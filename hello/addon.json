@@ -1,0 +1,10 @@
+{
+	"api": 1,
+	"title": "Hello",
+	"titles": {
+		"Russian": "Привет",
+		"Italiano": "Ciao"
+	},
+	"section": "streaming",
+	"version": "0.1"
+}

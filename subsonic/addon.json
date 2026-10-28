@@ -1,0 +1,9 @@
+{
+	"api": 1,
+	"title": "Subsonic",
+	"titles": {
+		"Russian": "Subsonic"
+	},
+	"section": "streaming",
+	"version": "0.1"
+}
