@@ -18,6 +18,9 @@ What is here:
   uses this rather than the player's `device_config.ini`: that file belongs to
   the player, it is rewritten whole on every save, and saving it from an addon's
   worker thread races the interface.
-
-The next piece will be a cover-art loader keyed by URL, for the services whose
-covers are an endpoint rather than a file.
+- `listrow.{h,c}` — covers for the rows of a service's list: a row is bound to a
+  URL, the picture appears in it when it arrives, and the twelve download slots
+  the player has are shared out among the rows that are actually on screen. The
+  downloading itself is the player's (`listart`); this is the row bookkeeping
+  the pages would otherwise each write out by hand. Off unless
+  `[streaming] list_art` is on.

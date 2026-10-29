@@ -18,7 +18,7 @@
 //     made once at sign-in and kept, with the token, in the addon's own
 //     session.ini on the card -- the password itself is never written anywhere.
 //     A fixed salt is what the servers accept and is also what keeps cover URLs
-//     stable, so the list covers cached by URL (qobuzart.c) are found again
+//     stable, so the list covers cached by URL (listart.c) are found again
 //     next time;
 //   * the old plain-password form (p=enc:<hex>) only when the server refuses
 //     tokens (error 41, e.g. an LDAP-backed account). That password then does

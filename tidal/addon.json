@@ -1,0 +1,12 @@
+{
+  "api": 1,
+  "title": "Tidal",
+  "titles": { "Russian": "Tidal", "Italiano": "Tidal" },
+  "section": "streaming",
+  "order": 1,
+  "version": "0.1",
+  "icon": "icon.png",
+  "service": true,
+  "owns_paths": [".local/tidal-cache/", ".local/listart/"],
+  "cache_path": ".local/tidal-cache/"
+}

@@ -14,6 +14,13 @@
 # widgets: an addon draws its page with lv_obj_create and friends, and a list
 # that left those out would only move the problem to the first addon that needed
 # a widget the last one did not.
+#
+# gui/nowplaying and gui/streaming are here for the covers: a service page asks
+# listart for the sleeve on a row (addons/common/listrow.h) and gets a
+# cover_image_t back, and both live in those directories. They were exported
+# before that only through the addons' own UND list, which is not the same
+# promise: a card-only addon would have failed to open on a player built without
+# them. Measured cost of the two directories: 151 names, 4 KB of binary.
 
 set -eu
 
@@ -38,6 +45,8 @@ fi
 player_objects="
 	$build/gui/shell
 	$build/gui/fonts
+	$build/gui/nowplaying
+	$build/gui/streaming
 	$build/system/core
 	$build/system/net
 	$build/system/image
