@@ -26,6 +26,8 @@ PLAYER_DIR ?= $(abspath $(CURDIR)/..)
 # from outside the tree second.
 CROSS_CC ?= $(firstword $(wildcard $(PLAYER_DIR)/rockbox-toolchain/bin/mipsel-rockbox-linux-gnu-gcc \
 			  $(PLAYER_DIR)/rockbox-toolchain/rockbox-dev/bin/mipsel-rockbox-linux-gnu-gcc))
+CROSS_CXX ?= $(firstword $(wildcard $(PLAYER_DIR)/rockbox-toolchain/bin/mipsel-rockbox-linux-gnu-g++ \
+			   $(PLAYER_DIR)/rockbox-toolchain/rockbox-dev/bin/mipsel-rockbox-linux-gnu-g++))
 CROSS_READELF ?= $(dir $(CROSS_CC))mipsel-rockbox-linux-gnu-readelf
 CROSS_STRIP ?= $(dir $(CROSS_CC))mipsel-rockbox-linux-gnu-strip
 LVGL_DIR ?= $(PLAYER_DIR)/lvgl
@@ -57,11 +59,19 @@ TARGET_CFLAGS = -O2 -g -Wall -MMD -MP -fPIC -march=mips32r2 -mno-madd4 \
 				$(ADDON_BOARD_CFLAGS) -include $(PLAYER_DIR)/src/system/core/glibc_compat.h
 
 HOST_CC ?= cc
+HOST_CXX ?= c++
 
 HOST_CFLAGS = -O2 -g -Wall -MMD -MP -fPIC -DHOST_BUILD=1 \
 			  $(shell pkg-config --cflags freetype2) \
 			  -D_FILE_OFFSET_BITS=64 -I$(CURDIR) -I$(PLAYER_DIR) -I$(LVGL_DIR) -DLV_CONF_INCLUDE_SIMPLE=1 \
 			  $(ADDON_BOARD_CFLAGS)
+
+# What a C++ translation unit of an addon is compiled with. The player has one
+# of these too (Makefile, TARGET_CXXFLAGS); here it is the C set, and an addon
+# that needs Gearboy's flags adds them to $(id)_CXXFLAGS (see "Per-addon
+# additions" below).
+TARGET_CXXFLAGS = $(TARGET_CFLAGS)
+HOST_CXXFLAGS = $(HOST_CFLAGS)
 
 # Undefined symbols are the point: lv_obj_create, http_get and the rest are
 # resolved by the player at dlopen() time. --gc-sections drops what an addon
@@ -92,27 +102,75 @@ host: $(addprefix $(BUILD_DIR)/host/,$(addsuffix .so,$(ADDONS)))
 # One rule shape for both halves. The toolchain, the flags and the output
 # directory are chosen by target-specific variables on the mode's directory --
 # not by $(if) inside the recipe, whose commas would eat -Wl,--gc-sections.
-$(BUILD_DIR)/target/%.o $(BUILD_DIR)/target/%.so: ADDON_CC = $(CROSS_CC)
-$(BUILD_DIR)/target/%.o: ADDON_CFLAGS = $(TARGET_CFLAGS)
+#
+# .o is a C object and .opp a C++ one: an addon that brings C++ (Gearboy's core
+# and its APU) is compiled by the C++ driver, and its final link names that
+# driver too (see $(id)_LD_target below), because the runtime comes with it.
+$(BUILD_DIR)/target/%.o: ADDON_CC = $(CROSS_CC)
+$(BUILD_DIR)/target/%.opp: ADDON_CC = $(CROSS_CXX)
+$(BUILD_DIR)/target/%.so: ADDON_CC = $(CROSS_CC)
+$(BUILD_DIR)/target/%.o $(BUILD_DIR)/target/%.opp: ADDON_CFLAGS = $(TARGET_CFLAGS)
 $(BUILD_DIR)/target/%.so: ADDON_LDFLAGS = $(TARGET_LDFLAGS)
 
-$(BUILD_DIR)/host/%.o $(BUILD_DIR)/host/%.so: ADDON_CC = $(HOST_CC)
-$(BUILD_DIR)/host/%.o: ADDON_CFLAGS = $(HOST_CFLAGS)
+$(BUILD_DIR)/host/%.o: ADDON_CC = $(HOST_CC)
+$(BUILD_DIR)/host/%.opp: ADDON_CC = $(HOST_CXX)
+$(BUILD_DIR)/host/%.so: ADDON_CC = $(HOST_CC)
+$(BUILD_DIR)/host/%.o $(BUILD_DIR)/host/%.opp: ADDON_CFLAGS = $(HOST_CFLAGS)
 $(BUILD_DIR)/host/%.so: ADDON_LDFLAGS = $(HOST_LDFLAGS)
 
+# ---------------------------------------------------------------------------
+# Per-addon additions
+#
+# A directory may carry addon.mk, included before any addon is declared. It is
+# plain make, with the addon's name as the prefix, and it exists so that one
+# addon's oddities stay out of the other ones' builds:
+#
+#   gearboy_CFLAGS        extra flags for its C sources
+#   gearboy_CXXFLAGS      extra flags for its C++ sources
+#   gearboy_LIBS          extra libraries to link
+#   gearboy_LD_target     the linker to use, when it is not the C driver
+#   gearboy_LD_host       the same for the simulator
+#
+# Everything here is expanded when a recipe runs, so a variable may name
+# $(CROSS_CXX) without caring where it was defined.
+# ---------------------------------------------------------------------------
+-include $(wildcard $(CURDIR)/*/addon.mk)
+
 # $(1) is the mode (target or host), $(2) the addon id.
+#
+# The sources are everything under the addon's folder, not just its top level:
+# an addon that carries a program (Gearboy's core, its C++ APU a few directories
+# down, miniz) keeps the tree it came from. common/ is compiled into every addon
+# and gets the ordinary flags, which is why it has a rule of its own.
 define ADDON_RULE
-$(BUILD_DIR)/$(1)/$(2).so: $$(patsubst $(CURDIR)/%.c,$(BUILD_DIR)/$(1)/%.o,$$(wildcard $(CURDIR)/$(2)/*.c) $(COMMON_SRCS))
-	@mkdir -p $$(dir $$@)
-	$$(ADDON_CC) $$(ADDON_LDFLAGS) -o $$@ $$^
+$(2)_CSRCS := $$(sort $$(wildcard $(CURDIR)/$(2)/*.c) $$(shell find $(CURDIR)/$(2) -mindepth 2 -name '*.c' 2>/dev/null))
+$(2)_CXXSRCS := $$(sort $$(shell find $(CURDIR)/$(2) -name '*.cpp' 2>/dev/null))
+$(1)_$(2)_OBJS := $$(patsubst $(CURDIR)/%.c,$(BUILD_DIR)/$(1)/%.o,$$($(2)_CSRCS) $(COMMON_SRCS)) \
+				  $$(patsubst $(CURDIR)/%.cpp,$(BUILD_DIR)/$(1)/%.opp,$$($(2)_CXXSRCS))
+
+$(BUILD_DIR)/$(1)/$(2).so: $$($(1)_$(2)_OBJS)
+	@mkdir -p $$(@D)
+	$$(or $$($(2)_LD_$(1)),$$(ADDON_CC)) $$(ADDON_LDFLAGS) $$($(2)_LIBS) -o $$@ $$^
 	@echo "addon $(2) [$(1)]: $$@ ($$$$(stat -c%s $$@) bytes)"
 
-$(BUILD_DIR)/$(1)/%.o: $(CURDIR)/%.c
-	@mkdir -p $$(dir $$@)
-	$$(ADDON_CC) $$(ADDON_CFLAGS) -c $$< -o $$@
+$$(BUILD_DIR)/$(1)/$(2)/%.o: $(CURDIR)/$(2)/%.c
+	@mkdir -p $$(@D)
+	$$(ADDON_CC) $$(ADDON_CFLAGS) $$($(2)_CFLAGS) -c $$< -o $$@
+
+$$(BUILD_DIR)/$(1)/$(2)/%.opp: $(CURDIR)/$(2)/%.cpp
+	@mkdir -p $$(@D)
+	$$(ADDON_CC) $$(ADDON_CFLAGS) $$($(2)_CXXFLAGS) -c $$< -o $$@
 endef
 
 $(foreach mode,target host,$(foreach id,$(ADDONS),$(eval $(call ADDON_RULE,$(mode),$(id)))))
+
+$(BUILD_DIR)/target/common/%.o: $(CURDIR)/common/%.c
+	@mkdir -p $(@D)
+	$(ADDON_CC) $(ADDON_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/host/common/%.o: $(CURDIR)/common/%.c
+	@mkdir -p $(@D)
+	$(ADDON_CC) $(ADDON_CFLAGS) -c $< -o $@
 
 # ---------------------------------------------------------------------------
 # exports: what the player has to publish for these addons
@@ -271,9 +329,11 @@ pack: target
 		mkdir -p "$(BUILD_DIR)/Addons/$$id"; \
 		cp "$(CURDIR)/$$id/addon.json" "$(BUILD_DIR)/Addons/$$id/"; \
 		cp "$(BUILD_DIR)/target/$$id.so" "$(BUILD_DIR)/Addons/$$id/addon.so"; \
+		$(CROSS_STRIP) --strip-debug "$(BUILD_DIR)/Addons/$$id/addon.so"; \
 		for extra in "$(CURDIR)/$$id"/*.png "$(CURDIR)/$$id"/*.txt "$(CURDIR)/$$id"/*.ini; do \
 			if [ -f "$$extra" ]; then cp "$$extra" "$(BUILD_DIR)/Addons/$$id/"; fi; \
 		done; \
+		if [ -d "$(CURDIR)/$$id/assets" ]; then cp -r "$(CURDIR)/$$id/assets" "$(BUILD_DIR)/Addons/$$id/"; fi; \
 	done
 	@echo "pack: $(BUILD_DIR)/Addons -- copy it to <card>/Addons"
 

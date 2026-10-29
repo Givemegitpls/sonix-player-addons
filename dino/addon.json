@@ -1,0 +1,9 @@
+{
+  "api": 1,
+  "title": "Dino",
+  "titles": { "Russian": "Динозаврик", "Italiano": "Dino" },
+  "section": "more",
+  "order": 7,
+  "version": "0.1",
+  "icon": "icon.png"
+}

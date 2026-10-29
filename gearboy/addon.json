@@ -1,0 +1,9 @@
+{
+  "api": 1,
+  "title": "Gearboy",
+  "titles": { "Russian": "Gearboy", "Italiano": "Gearboy" },
+  "section": "more",
+  "order": 2,
+  "version": "0.1",
+  "icon": "icon.png"
+}

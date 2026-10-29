@@ -1,0 +1,9 @@
+{
+  "api": 1,
+  "title": "Flappy Bird",
+  "titles": { "Russian": "Flappy Bird", "Italiano": "Flappy Bird" },
+  "section": "more",
+  "order": 5,
+  "version": "0.1",
+  "icon": "icon.png"
+}
