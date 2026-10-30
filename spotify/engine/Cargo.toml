@@ -1,0 +1,28 @@
+[package]
+name = "spotify-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "GPL-3.0-or-later"
+publish = false
+description = "The Spotify protocol half of the Sonix Spotify addon, as a cdylib."
+
+# cdylib for the card, rlib so the unit tests can link the same code.
+[lib]
+name = "spotify_engine"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+# No dependencies at all, on purpose: see README.md. The image that builds this
+# tree must not need a crates.io index or a vendor directory for an addon.
+[dependencies]
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+strip = true
+# Nothing may unwind across the C ABI: the addon is C, and a panic in a worker
+# thread that reached an extern "C" function would take the player down with
+# the addon's name nowhere in the report.
+panic = "abort"

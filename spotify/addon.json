@@ -1,0 +1,10 @@
+{
+  "api": 1,
+  "title": "Spotify",
+  "titles": { "Russian": "Spotify", "Italiano": "Spotify" },
+  "section": "streaming",
+  "order": 9,
+  "version": "0.1",
+  "icon": "icon.png",
+  "service": true
+}

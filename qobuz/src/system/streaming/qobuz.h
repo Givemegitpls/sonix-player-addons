@@ -23,7 +23,7 @@
 //     point is the password written anywhere.
 //
 // The application credentials (app_id, app_secret) are not in here: they are
-// read from a file on the device, see streamkeys.h.
+// the addon's own, in <card>/Addons/qobuz/settings.ini, see qobuzconf.h.
 //
 // Every function that talks to the network blocks. Call them from a worker
 // thread, never from the GUI thread -- the same rule as http.h and radio.c.
@@ -109,12 +109,12 @@ typedef struct {
 // Session
 // ---------------------------------------------------------------------------
 
-// Reads the application credentials and the stored token. Once at startup,
-// after config_init() and streamkeys_init().
+// Reads the application credentials and the stored token. Once, from the
+// addon's init(), after qobuzconf_init().
 void qobuz_init(void);
 
-// Reads the card's token again, after streamkeys_attach_card() -- at startup
-// the card has no mount point yet (see main.c).
+// Reads the credentials and the token again, after the card may have been
+// written (qobuzconf_reload()).
 void qobuz_reload_session(void);
 
 // False when the keys file is missing: the service is not broken, it is off,

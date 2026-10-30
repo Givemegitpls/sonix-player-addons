@@ -3,6 +3,7 @@
 #include "src/gui/streaming/tidalpage.h"
 #include "src/system/streaming/tidal.h"
 #include "src/system/streaming/tidalcache.h"
+#include "src/system/streaming/tidalconf.h"
 #include "src/system/streaming/tidalservice.h"
 
 // Tidal, as a service addon -- the same shape as addons/qobuz, which is the one
@@ -22,8 +23,10 @@
 // why the service table's playlist id is text; nothing else differs.
 
 static lv_obj_t *tidal_addon_init(const sonix_addon_host_t *host) {
-	// The card first: the session and the keys are read from it (streamkeys.h),
-	// and so is everything the cache does.
+	// The card first: the keys and the session are the addon's own files in
+	// host->dir (tidalconf.h), which is also where the old place they came from
+	// is migrated once, and so is everything the cache does.
+	tidalconf_init(host->dir, host->sd_root);
 	tidalcache_set_root(host->sd_root);
 	tidal_init();
 

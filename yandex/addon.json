@@ -1,0 +1,12 @@
+{
+  "api": 1,
+  "title": "Yandex Music",
+  "titles": { "Russian": "Яндекс Музыка", "Italiano": "Yandex Music" },
+  "section": "streaming",
+  "order": 4,
+  "version": "0.1",
+  "icon": "icon.png",
+  "service": true,
+  "owns_paths": [".local/yandex-cache/", ".local/yandex-saved.tsv", ".local/listart/"],
+  "cache_path": ".local/yandex-cache/"
+}

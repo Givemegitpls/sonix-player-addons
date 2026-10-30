@@ -3,6 +3,7 @@
 #include "src/gui/streaming/qobuzpage.h"
 #include "src/system/streaming/qobuz.h"
 #include "src/system/streaming/qobuzcache.h"
+#include "src/system/streaming/qobuzconf.h"
 #include "src/system/streaming/qobuzservice.h"
 
 // Qobuz, as a service addon.
@@ -26,8 +27,10 @@
 // manifest's owns_paths/cache_path, not from here.
 
 static lv_obj_t *qobuz_addon_init(const sonix_addon_host_t *host) {
-	// The card first: the session and the keys are read from it (streamkeys.h),
-	// and so is everything the cache does.
+	// The card first: the keys and the session are the addon's own files in
+	// host->dir (qobuzconf.h), which is also where the old place they came from
+	// is migrated once, and so is everything the cache does.
+	qobuzconf_init(host->dir, host->sd_root);
 	qobuzcache_set_root(host->sd_root);
 	qobuz_init();
 

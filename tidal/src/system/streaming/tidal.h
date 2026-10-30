@@ -45,9 +45,9 @@
 // cases, and tidalcache.c can download either.
 //
 // The application credentials (client_id, client_secret) are not in here: they
-// are read from a file on the device, see streamkeys.h. Tidal revokes them from
-// time to time, so when login starts failing that file is the first thing to
-// check, not this code.
+// are the addon's own, in <card>/Addons/tidal/settings.ini, see tidalconf.h.
+// Tidal revokes them from time to time, so when login starts failing that file
+// is the first thing to check, not this code.
 //
 // Every function that talks to the network blocks. Call them from a worker
 // thread, never from the GUI thread -- same rule as http.h, radio.c and
@@ -144,12 +144,12 @@ typedef struct {
 // Session
 // ---------------------------------------------------------------------------
 
-// Reads the application credentials and the stored tokens. Once at startup,
-// after config_init() and streamkeys_init().
+// Reads the application credentials and the stored tokens. Once, from the
+// addon's init(), after tidalconf_init().
 void tidal_init(void);
 
-// Reads the card's tokens again, after streamkeys_attach_card() -- at startup
-// the card has no mount point yet (see main.c).
+// Reads the credentials and the tokens again, after the card may have been
+// written (tidalconf_reload()).
 void tidal_reload_session(void);
 
 // False when the keys file is missing: the service is not broken, it is off,

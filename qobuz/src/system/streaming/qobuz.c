@@ -12,7 +12,7 @@
 #include "src/system/core/md5.h"
 #include "src/system/streaming/qobuzkey.h"
 #include "src/system/streaming/qobuzservice.h"
-#include "src/system/streaming/streamkeys.h"
+#include "src/system/streaming/qobuzconf.h"
 #include "src/system/core/lang.h"
 
 // Base address. Configurable for one reason only: pointing it at a fake server
@@ -26,9 +26,10 @@
 #define QOBUZ_BODY_LIMIT (2 * 1024 * 1024)
 
 // The application credentials are Qobuz's, not this project's, so none of them
-// is compiled in: they are taken from the web player at run time and kept on
-// the card (see qobuzkey.h and streamkeys.h). A card may also name its own pair
-// in sonix/streaming.json, which is what a local configuration uses.
+// is compiled in: they are taken from the web player at run time and kept in
+// the addon's own file on the card (see qobuzkey.h and qobuzconf.h). The owner
+// may also name a pair in <card>/Addons/qobuz/settings.ini, which is what a
+// local configuration uses.
 //
 // How long a derived pair is trusted before it is taken again. The secret does
 // not change often -- twice a year at most -- and a rotation is caught anyway:
@@ -81,12 +82,13 @@ void qobuz_init(void) {
 
 	qobuz_load_keys();
 
-	// The account comes from the card, not from the player's own storage: see
-	// streamkeys.h. qobuz_reload_session() runs again once the card is mounted.
+	// The account comes from the addon's own folder on the card, not from the
+	// player's storage: see qobuzconf.h. qobuz_reload_session() reads it again
+	// when the card has been written in between.
 	qobuz_reload_session();
 	// A session this player saved in its own storage before the card carried
 	// them is dropped rather than left to linger; the account is signed out
-	// everywhere else, and the card's file is the one that counts.
+	// everywhere else, and the addon's file is the one that counts.
 	if (config_get("qobuz", "token", NULL) || config_get("qobuz", "user", NULL)) {
 		config_set("qobuz", "token", "");
 		config_set("qobuz", "user", "");
@@ -108,35 +110,27 @@ void qobuz_init(void) {
 
 void qobuz_reload_session(void) {
 	qobuz_load_keys();
-	const char *token = streamkeys_qobuz_token();
-	const char *user = streamkeys_qobuz_token_user();
-	snprintf(auth_token, sizeof(auth_token), "%s", token ? token : "");
-	snprintf(display_name, sizeof(display_name), "%s", user ? user : "");
-	printf("qobuz: %s\n", auth_token[0] ? "token found on the card" : "no token on the card");
+	char token[QOBUZCONF_TOKEN_MAX];
+	char user[QOBUZCONF_USER_MAX];
+	qobuzconf_session(token, sizeof(token), user, sizeof(user));
+	snprintf(auth_token, sizeof(auth_token), "%s", token);
+	snprintf(display_name, sizeof(display_name), "%s", user);
+	printf("qobuz: %s\n", auth_token[0] ? "token found in the addon's folder" : "no token in the addon's folder");
 }
 
-// The credentials the card offers: the user's own pair when the file names one,
-// otherwise the pair derived the last time. Called again once the card is
-// mounted, since at startup there is no card to read.
+// The pair the addon's own file carries: the owner's when it names one,
+// otherwise the one derived the last time (qobuzconf.h says which is which).
+// Called again whenever the card may have been written in between.
 static void qobuz_load_keys(void) {
-	const char *id = streamkeys_qobuz_app_id();
-	const char *secret = streamkeys_qobuz_app_secret();
-	if (id && secret) {
-		snprintf(app_id, sizeof(app_id), "%s", id);
-		snprintf(app_secret, sizeof(app_secret), "%s", secret);
-		creds_by_user = true;
-		creds_at = 0;
-		return;
-	}
-
-	const char *cached_id = streamkeys_qobuz_cached_app_id();
-	const char *cached_secret = streamkeys_qobuz_cached_app_secret();
-	if (cached_id && cached_secret) {
-		snprintf(app_id, sizeof(app_id), "%s", cached_id);
-		snprintf(app_secret, sizeof(app_secret), "%s", cached_secret);
-		creds_at = streamkeys_qobuz_creds_at();
-	}
-	creds_by_user = false;
+	char id[QOBUZCONF_ID_MAX];
+	char secret[QOBUZCONF_SECRET_MAX];
+	bool by_user = false;
+	long at = 0;
+	qobuzconf_keys(id, sizeof(id), secret, sizeof(secret), &by_user, &at);
+	snprintf(app_id, sizeof(app_id), "%s", id);
+	snprintf(app_secret, sizeof(app_secret), "%s", secret);
+	creds_by_user = by_user;
+	creds_at = at;
 }
 
 // True while the pair can be used without asking Qobuz again.
@@ -219,7 +213,7 @@ static bool qobuz_ensure_keys(bool force) {
 
 	creds_by_user = false;
 	creds_at = (long)time(NULL);
-	streamkeys_save_qobuz_creds(app_id, app_secret, creds_at);
+	qobuzconf_save_creds(app_id, app_secret, creds_at, false);
 	printf("qobuz: %d candidate secret(s), using the %s one\n", keys.count,
 		   app_secret[0] ? "first accepted" : "none");
 	creds_fetching = false;
@@ -248,7 +242,7 @@ void qobuz_set_format(int wanted) {
 void qobuz_logout(void) {
 	auth_token[0] = '\0';
 	display_name[0] = '\0';
-	streamkeys_save_qobuz_session("", "");
+	qobuzconf_save_session("", "");
 	printf("qobuz: session closed\n");
 }
 
@@ -411,7 +405,7 @@ bool qobuz_login(const char *username, const char *password) {
 
 	snprintf(auth_token, sizeof(auth_token), "%s", token);
 	snprintf(display_name, sizeof(display_name), "%s", name);
-	streamkeys_save_qobuz_session(auth_token, display_name);
+	qobuzconf_save_session(auth_token, display_name);
 
 	printf("qobuz: logged in as %s\n", display_name);
 	return true;

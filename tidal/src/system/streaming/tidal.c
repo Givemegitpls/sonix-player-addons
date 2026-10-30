@@ -11,7 +11,7 @@
 #include "src/system/net/http.h"
 #include "src/system/core/json.h"
 #include "src/system/streaming/tidalservice.h"
-#include "src/system/streaming/streamkeys.h"
+#include "src/system/streaming/tidalconf.h"
 #include "src/system/core/lang.h"
 
 // The scopes asked for at sign-in: r_usr to read, w_usr to write favourites
@@ -99,8 +99,8 @@ static char client_secret[128];
 // They are public -- every open Tidal client carries them, and this pair is the
 // one tidalapi publishes -- but they are not written plainly, for the same
 // reason tidalapi does not: they are kept out of `strings` of an unpacked
-// image. The two halves are base64 of base64, decoded at startup. A card that
-// names its own pair in sonix/streaming.json overrides them (see streamkeys.h).
+// image. The two halves are base64 of base64, decoded at startup. A pair the
+// addon's own settings.ini names overrides them (see tidalconf.h).
 #define TIDAL_CLIENT_ID_A "WmxneVNuaGtiVzUw"
 #define TIDAL_CLIENT_ID_B "V2xkTE1HbDRWQT09"
 #define TIDAL_CLIENT_SECRET_A "TVU1dU9VRm1SRUZxZUhKblNrWktZa3RPVjB4bFFY"
@@ -234,14 +234,14 @@ const char *tidal_expected_mime(void) {
 // The format is the simplest that works: `key=value`, one per line, in write
 // order. A human can read it back without tools.
 
-// The session lives on the card, beside the user's own streaming.json (see
-// streamkeys.h): the account travels with the card, and a player that is handed
-// on keeps nothing about it. The expiry is kept so a renewal is not attempted
-// on every request; the rest of the identity comes out of the access token's
-// own JWT, since a token typed into the card never came with a login response.
+// The session lives in the addon's own folder on the card (tidalconf.h): the
+// account travels with the card, and a player that is handed on keeps nothing
+// about it. The expiry is kept so a renewal is not attempted on every request;
+// the rest of the identity comes out of the access token's own JWT, since a
+// token typed into the card never came with a login response.
 
 static void save_session(void) {
-	streamkeys_save_tidal_session(access_token, refresh_token, token_expires_at);
+	tidalconf_save_session(access_token, refresh_token, token_expires_at);
 }
 
 // Finds `"uid":<number>` and `"cc":"<country>"` in an access token. Both are
@@ -286,11 +286,8 @@ static void read_token_identity(void) {
 }
 
 static void load_session(void) {
-	const char *access = streamkeys_tidal_access_token();
-	const char *refresh = streamkeys_tidal_refresh_token();
-	snprintf(access_token, sizeof(access_token), "%s", access ? access : "");
-	snprintf(refresh_token, sizeof(refresh_token), "%s", refresh ? refresh : "");
-	token_expires_at = streamkeys_tidal_expires_at();
+	tidalconf_session(access_token, sizeof(access_token), refresh_token, sizeof(refresh_token),
+					  &token_expires_at);
 	if (access_token[0]) {
 		read_token_identity();
 	}
@@ -301,7 +298,8 @@ static void load_session(void) {
 
 void tidal_reload_session(void) {
 	load_session();
-	printf("tidal: %s\n", refresh_token[0] ? "token found on the card" : "no token on the card");
+	printf("tidal: %s\n",
+		   refresh_token[0] ? "token found in the addon's folder" : "no token in the addon's folder");
 }
 
 void tidal_init(void) {
@@ -327,12 +325,9 @@ void tidal_init(void) {
 		cover_px = TIDAL_COVER_PX_DEFAULT;
 	}
 
-	const char *id = streamkeys_tidal_client_id();
-	const char *secret = streamkeys_tidal_client_secret();
-	if (id && secret) {
-		snprintf(client_id, sizeof(client_id), "%s", id);
-		snprintf(client_secret, sizeof(client_secret), "%s", secret);
-	} else {
+	// A pair the addon's own file names overrides the built-in one, which is
+	// what the old [tidal] section of streaming-keys.ini used to do.
+	if (!tidalconf_keys(client_id, sizeof(client_id), client_secret, sizeof(client_secret))) {
 		unwrap(TIDAL_CLIENT_ID_A, TIDAL_CLIENT_ID_B, client_id, sizeof(client_id));
 		unwrap(TIDAL_CLIENT_SECRET_A, TIDAL_CLIENT_SECRET_B, client_secret, sizeof(client_secret));
 	}
@@ -354,7 +349,7 @@ void tidal_init(void) {
 	}
 
 	printf("tidal: %s, %s\n", tidal_configured() ? "configured" : "no application keys",
-		   refresh_token[0] ? "session on the card" : "no session");
+		   refresh_token[0] ? "session in the addon's folder" : "no session");
 
 	// Nothing is registered here: the loader does that from
 	// sonix_addon_service_entry() (addon.c), before init() runs.
