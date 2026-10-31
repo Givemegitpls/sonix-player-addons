@@ -10,6 +10,8 @@
 
 #include "src/system/streaming/yandex.h"
 #include "src/system/streaming/yandexconf.h"
+#include "src/system/streaming/yandexplay.h"
+#include "src/system/streaming/yandexwave.h"
 
 #include "lvgl/lvgl.h"
 
@@ -361,6 +363,153 @@ static void poll_async(void *user) {
 // the rows
 // ---------------------------------------------------------------------------
 
+// Playing
+//
+// The engine is yandexplay.c and it was already here: a list of ids becomes the
+// player's queue, the track playback reaches is fetched into
+// <card>/.local/yandex-cache/ and played, and the ones after it are fetched
+// ahead. What it never had is a caller -- the page that used to call it is
+// yandexpage.c, and that page is not ported. Two buttons are the smallest
+// caller that gets music out of the device: My Wave (a station, endless) and
+// the liked tracks (a list, finite).
+//
+// yandexplay_watch() runs on a one-second GUI timer: it fetches ahead, keeps the
+// queued files from the cache's sweep and tells My Wave what is playing. The
+// timer is created with the page and never deleted with it -- leaving the screen
+// does not stop the music, and the wave would run dry without it.
+// ---------------------------------------------------------------------------
+
+static lv_timer_t *play_timer;
+static bool play_busy; // one list is being built: the buttons do nothing meanwhile
+
+typedef struct {
+	yandexlist_t *list; // built on the worker, started on the GUI thread
+	bool wave;
+	char message[256];
+} play_answer_t;
+
+static void play_async(void *user);
+
+static void liked_each(const char *track_id, const char *album_id, const yandex_track_t *track, void *user) {
+	(void)track;
+	yandexlist_t *list = user;
+	if (track_id && track_id[0]) {
+		yandexlist_add_id(list, track_id, album_id);
+	}
+}
+
+static void *liked_main(void *arg) {
+	(void)arg;
+	play_answer_t *a = calloc(1, sizeof(*a));
+	if (!a) {
+		return NULL;
+	}
+	a->list = yandexlist_new();
+	if (a->list) {
+		int n = yandex_liked_ids(liked_each, a->list);
+		if (n <= 0) {
+			const char *why = yandex_last_error();
+			snprintf(a->message, sizeof(a->message), "%s",
+					 n == 0 ? "no liked tracks" : (why && why[0] ? why : "the liked list was not read"));
+		}
+	}
+	if (!gui_post(play_async, a)) {
+		yandexlist_free(a->list);
+		free(a);
+	}
+	return NULL;
+}
+
+static void *wave_main(void *arg) {
+	(void)arg;
+	play_answer_t *a = calloc(1, sizeof(*a));
+	if (!a) {
+		return NULL;
+	}
+	yandex_track_t *tracks = calloc(YANDEXWAVE_BATCH_MAX, sizeof(*tracks));
+	if (!tracks) {
+		free(a);
+		return NULL;
+	}
+	int n = yandex_wave_start(NULL, 0, tracks, YANDEXWAVE_BATCH_MAX);
+	a->wave = true;
+	if (n > 0) {
+		a->list = yandexlist_new();
+	}
+	for (int i = 0; a->list && i < n; i++) {
+		if (tracks[i].id[0]) {
+			yandexlist_add_track(a->list, &tracks[i]);
+		}
+	}
+	if (!a->list || yandexlist_count(a->list) == 0) {
+		const char *why = yandex_last_error();
+		snprintf(a->message, sizeof(a->message), "%s", why && why[0] ? why : "the station said nothing");
+	}
+	free(tracks);
+	if (!gui_post(play_async, a)) {
+		yandexlist_free(a->list);
+		free(a);
+	}
+	return NULL;
+}
+
+static void play_async(void *user) {
+	play_answer_t *a = user;
+	play_busy = false;
+	// yandexplay_list() takes a copy of the list, so ours is dropped either way.
+	if (a->list && yandexlist_count(a->list) > 0 && yandexplay_list(a->list, 0, a->wave)) {
+		yandexlist_free(a->list);
+		free(a);
+		return;
+	}
+	yandexlist_free(a->list);
+	gui_notify_popup(a->message[0] ? a->message : "could not start the queue");
+	free(a);
+}
+
+static void play_tick_cb(lv_timer_t *timer) {
+	(void)timer;
+	yandexplay_watch();
+}
+
+// Both buttons want the same three things: keys, a session, and no list being
+// built already.
+static bool play_ready(void) {
+	if (!yandex_configured()) {
+		gui_notify_popup("no keys: the addon's settings.ini has none");
+		return false;
+	}
+	if (!yandex_logged_in()) {
+		gui_notify_popup("not signed in");
+		return false;
+	}
+	if (play_busy) {
+		gui_notify_popup("a list is being built");
+		return false;
+	}
+	return true;
+}
+
+static void play_wave_cb(lv_event_t *e) {
+	(void)e;
+	if (!play_ready()) {
+		return;
+	}
+	play_busy = true;
+	gui_notify_popup("asking the station...");
+	start_worker(wave_main);
+}
+
+static void play_liked_cb(lv_event_t *e) {
+	(void)e;
+	if (!play_ready()) {
+		return;
+	}
+	play_busy = true;
+	gui_notify_popup("reading the liked tracks...");
+	start_worker(liked_main);
+}
+
 static void sign_in_cb(lv_event_t *e) {
 	(void)e;
 	if (!yandex_configured()) {
@@ -384,6 +533,7 @@ static void sign_out_cb(lv_event_t *e) {
 	login_stop();
 	login_clear();
 	yandex_logout();
+	yandexplay_signed_out();
 	refresh();
 	gui_notify_popup("signed out");
 }
@@ -454,9 +604,14 @@ void yandexstate_init(gui_config_t *cfg, const char *sd_root) {
 	settingsrow_add(container, "Code", &code_value, NULL, NULL);
 	settingsrow_add(container, "Where", &where_value, NULL, NULL);
 	settingsrow_add(container, "Waiting", &wait_value, NULL, NULL);
+	// A value label is created with LVGL's own "Text" until something writes to
+	// it, and these three are empty until a code arrives.
+	login_clear();
 	settingsrow_add(container, "Token file", &token_value, NULL, NULL);
 	settingsrow_add(container, "Quality", &quality_value, quality_cb, NULL);
 
+	settingsrow_action(container, "Play My Wave", play_wave_cb, NULL);
+	settingsrow_action(container, "Play liked tracks", play_liked_cb, NULL);
 	settingsrow_action(container, "Sign in with a code", code_sign_in_cb, NULL);
 	settingsrow_action(container, "Stop waiting", stop_waiting_cb, NULL);
 	settingsrow_action(container, "Sign in from the card", sign_in_cb, NULL);
@@ -464,6 +619,11 @@ void yandexstate_init(gui_config_t *cfg, const char *sd_root) {
 	settingsrow_action(container, "Sign out", sign_out_cb, NULL);
 
 	refresh();
+
+	// The playback watch: fetching ahead, the cache's ceiling, My Wave's next
+	// batch. One second, for the life of the program, whether the page is up or
+	// not -- the music outlives the screen that started it.
+	play_timer = lv_timer_create(play_tick_cb, 1000, NULL);
 
 	lv_obj_add_event_cb(yandexstate_screen, loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 	lv_obj_add_event_cb(yandexstate_screen, unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
