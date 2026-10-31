@@ -1,3 +1,0 @@
-# The engine is built, not committed: `make addons` puts it here for the
-# packer, and `make addons-host` puts the simulator's copy in build/host/.
-spotify_engine.so

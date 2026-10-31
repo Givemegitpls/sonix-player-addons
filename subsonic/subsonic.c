@@ -256,8 +256,12 @@ void subsonic_cover_url(const char *cover_id, int px, char *out, size_t size) {
 // Every reply is {"subsonic-response":{"status":"ok"|"failed", "error":{...}}}.
 // On success `*resp` is the subsonic-response object; the caller frees with
 // call_done() once it has read the document (which points into the body).
+// `resp` is the index of the "subsonic-response" object inside `doc`, not the
+// HTTP status: a server that answers 426 with a plain-text body never reaches
+// JSON parsing at all, so the status needs its own way out. `http_status` is
+// optional and is set as soon as a reply was read, whatever it said.
 static bool call_with(const session_t *s, const char *method, const char *extra, char **body, json_doc_t *doc,
-					  int *resp, int *error_code) {
+					  int *resp, int *error_code, int *http_status) {
 	last_error[0] = '\0';
 	if (error_code) {
 		*error_code = 0;
@@ -281,7 +285,11 @@ again:;
 	int status = 0;
 	size_t len = 0;
 	*body = NULL;
-	if (!http_get_ex(url, NULL, true, body, &len, BODY_LIMIT, TIMEOUT_SECS, &status)) {
+	bool read = http_get_ex(url, NULL, true, body, &len, BODY_LIMIT, TIMEOUT_SECS, &status);
+	if (http_status) {
+		*http_status = read ? status : 0;
+	}
+	if (!read) {
 		// A server that closes before the body is complete -- or a connection
 		// dropped mid-reply -- fails here rather than parsing as something
 		// short. One more connection before saying so: it is a different fault
@@ -395,7 +403,7 @@ again:;
 static bool call(const char *method, const char *extra, char **body, json_doc_t *doc, int *resp) {
 	session_t s;
 	session_copy(&s);
-	return call_with(&s, method, extra, body, doc, resp, NULL);
+	return call_with(&s, method, extra, body, doc, resp, NULL, NULL);
 }
 
 static void call_done(char *body, json_doc_t *doc) {
@@ -496,7 +504,8 @@ bool subsonic_login(const char *server, const char *user, const char *password) 
 	json_doc_t doc;
 	int resp = -1;
 	int code = 0;
-	bool ok = call_with(&s, "ping", NULL, &body, &doc, &resp, &code);
+	int status = 0;
+	bool ok = call_with(&s, "ping", NULL, &body, &doc, &resp, &code, &status);
 	if (!ok && code == 41) {
 		// "Token authentication not supported for LDAP users": the old form,
 		// and the password has to be kept for it.
@@ -507,7 +516,21 @@ bool subsonic_login(const char *server, const char *user, const char *password) 
 		for (const unsigned char *p = (const unsigned char *)password; *p && n + 2 < sizeof(s.password_hex); p++) {
 			n += (size_t)snprintf(s.password_hex + n, sizeof(s.password_hex) - n, "%02x", *p);
 		}
-		ok = call_with(&s, "ping", NULL, &body, &doc, &resp, &code);
+		ok = call_with(&s, "ping", NULL, &body, &doc, &resp, &code, &status);
+	}
+	// A server behind a reverse proxy that terminates TLS answers a plain-HTTP
+	// request with 426 Upgrade Required and no Location, so there is nothing for
+	// the player's redirect handling to follow. Ask the same question over TLS
+	// once, and keep the scheme that answered.
+	if (!ok && status == 426 && strncmp(s.server, "http://", 7) == 0) {
+		char previous[SUBSONIC_SERVER_MAX];
+		snprintf(previous, sizeof(previous), "%s", s.server);
+		snprintf(s.server, sizeof(s.server), "https://%s", previous + 7);
+		printf("addon subsonic: %s wants TLS, asking again over https\n", previous);
+		ok = call_with(&s, "ping", NULL, &body, &doc, &resp, &code, &status);
+		if (!ok) {
+			snprintf(s.server, sizeof(s.server), "%s", previous);
+		}
 	}
 	if (!ok) {
 		return false;

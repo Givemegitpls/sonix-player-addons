@@ -142,9 +142,15 @@ $(BUILD_DIR)/host/%.so: ADDON_LDFLAGS = $(HOST_LDFLAGS)
 # an addon that carries a program (Gearboy's core, its C++ APU a few directories
 # down, miniz) keeps the tree it came from. common/ is compiled into every addon
 # and gets the ordinary flags, which is why it has a rule of its own.
+#
+# Two directories are never sources: `target/`, a cargo build tree (Spotify
+# carries a Rust program beside its C, and ring's own build script writes .c
+# into it -- compiled into an addon they were "multiple definition of `main`"),
+# and `tools/`, the host-side probes of such a program, which have a main() of
+# their own.
 define ADDON_RULE
-$(2)_CSRCS := $$(sort $$(wildcard $(CURDIR)/$(2)/*.c) $$(shell find $(CURDIR)/$(2) -mindepth 2 -name '*.c' 2>/dev/null))
-$(2)_CXXSRCS := $$(sort $$(shell find $(CURDIR)/$(2) -name '*.cpp' 2>/dev/null))
+$(2)_CSRCS := $$(sort $$(wildcard $(CURDIR)/$(2)/*.c) $$(shell find $(CURDIR)/$(2) -mindepth 2 -name '*.c' ! -path '*/target/*' ! -path '*/tools/*' 2>/dev/null))
+$(2)_CXXSRCS := $$(sort $$(shell find $(CURDIR)/$(2) -name '*.cpp' ! -path '*/target/*' 2>/dev/null))
 $(1)_$(2)_OBJS := $$(patsubst $(CURDIR)/%.c,$(BUILD_DIR)/$(1)/%.o,$$($(2)_CSRCS) $(COMMON_SRCS)) \
 				  $$(patsubst $(CURDIR)/%.cpp,$(BUILD_DIR)/$(1)/%.opp,$$($(2)_CXXSRCS))
 

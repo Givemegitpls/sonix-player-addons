@@ -1,105 +1,94 @@
-# Spotify, as a service addon with a protocol half of its own.
+# Spotify: the C half of this addon, and the Rust engine it spawns.
 #
-# The C side (addon.c) is an ordinary addon: the flags below only add the
-# engine's header directory. The Rust side (engine/) is a cdylib the addon
-# opens with dlopen() from the card, and this file is what builds it and puts
-# it where the packer will find it:
+# The addon (addon.c) is an ordinary shared library. The protocol half is a
+# program of its own -- engine-mips/, librespot + tokio + rustls built as a
+# static mipsel-musl binary -- which addon.c starts with fork()/execv() and
+# speaks to over a unix socket. `docs/ADDONS.md` has the why; the short version
+# is that the device's glibc is 2.16 and nothing on this side can link a modern
+# Rust library, while a static binary has no libc to ask.
 #
-#   <card>/Addons/spotify/assets/spotify_engine.so
+# What this file does, and what it deliberately does not:
 #
-# `assets/` on purpose: addons/Makefile's pack rule copies an addon's `*.png`,
-# `*.txt`, `*.ini` and its whole `assets/` folder, and nothing else, so this is
-# the one place a second `.so` can sit without that rule having to grow a case
-# for one addon.
+#   * `make addons` copies the already-built device binary into
+#     spotify/assets/, which is the one place addons/Makefile's pack rule looks
+#     for a second file. It does NOT build it: that needs docker (the image
+#     carries the musl cross compiler and the pinned Rust nightly), and `make
+#     addons` runs on machines that have neither. To build the engine:
 #
-# The rule never breaks `make addons`. Three things can be true of the machine
-# running it, and each has its answer:
+#         make -C addons/spotify/engine-mips        (in the docker image)
 #
-#   no cargo            the addon is built without an engine; the line in the
-#                       build output says so, and the addon's Engine row says
-#                       "engine not built" on the device. Nothing fails.
-#   cargo, no MIPS std  the same, with the reason named (`rustup target add`).
-#   cargo and the std   still not built by default -- see below.
+#     With no binary there, the addon is built without one and says "engine
+#     not built" on the screen. Nothing fails, and no stale binary is left in
+#     the folder for the packer to pick up.
 #
-# The last one is not a bug. Rust's mipsel-unknown-linux-gnu standard library
-# is built against glibc 2.17 and the device has 2.16, so a library linked from
-# it asks for symbols that are not there: `make addons-checks` (check-abi)
-# would catch it, and on the device it would be a dlopen() that fails with a
-# version in the message. The engine has to be built against a target whose std
-# is old enough -- a custom target JSON and `-Z build-std`, the way the rekkod
-# tree's spotify-engine did it -- and that needs nightly. Until then the target
-# build is opt-in, and this is the switch:
+#   * `make addons-host` builds the same crate for this machine (cargo without
+#     the MIPS flags) and puts the binary where the simulator's addon folder
+#     expects it. The host engine is the same program with the same protocol;
+#     only the librespot session needs an account to say anything interesting.
 #
-#   make addons SPOTIFY_ENGINE_ALLOW_TARGET=1
+#   * `make -C addons spotify-engine-test` runs the engine's unit tests.
 #
-# The host build has none of that trouble and is what the simulator uses:
-#
-#   make addons-host                     builds build/host/spotify_engine.so
-#   make -C addons spotify-engine-test   cargo test, on the machine
-spotify_ENGINE_DIR := $(CURDIR)/spotify/engine
-spotify_ENGINE_SO := $(CURDIR)/spotify/assets/spotify_engine.so
-spotify_ENGINE_HOST_SO := $(BUILD_DIR)/host/spotify_engine.so
-spotify_CARGO ?= $(firstword $(wildcard /usr/bin/cargo /usr/local/bin/cargo) $(shell command -v cargo 2>/dev/null))
-spotify_ENGINE_TARGET ?= mipsel-unknown-linux-gnu
-spotify_ENGINE_ALLOW_TARGET ?= 0
+# Nothing here links anything new into the addon: libc's pthread and the socket
+# calls come with ADDON_LIBS and the player's own libc, and the engine is a file
+# on the card, not a library.
+spotify_ENGINE_DIR := $(CURDIR)/spotify/engine-mips
+spotify_ENGINE_MIPS := $(spotify_ENGINE_DIR)/target/mipsel-unknown-linux-musl/release/spotify-engine-mips
+spotify_ENGINE_HOST_BIN := $(spotify_ENGINE_DIR)/target/release/spotify-engine-mips
+spotify_ENGINE_ASSET := $(CURDIR)/spotify/assets/spotify-engine-mips
+spotify_ENGINE_HOST := $(BUILD_DIR)/host/spotify-engine-host
+spotify_ENGINE_CARGO ?= $(shell command -v cargo 2>/dev/null)
 
+# Where the addon keeps nothing of the build's: the header of addon.c.
 spotify_CFLAGS = -I$(CURDIR)/spotify
-# dlopen()/dlsym() are libdl on this device's glibc 2.16. The player links it
-# too, so the symbols would resolve from there, but an addon that names its own
-# dependencies is the rule here (-lpthread -lm -lrt come with ADDON_LIBS for
-# the same reason).
-spotify_LIBS = -ldl
 
-# The addon's own prerequisites: the two libraries that are not made by a C
-# compiler. Written as prerequisite lines rather than by touching ADDON_RULE --
-# make merges them into the recipe rule below, wherever it is declared -- and
-# order-only, because ADDON_RULE links `$^`: a phony prerequisite in there
-# would be handed to the linker as an input file.
-$(BUILD_DIR)/target/spotify.so: | spotify-engine-target
+# The two libraries that are not made by a C compiler. Written as prerequisite
+# lines rather than by touching ADDON_RULE -- make merges them into the recipe
+# rule wherever it is declared -- and order-only, because ADDON_RULE links `$^`
+# and a phony prerequisite in there would be handed to the linker as an input.
+$(BUILD_DIR)/target/spotify.so: | spotify-engine-pack
 $(BUILD_DIR)/host/spotify.so: | spotify-engine-host
 
-.PHONY: spotify-engine spotify-engine-host spotify-engine-target spotify-engine-test
+.PHONY: spotify-engine spotify-engine-pack spotify-engine-host spotify-engine-test
 
 # Both halves, for a hand-run `make -C addons spotify-engine`.
-spotify-engine: spotify-engine-host spotify-engine-target
+spotify-engine: spotify-engine-pack spotify-engine-host
 
+# The device binary, into the folder the packer copies onto the card. Absent
+# source, absent file: a card that used to carry an engine and no longer has one
+# must say "engine not built", not run yesterday's.
+spotify-engine-pack:
+	@if [ -f "$(spotify_ENGINE_MIPS)" ]; then \
+		mkdir -p "$(dir $(spotify_ENGINE_ASSET))"; \
+		cp "$(spotify_ENGINE_MIPS)" "$(spotify_ENGINE_ASSET)"; \
+		chmod 0755 "$(spotify_ENGINE_ASSET)"; \
+		echo "spotify: engine [device]: $(spotify_ENGINE_ASSET) ($$(stat -c%s "$(spotify_ENGINE_ASSET)") bytes)"; \
+	else \
+		rm -f "$(spotify_ENGINE_ASSET)"; \
+		echo "spotify: engine not built for the device: $(spotify_ENGINE_MIPS) is not there"; \
+		echo "spotify:   build it with: make -C addons/spotify/engine-mips   (docker + the image's toolchain)"; \
+		echo "spotify:   the addon is built without it and says \"engine not built\" on the screen"; \
+	fi
+
+# The same crate for this machine. `--offline` first: a machine that has built
+# it once has every crate in the registry cache, and a machine with no network
+# should not wait for a fetch to time out.
 spotify-engine-host:
-	@if [ -z "$(spotify_CARGO)" ]; then \
-		echo "spotify: engine not built for the host: cargo is not installed (the addon runs without it)"; \
+	@if [ -z "$(spotify_ENGINE_CARGO)" ]; then \
+		echo "spotify: engine not built for the simulator: cargo is not installed (the addon shows \"engine not built\")"; \
+		rm -f "$(spotify_ENGINE_HOST)"; \
 		exit 0; \
 	fi; \
-	mkdir -p $(BUILD_DIR)/host; \
-	cd $(spotify_ENGINE_DIR) && $(spotify_CARGO) build --release --offline --quiet \
-		|| { echo "spotify: cargo build failed; the addon is built without an engine"; exit 0; }; \
-	cp $(spotify_ENGINE_DIR)/target/release/libspotify_engine.so $(spotify_ENGINE_HOST_SO); \
-	echo "spotify: engine [host]: $(spotify_ENGINE_HOST_SO)"
+	mkdir -p "$(dir $(spotify_ENGINE_HOST))"; \
+	if ! (cd "$(spotify_ENGINE_DIR)" && $(spotify_ENGINE_CARGO) build --release --offline >/dev/null 2>&1); then \
+		(cd "$(spotify_ENGINE_DIR)" && $(spotify_ENGINE_CARGO) build --release --quiet) \
+			|| { echo "spotify: engine not built for the simulator: cargo build failed (the addon shows \"engine not built\")"; \
+				rm -f "$(spotify_ENGINE_HOST)"; exit 0; }; \
+	fi; \
+	cp "$(spotify_ENGINE_HOST_BIN)" "$(spotify_ENGINE_HOST)"; \
+	chmod 0755 "$(spotify_ENGINE_HOST)"; \
+	echo "spotify: engine [host]: $(spotify_ENGINE_HOST)"
 
-spotify-engine-target:
-	@if [ -z "$(spotify_CARGO)" ]; then \
-		echo "spotify: engine not built: cargo is not installed (the addon runs without it)"; \
-		exit 0; \
-	fi; \
-	if [ "$(spotify_ENGINE_ALLOW_TARGET)" != "1" ]; then \
-		echo "spotify: engine not built for the device: Rust's $(spotify_ENGINE_TARGET) std needs glibc 2.17 and the device has 2.16."; \
-		echo "spotify:   the addon is built without it and says \"engine not built\" on the screen."; \
-		echo "spotify:   see addons/spotify/engine/README.md (SPOTIFY_ENGINE_ALLOW_TARGET=1 overrides)"; \
-		exit 0; \
-	fi; \
-	libdir=$$(rustc --print target-libdir --target $(spotify_ENGINE_TARGET) 2>/dev/null); \
-	if [ ! -d "$$libdir" ]; then \
-		echo "spotify: engine not built: no $(spotify_ENGINE_TARGET) standard library (rustup target add $(spotify_ENGINE_TARGET))"; \
-		exit 0; \
-	fi; \
-	mkdir -p $(dir $(spotify_ENGINE_SO)); \
-	cd $(spotify_ENGINE_DIR) && \
-		CARGO_TARGET_MIPSEL_UNKNOWN_LINUX_GNU_LINKER=$(CROSS_CC) \
-		$(spotify_CARGO) build --release --offline --target $(spotify_ENGINE_TARGET) \
-		|| { echo "spotify: cargo build --target $(spotify_ENGINE_TARGET) failed; the addon is built without an engine"; exit 0; }; \
-	cp $(spotify_ENGINE_DIR)/target/$(spotify_ENGINE_TARGET)/release/libspotify_engine.so $(spotify_ENGINE_SO); \
-	echo "spotify: engine [target]: $(spotify_ENGINE_SO) (run make addons-checks: this one may ask for a newer glibc)"
-
-# The engine's own tests: 27 of them, no network, no device. They are not part
-# of `make addons` because they are Rust's business and not the card's.
+# The engine's own tests: no network, no device, no account.
 spotify-engine-test:
-	@if [ -z "$(spotify_CARGO)" ]; then echo "spotify: no cargo, no tests"; exit 0; fi
-	cd $(spotify_ENGINE_DIR) && $(spotify_CARGO) test --offline
+	@if [ -z "$(spotify_ENGINE_CARGO)" ]; then echo "spotify: no cargo, no tests"; exit 0; fi
+	cd "$(spotify_ENGINE_DIR)" && $(spotify_ENGINE_CARGO) test

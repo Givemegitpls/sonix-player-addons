@@ -1,0 +1,4 @@
+# The engine is built, not committed: addons/spotify/addon.mk copies the device
+# binary here for the packer (`make addons`). The simulator's copy goes to
+# addons/build/host/spotify-engine-host (`make addons-host`).
+/assets/

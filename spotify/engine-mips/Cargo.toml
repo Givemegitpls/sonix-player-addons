@@ -1,0 +1,63 @@
+[package]
+name = "spotify-engine-mips"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+description = "The librespot half of the Sonix Spotify addon, as a static MIPS process for the TempoTec V3."
+
+[[bin]]
+name = "spotify-engine-mips"
+path = "src/main.rs"
+
+# librespot 0.8 with rustls and no native TLS: rustls' C half (ring) is the only
+# thing in the tree that has to be cross-compiled for mips, and native-tls
+# would want OpenSSL, which the musl.cc toolchain does not carry.
+#
+# default-features = false drops librespot's `native-tls` and `with-dns-sd`
+# (libmdns); `rustls-tls-webpki-roots` is the one that keeps the network half
+# pure Rust apart from ring, with the trust anchors compiled in instead of read
+# from the device's (nonexistent) /etc/ssl.
+[dependencies]
+librespot-core = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-audio = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-metadata = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-protocol = "=0.8.0"
+# The playlist rootlist is a protobuf, not JSON, so it is parsed with the same
+# protobuf crate librespot uses. Pinned to the version already in the graph.
+protobuf = "3.7"
+# Direct only for the SIOCSIFFLAGS that raises `lo`: the device boots with the
+# loopback interface down, and the audio pipe binds to 127.0.0.1.
+libc = "0.2"
+# The HTTP half. hyper is already linked in through librespot's client; the
+# server side of the same version is a small addition and saves hand-rolling
+# chunked framing on the device. `bytes`, `http-body` and `http-body-util` are
+# its companions, also already in the graph.
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Direct only for `--self-test`: rustls reaches ring through hyper-rustls, and
+# ring is the one dependency in this tree with C code (there is no MIPS assembly
+# in it, so it is the C fallback). A SHA-256 of the empty string computed on the
+# device is the cheapest way to know that half runs and is not silently wrong --
+# the same class of failure the -soft-float flag exists for.
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+# preserve_order so that a response reads in the order it was written
+# ({"ok":true,"protocol":1,...}) instead of serde_json's alphabetical default:
+# the protocol is read by hand in the addon's C half, and a human reading
+# `probe` output should not have to re-sort it.
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "signal"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+# The engine is a separate process here, but the same rule as ../engine: a panic
+# must not unwind, and panic_abort also keeps the unwinder out of the link.
+panic = "abort"
