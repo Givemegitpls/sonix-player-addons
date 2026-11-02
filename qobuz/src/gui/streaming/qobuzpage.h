@@ -7,14 +7,14 @@
 
 #include "lvgl/lvgl.h"
 
-// The Qobuz pages: the main one, login, search and the results list (a single
-// list, reused for tracks, albums, artists and playlists). `addon_id` is
+// The Qobuz pages: the main one, search and the results list (a single list,
+// reused for tracks, albums, artists and playlists). `addon_id` is
 // sonix_addon_host_t::id, kept for sonix_addon_own_screen().
 void qobuzpage_init(gui_config_t *cfg, const char *addon_id);
 
 // Takes the page apart for the addon's stop(): the two workers, the three
 // timers, every hook into player code, the transfers (through qobuzcache_stop),
-// the four screens opened beside the one init() returned, and every screen
+// the three screens opened beside the one init() returned, and every screen
 // pointer. False when a bounded wait found a worker still in the library -- see
 // addon.h, "Unloading".
 bool qobuzpage_stop(void);

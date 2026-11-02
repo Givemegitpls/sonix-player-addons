@@ -36,10 +36,10 @@ typedef enum {
 //     browser; no device flow, no refresh token. What every open client uses
 //     is the web session's own token, which the user copies from
 //     zvuk.com/api/tiny/profile once signed in there. The addon takes it from
-//     a file at the card's root, zvuk_token.txt (ZVUK_TOKEN_FILE), and from
-//     nowhere else: no keyboard, no QR, no page on the phone. It is sent as the
-//     X-Auth-Token header. No application keys at all: Zvuk needs none of the
-//     firmware's, and the addon hard-codes none of its own;
+//     a file in its own folder on the card, token.txt (ZVUK_TOKEN_FILE), and
+//     from nowhere else: no keyboard, no QR, no page on the phone. It is sent
+//     as the X-Auth-Token header. No application keys at all: Zvuk needs none
+//     of the firmware's, and the addon hard-codes none of its own;
 //   * almost everything is GraphQL (POST /api/v1/graphql); the profile is
 //     REST (/api/tiny/profile). Both sit behind ServicePipe, an anti-bot
 //     filter that answers 418 or an HTML page to anything that does not look
@@ -72,8 +72,8 @@ typedef enum {
 #define ZVUK_URL_MAX 320
 #define ZVUK_TOKEN_MAX 160
 
-// The file on the card the token comes from.
-#define ZVUK_TOKEN_FILE "zvuk_token.txt"
+// The file in the addon's own folder the token comes from.
+#define ZVUK_TOKEN_FILE "token.txt"
 
 typedef enum { ZVUK_CONTENT_TRACK = 0, ZVUK_CONTENT_CHAPTER, ZVUK_CONTENT_EPISODE } zvuk_content_t;
 
@@ -141,7 +141,7 @@ bool zvuk_session_expired(void);
 void zvuk_logout(void);
 
 // ---------------------------------------------------------------------------
-// Signing in with a token from the card (ZVUK_TOKEN_FILE)
+// Signing in with a token from the addon's folder (ZVUK_TOKEN_FILE)
 // ---------------------------------------------------------------------------
 
 // Cleans what the file held: spaces, quotes, "token=" in front, or a whole

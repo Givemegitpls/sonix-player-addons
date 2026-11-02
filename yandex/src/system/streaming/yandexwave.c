@@ -185,7 +185,7 @@ static void run_more(void) {
 
 static void *worker_main(void *arg) {
 	(void)arg;
-	yandexlive_enter();
+	yandexlive_enter(YANDEXLIVE_WAVE);
 	// Below the interface, not starved by it: see yandexsync.c for why not
 	// SCHED_IDLE. A batch is a request somebody's music is waiting on.
 	thread_be_low_priority("yandex wave");
@@ -209,7 +209,7 @@ static void *worker_main(void *arg) {
 			yandex_wave_feedback(job.event, job.id[0] ? job.id : NULL, job.album, job.secs);
 		}
 	}
-	yandexlive_leave();
+	yandexlive_leave(YANDEXLIVE_WAVE);
 	return NULL;
 }
 
@@ -283,7 +283,7 @@ bool yandexwave_stop(void) {
 	queue_len = 0;
 	pthread_cond_broadcast(&ready);
 	pthread_mutex_unlock(&lock);
-	bool safe = yandexlive_wait("the wave worker", YANDEXLIVE_WAIT_MS);
+	bool safe = yandexlive_wait(YANDEXLIVE_WAVE, "the wave worker", YANDEXLIVE_WAIT_MS);
 
 	pthread_mutex_lock(&lock);
 	running = false;

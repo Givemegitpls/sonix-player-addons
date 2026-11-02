@@ -7,6 +7,6 @@
   "version": "0.1",
   "icon": "icon.png",
   "service": true,
-  "owns_paths": [".local/zvuk-cache/", ".local/zvuk-saved.tsv", ".local/listart/"],
-  "cache_path": ".local/zvuk-cache/"
+  "owns_paths": ["Addons/zvuk/cache/", "Addons/zvuk/saved.tsv"],
+  "cache_path": "Addons/zvuk/cache/"
 }

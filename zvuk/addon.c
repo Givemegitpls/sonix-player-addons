@@ -1,5 +1,7 @@
 #include "src/addon/addon.h"
 
+#include "common/addonfs.h"
+
 #include "src/gui/streaming/zvukpage.h"
 #include "src/system/streaming/streamturn.h"
 #include "src/system/streaming/zvuk.h"
@@ -37,16 +39,69 @@
 //
 // Keys and the token: Zvuk needs none of the firmware's keys, only the user's
 // own token, which the user copies out of zvuk.com/api/tiny/profile into
-// <card>/zvuk_token.txt. The addon reads that file itself (there is no
-// cardimport here) and keeps the session it gets in its own folder on the card;
-// its settings -- the address, the User-Agent, the quality ceiling -- are
+// token.txt in this addon's folder. The addon reads that file itself (there is
+// no cardimport here) and keeps the session it gets beside it; its settings --
+// the address, the User-Agent, the quality ceiling -- are
 // <card>/Addons/zvuk/settings.ini. Nothing of it is in device_config.ini.
+//
+// The rule for everything below: an addon writes under its own folder and
+// nowhere else -- settings beside addon.so, caches and indexes under it too.
+// What earlier builds left at the card's root and in the card's shared ".local"
+// tree is moved in once, at init() (zvuk_migrate_card_files). The saved music
+// is the exception that proves it: <music>/Zvuk/ is the user's library, not
+// this addon's storage, and it stays where the scanner finds it.
+
+// The three files this addon used to keep outside its own folder: the token at
+// the card's root, the index of what was saved and the audio cache in the
+// card's shared ".local" tree -- which is the player's, and which a factory
+// reset, the USB export and the card watcher each had to guess about.
+//
+// One-shot and conservative: addon_migrate_path() renames rather than copies,
+// does nothing when the new path is already there (the move is done) or the old
+// one is not (there was nothing to move), and on a failure -- a read-only card,
+// a card just pulled -- logs and leaves both alone, so the next start tries
+// again. A missing token is the normal case, not a failure: it is how a user
+// signs in, and the addon runs without one.
+//
+// The cache's directory is moved before addon_cache_dir() creates it: an empty
+// directory at the new path would read as "already migrated" and the move would
+// never happen.
+static void zvuk_migrate_card_files(const sonix_addon_host_t *host) {
+	if (!host || !host->dir || !host->dir[0] || !host->sd_root || !host->sd_root[0]) {
+		return;
+	}
+	char old_path[512], new_path[512];
+
+	snprintf(old_path, sizeof(old_path), "%s/zvuk_token.txt", host->sd_root);
+	snprintf(new_path, sizeof(new_path), "%s/%s", host->dir, ZVUK_TOKEN_FILE);
+	addon_migrate_path(old_path, new_path);
+
+	snprintf(old_path, sizeof(old_path), "%s/.local/zvuk-saved.tsv", host->sd_root);
+	snprintf(new_path, sizeof(new_path), "%s/%s", host->dir, ZVUKDL_INDEX);
+	addon_migrate_path(old_path, new_path);
+
+	snprintf(old_path, sizeof(old_path), "%s/.local/zvuk-cache", host->sd_root);
+	snprintf(new_path, sizeof(new_path), "%s/cache", host->dir);
+	addon_migrate_path(old_path, new_path);
+}
 
 static lv_obj_t *zvuk_addon_init(const sonix_addon_host_t *host) {
 	// The card first: the settings and the session are read from it, and so is
 	// everything the cache and the library index do.
 	zvukconf_init(host->dir);
+
+	// Before any module opens a file, the ones an earlier build left elsewhere
+	// on the card are brought into this folder.
+	zvuk_migrate_card_files(host);
+
+	// The cache lives in <addon>/cache, made here. A card that refuses it (a
+	// read-only one, or one that has gone) leaves it NULL: tracks then stream
+	// and are not kept, rather than landing somewhere that is not ours.
+	char cache[512];
+	bool have_cache = addon_cache_dir(host, cache, sizeof(cache));
+	zvukcache_set_addon_dir(have_cache ? cache : NULL);
 	zvukcache_set_root(host->sd_root);
+	zvukdl_set_addon_dir(host->dir);
 	zvukdl_set_root(host->sd_root);
 	zvuk_init();
 
@@ -59,7 +114,7 @@ static lv_obj_t *zvuk_addon_init(const sonix_addon_host_t *host) {
 	// The page. It fills in the two interface objects the service table carries
 	// (the mark over the artwork, "show album") itself, at the end of its own
 	// init, and registers every screen it builds with the shell as it makes it.
-	zvukpage_init(host->cfg, host->id, host->sd_root);
+	zvukpage_init(host->cfg, host->id, host->sd_root, host->dir);
 
 	return zvukpage_screen;
 }

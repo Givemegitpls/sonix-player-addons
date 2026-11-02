@@ -317,7 +317,7 @@ static void *worker_main(void *arg) {
 	(void)arg;
 	// Counted in yandexlive from its first instruction to its last: stop()
 	// waits on this count, and frees the queue and the jobs below it.
-	yandexlive_enter();
+	yandexlive_enter(YANDEXLIVE_PLAY);
 	// A tapped track is waited on: a dead network is said in seconds.
 	yandex_http_set_thread_timeout_cap(STREAM_UI_TIMEOUT_SECS);
 	for (;;) {
@@ -385,7 +385,7 @@ static void *worker_main(void *arg) {
 			free(r);
 		}
 	}
-	yandexlive_leave();
+	yandexlive_leave(YANDEXLIVE_PLAY);
 	return NULL;
 }
 
@@ -939,7 +939,7 @@ bool yandexplay_stop(void) {
 	metadata_pending.kind = JOB_NONE;
 	pthread_cond_broadcast(&job_cond);
 	pthread_mutex_unlock(&job_lock);
-	bool safe = yandexlive_wait("the play worker", YANDEXLIVE_WAIT_MS);
+	bool safe = yandexlive_wait(YANDEXLIVE_PLAY, "the play worker", YANDEXLIVE_WAIT_MS);
 
 	// Its answers have landed or been dropped by now. What is left is this
 	// module's memory: the queue (ids of a card that may be gone), the listener,

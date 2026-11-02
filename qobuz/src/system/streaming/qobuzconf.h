@@ -22,6 +22,8 @@
 //                                      player, 0 when it was not
 //                  migrated           the old files have been read once
 //   session.ini:   token, user          the account
+//                  signed_out          the token file is not to be read again
+//                                      until someone signs in (see below)
 //
 // The pair is Qobuz's, not this project's: when the addon has none it derives
 // one from the web player (qobuzkey.c) and keeps it here, which is why
@@ -68,8 +70,16 @@ void qobuzconf_save_creds(const char *app_id, const char *app_secret, long at, b
 void qobuzconf_session(char *token, size_t token_size, char *user, size_t user_size);
 
 // Writes the account. An empty token is a sign-out: the keys are removed from
-// the file, and the old place is not read again (see `migrated`).
-void qobuzconf_save_session(const char *token, const char *user);
+// the file, `signed_out` is set, and the old place is not read again (see
+// `migrated`). False when the card would not take it (read-only, full, gone):
+// the session in memory is still the one this run uses.
+bool qobuzconf_save_session(const char *token, const char *user);
+
+// True when the last thing written here was a sign-out. The token file on the
+// card is the account, so without this a sign-out would last exactly until the
+// next start; with it, coming back is the "Sign in from the card" row -- which
+// ignores this -- and not a restart of the player.
+bool qobuzconf_signed_out(void);
 
 // The addon's folder, "" when there is none.
 const char *qobuzconf_dir(void);

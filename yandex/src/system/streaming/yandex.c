@@ -672,15 +672,16 @@ static bool ensure_uid(void) {
 }
 
 // ---------------------------------------------------------------------------
-// Signing in with a token from the card (yandex_token.txt)
+// Signing in with a token from the card's addon folder (token.txt)
 //
 // The fork's way in was the OAuth device flow (yandex_login_begin/poll): a code
 // typed on a phone. That needs the application keys as well, and the addon has
 // them -- but a flow that shows a code and waits is a page, and this stage has
 // no page. What it has is the token itself: the user copies it out of the web
 // player (yandex.ru/music, the session's own OAuth token) into
-// <card>/yandex_token.txt, and the addon takes it from there, one file, like
-// Zvuk's (zvukstate.c). Nothing else signs in: no keyboard, no QR.
+// <card>/Addons/yandex/token.txt, and the addon takes it from there, one file at
+// the top of its own folder like the settings and the session, as Zvuk does.
+// Nothing else signs in: no keyboard, no QR.
 // ---------------------------------------------------------------------------
 
 // Cleans what the file held: spaces, quotes, a "token=" or "OAuth " in front, a
@@ -801,16 +802,25 @@ static void id_any(const json_doc_t *doc, int tok, char *out, size_t size) {
 
 static void id_of(const json_doc_t *doc, int obj, const char *key, char *out, size_t size) { id_any(doc, obj >= 0 ? json_get(doc, obj, key) : -1, out, size); }
 
-static void artists_of(const json_doc_t *doc, int obj, char *out, size_t size) {
+static void artists_of(const json_doc_t *doc, int obj, char *out, size_t size, char *first_id, size_t id_size) {
 	out[0] = '\0';
+	if (first_id && id_size) {
+		first_id[0] = '\0';
+	}
 	int arr = json_get(doc, obj, "artists");
 	int n = arr >= 0 ? json_len(doc, arr) : 0;
 	size_t used = 0;
 	for (int i = 0; i < n && i < 3; i++) {
+		int a = json_at(doc, arr, i);
 		char name[96] = "";
-		json_obj_str(doc, json_at(doc, arr, i), "name", name, sizeof(name));
+		json_obj_str(doc, a, "name", name, sizeof(name));
 		if (name[0]) {
 			used += (size_t)snprintf(out + used, used < size ? size - used : 0, "%s%s", used ? ", " : "", name);
+		}
+		if (i == 0 && first_id && id_size) {
+			// The first artist's id is the one a row's "Open artist" needs; the
+			// name is all the row shows, and both come from the same entry.
+			id_of(doc, a, "id", first_id, id_size);
 		}
 	}
 }
@@ -833,7 +843,7 @@ static void track_from(const json_doc_t *doc, int t, yandex_track_t *out) {
 	memset(out, 0, sizeof(*out));
 	id_of(doc, t, "id", out->id, sizeof(out->id));
 	json_obj_str(doc, t, "title", out->title, sizeof(out->title));
-	artists_of(doc, t, out->artist, sizeof(out->artist));
+	artists_of(doc, t, out->artist, sizeof(out->artist), out->artist_id, sizeof(out->artist_id));
 	int albums = json_get(doc, t, "albums");
 	int album = albums >= 0 && json_len(doc, albums) > 0 ? json_at(doc, albums, 0) : -1;
 	if (album >= 0) {
@@ -861,7 +871,7 @@ static void album_from(const json_doc_t *doc, int a, yandex_album_t *out) {
 	memset(out, 0, sizeof(*out));
 	id_of(doc, a, "id", out->id, sizeof(out->id));
 	json_obj_str(doc, a, "title", out->title, sizeof(out->title));
-	artists_of(doc, a, out->artist, sizeof(out->artist));
+	artists_of(doc, a, out->artist, sizeof(out->artist), out->artist_id, sizeof(out->artist_id));
 	char uri[300] = "";
 	json_obj_str(doc, a, "coverUri", uri, sizeof(uri));
 	yandex_cover_url(uri, 200, out->cover, sizeof(out->cover));
@@ -1248,7 +1258,7 @@ static void album_meta_from(const json_doc_t *doc, int a, const char *album_id, 
 	if (various) {
 		snprintf(out->artist, sizeof(out->artist), "Various Artists");
 	} else {
-		artists_of(doc, a, out->artist, sizeof(out->artist));
+		artists_of(doc, a, out->artist, sizeof(out->artist), out->artist_id, sizeof(out->artist_id));
 	}
 	json_obj_str(doc, a, "genre", out->genre, sizeof(out->genre));
 	out->year = (int)json_obj_long(doc, a, "year", 0);

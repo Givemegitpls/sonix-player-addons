@@ -288,16 +288,29 @@ void qobuzconf_session(char *token, size_t token_size, char *user, size_t user_s
 	pthread_mutex_unlock(&conf_lock);
 }
 
-void qobuzconf_save_session(const char *token, const char *user) {
+bool qobuzconf_save_session(const char *token, const char *user) {
+	bool saved = false;
 	pthread_mutex_lock(&conf_lock);
 	if (loaded) {
 		store_set(&session, "token", token ? token : "");
 		store_set(&session, "user", user ? user : "");
-		if (!store_save(&session)) {
+		// A sign-out says so in the file: the token on the card would otherwise
+		// sign the account straight back in at the next start (qobuzconf.h).
+		store_set(&session, "signed_out", (token && token[0]) ? "" : "1");
+		saved = store_save(&session);
+		if (!saved) {
 			fprintf(stderr, "qobuz: cannot write %s\n", session.path);
 		}
 	}
 	pthread_mutex_unlock(&conf_lock);
+	return saved;
+}
+
+bool qobuzconf_signed_out(void) {
+	pthread_mutex_lock(&conf_lock);
+	bool out = loaded && strcmp(store_get(&session, "signed_out"), "1") == 0;
+	pthread_mutex_unlock(&conf_lock);
+	return out;
 }
 
 const char *qobuzconf_dir(void) { return conf_dir; }

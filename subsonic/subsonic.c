@@ -1,5 +1,7 @@
 #include "subsonic.h"
 
+#include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -7,6 +9,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -37,10 +41,28 @@ typedef struct {
 	char password_hex[256]; // only for servers that refuse tokens
 } session_t;
 
+// One server, as its file on the card describes it: what the Servers page lists.
+typedef struct {
+	char slug[SUBSONIC_SLUG_MAX];
+	char label[SUBSONIC_LABEL_MAX];
+	char server[SUBSONIC_SERVER_MAX];
+	char user[SUBSONIC_NAME_MAX];
+} host_t;
+
 static pthread_mutex_t session_lock = PTHREAD_MUTEX_INITIALIZER;
 static session_t session;
-static store_t settings; // the same, on the card; guarded by session_lock
+static char session_slug[SUBSONIC_SLUG_MAX]; // which file `session` belongs to
+static char session_label[SUBSONIC_LABEL_MAX];
+static store_t settings; // the active server's file; guarded by session_lock
 static int quality = SUBSONIC_QUALITY_ORIGINAL;
+
+// <dir>/servers, and the files in it. The list is a copy: the page asks for a
+// row and gets text, never a pointer into the set that the next scan replaces.
+static char hosts_dir[STORE_PATH_MAX];
+static bool hosts_ready; // the folder exists, so a write has somewhere to go
+static host_t hosts[SUBSONIC_HOSTS_MAX];
+static int host_count;
+static char hosts_note[192]; // under session_lock, like everything above
 
 static __thread char last_error[192];
 
@@ -59,51 +81,42 @@ static void session_copy(session_t *out) {
 	pthread_mutex_unlock(&session_lock);
 }
 
-static void normalise_server(const char *in, char *out, size_t size);
-
-// The session goes to the addon's own file on the card, <dir>/session.ini, and
-// nothing goes to the player's configuration: that file is the player's, it is
-// rewritten whole on every save, and a worker thread writing to it races the
-// interface for it. The card is also where the addon itself lives, so a card
-// that is pulled takes the session with it and a fresh card starts signed out,
-// which is what the second reading of "an addon is a package on a card" means.
-static void persist_locked(void) {
-	store_set(&settings, "server", session.server);
-	store_set(&settings, "user", session.user);
-	store_set(&settings, "salt", session.salt);
-	store_set(&settings, "token", session.token);
-	store_set(&settings, "password_hex", session.password_hex);
-	store_save(&settings);
+// The sentence the page shows after a sign-in that worked but could not be
+// kept, and any other "the card is not taking this" the user has to hear.
+static void set_note_locked(const char *text) {
+	snprintf(hosts_note, sizeof(hosts_note), "%s", text ? text : "");
 }
 
-// `dir` is the addon's folder on the card: host->dir in init(). Read once.
-void subsonic_load(const char *dir) {
-	char path[STORE_PATH_MAX];
-	if (dir && dir[0]) {
-		snprintf(path, sizeof(path), "%s/session.ini", dir);
-	} else {
-		path[0] = '\0';
-	}
+static void clear_note_locked(void) { hosts_note[0] = '\0'; }
 
+void subsonic_hosts_note(char *out, size_t size) {
+	if (!out || !size) {
+		return;
+	}
 	pthread_mutex_lock(&session_lock);
-	store_init(&settings, path);
-	store_load(&settings);
-	memset(&session, 0, sizeof(session));
-	// Through the same normaliser the sign-in form uses: a server written once
-	// without a scheme, or edited by hand, arrives with one.
-	normalise_server(store_get(&settings, "server"), session.server, sizeof(session.server));
-	snprintf(session.user, sizeof(session.user), "%s", store_get(&settings, "user"));
-	snprintf(session.salt, sizeof(session.salt), "%s", store_get(&settings, "salt"));
-	snprintf(session.token, sizeof(session.token), "%s", store_get(&settings, "token"));
-	snprintf(session.password_hex, sizeof(session.password_hex), "%s", store_get(&settings, "password_hex"));
-	quality = store_get_int(&settings, "quality", SUBSONIC_QUALITY_ORIGINAL);
+	snprintf(out, size, "%s", hosts_note);
 	pthread_mutex_unlock(&session_lock);
+}
 
-	if (quality < 0 || quality >= SUBSONIC_QUALITY_COUNT) {
-		quality = SUBSONIC_QUALITY_ORIGINAL;
+static void normalise_server(const char *in, char *out, size_t size);
+static bool persist_locked(void);
+
+// ---------------------------------------------------------------------------
+// quality
+// ---------------------------------------------------------------------------
+
+int subsonic_get_quality(void) { return quality; }
+
+void subsonic_set_quality(int q) {
+	if (q < 0 || q >= SUBSONIC_QUALITY_COUNT) {
+		return;
 	}
-
-	printf("addon subsonic: %s\n", subsonic_logged_in() ? "saved session" : "no session");
+	quality = q;
+	// Into the active server's file: the choice is the account's, not the
+	// player's. persist_locked() skips a server that has no file.
+	pthread_mutex_lock(&session_lock);
+	persist_locked();
+	pthread_mutex_unlock(&session_lock);
 }
 
 bool subsonic_logged_in(void) {
@@ -116,8 +129,8 @@ bool subsonic_logged_in(void) {
 void subsonic_display_name(char *out, size_t size) {
 	session_t s;
 	session_copy(&s);
-	const char *host = strstr(s.server, "://");
-	host = host ? host + 3 : s.server;
+	char host[SUBSONIC_SERVER_MAX];
+	subsonic_server_host(s.server, host, sizeof(host));
 	if (s.user[0]) {
 		snprintf(out, size, "%s @ %s", s.user, host);
 	} else if (size) {
@@ -151,23 +164,6 @@ void subsonic_track_key(const char *song_id, char *out, size_t size) {
 		}
 	}
 	snprintf(out, size, "%016llx", (unsigned long long)h);
-}
-
-// ---------------------------------------------------------------------------
-// quality
-// ---------------------------------------------------------------------------
-
-int subsonic_get_quality(void) { return quality; }
-
-void subsonic_set_quality(int q) {
-	if (q < 0 || q >= SUBSONIC_QUALITY_COUNT) {
-		return;
-	}
-	quality = q;
-	pthread_mutex_lock(&session_lock);
-	store_set_int(&settings, "quality", q);
-	store_save(&settings);
-	pthread_mutex_unlock(&session_lock);
 }
 
 const char *subsonic_expected_suffix(const subsonic_track_t *track) {
@@ -484,7 +480,558 @@ static void normalise_server(const char *in, char *out, size_t size) {
 	out[plen + n] = '\0';
 }
 
-bool subsonic_login(const char *server, const char *user, const char *password) {
+// ---------------------------------------------------------------------------
+// The servers on the card
+//
+// One file per server in <dir>/servers/, plus a one-line `active` naming the
+// one in use. A file each and not one file for all of them, because store.h
+// holds sixteen keys and a second account would need them all again: splitting
+// by file is what the shared piece already does well, and it makes removing a
+// server an unlink() with nothing to renumber.
+//
+// None of it goes to the player's configuration: that file is the player's, it
+// is rewritten whole on every save, and a worker thread writing to it races the
+// interface for it. The card is also where the addon itself lives, so a card
+// that is pulled takes the servers with it and a fresh card starts signed out,
+// which is what the second reading of "an addon is a package on a card" means.
+// ---------------------------------------------------------------------------
+
+static bool make_dir(const char *path) {
+	if (mkdir(path, 0755) == 0) {
+		return true;
+	}
+	if (errno == EEXIST) {
+		return true;
+	}
+	fprintf(stderr, "addon subsonic: %s: %s\n", path, strerror(errno));
+	return false;
+}
+
+// Is there a server file in this folder? What the migration asks before it
+// moves an old session in: a folder with servers in it is a folder somebody has
+// already come back to.
+static bool has_ini(const char *path) {
+	DIR *d = opendir(path);
+	if (!d) {
+		return false;
+	}
+	bool any = false;
+	struct dirent *e;
+	while (!any && (e = readdir(d)) != NULL) {
+		size_t len = strlen(e->d_name);
+		any = len > 4 && strcmp(e->d_name + len - 4, ".ini") == 0;
+	}
+	closedir(d);
+	return any;
+}
+
+static bool file_there(const char *path) { return path[0] && access(path, F_OK) == 0; }
+
+static bool join_path(char *out, size_t size, const char *dir, const char *name, const char *suffix) {
+	int n = snprintf(out, size, "%s/%s%s", dir, name, suffix ? suffix : "");
+	return n > 0 && (size_t)n < size;
+}
+
+static bool host_path(const char *slug, char *out, size_t size) {
+	if (!hosts_dir[0] || !slug || !slug[0]) {
+		if (size) {
+			out[0] = '\0';
+		}
+		return false;
+	}
+	return join_path(out, size, hosts_dir, slug, ".ini");
+}
+
+static bool active_path(char *out, size_t size) {
+	if (!hosts_dir[0]) {
+		if (size) {
+			out[0] = '\0';
+		}
+		return false;
+	}
+	return join_path(out, size, hosts_dir, "active", NULL);
+}
+
+void subsonic_server_host(const char *server, char *out, size_t size) {
+	if (!out || !size) {
+		return;
+	}
+	const char *p = server ? strstr(server, "://") : NULL;
+	p = p ? p + 3 : (server ? server : "");
+	size_t n = 0;
+	while (p[n] && p[n] != '/' && n + 1 < size) {
+		n++;
+	}
+	memcpy(out, p, n);
+	out[n] = '\0';
+}
+
+// The address made into a file name: lower case, and nothing a card's FAT
+// filesystem or a shell would argue with. Twenty-four characters leave room for
+// the "-12" a second server on one host needs.
+static void slug_of(const char *server, char *out, size_t size) {
+	char host[SUBSONIC_SERVER_MAX];
+	subsonic_server_host(server, host, sizeof(host));
+
+	char work[SUBSONIC_SLUG_MAX];
+	size_t n = 0;
+	for (const char *p = host; *p && n + 1 < sizeof(work); p++) {
+		char c = *p;
+		if (c >= 'A' && c <= 'Z') {
+			c = (char)(c - 'A' + 'a');
+		}
+		if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-')) {
+			c = '-';
+		}
+		work[n++] = c;
+	}
+	work[n] = '\0';
+	// A leading dot would hide the file from a card reader; a trailing one is
+	// the same name Windows will not write.
+	while (n > 0 && (work[n - 1] == '.' || work[n - 1] == '-' || work[n - 1] == '_')) {
+		work[--n] = '\0';
+	}
+	size_t at = 0;
+	while (work[at] == '.' || work[at] == '-' || work[at] == '_') {
+		at++;
+	}
+	if (n <= at) {
+		snprintf(out, size, "server");
+		return;
+	}
+	snprintf(out, size, "%.*s", (int)((n - at) > 24 ? 24 : (n - at)), work + at);
+}
+
+// The `active` marker is one line of text, written to <file>.tmp and renamed:
+// the card can leave the slot between the two writes.
+static bool active_write(const char *slug) {
+	char path[STORE_PATH_MAX];
+	if (!active_path(path, sizeof(path))) {
+		return false;
+	}
+	if (!slug || !slug[0]) {
+		unlink(path); // no servers left, so no marker either
+		return true;
+	}
+	char tmp[STORE_PATH_MAX + 8];
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	FILE *f = fopen(tmp, "w");
+	if (!f) {
+		fprintf(stderr, "addon subsonic: %s: %s\n", tmp, strerror(errno));
+		return false;
+	}
+	fprintf(f, "%s\n", slug);
+	bool ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+	ok = (fclose(f) == 0) && ok;
+	if (!ok || rename(tmp, path) != 0) {
+		fprintf(stderr, "addon subsonic: %s: %s\n", path, strerror(errno));
+		unlink(tmp);
+		return false;
+	}
+	return true;
+}
+
+static bool active_read(char *out, size_t size) {
+	char path[STORE_PATH_MAX];
+	if (out && size) {
+		out[0] = '\0';
+	}
+	if (!out || !size || !active_path(path, sizeof(path))) {
+		return false;
+	}
+	FILE *f = fopen(path, "r");
+	if (!f) {
+		return false;
+	}
+	char line[SUBSONIC_SLUG_MAX];
+	bool got = fgets(line, sizeof(line), f) != NULL;
+	fclose(f);
+	if (!got) {
+		return false;
+	}
+	size_t len = strlen(line);
+	while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' || line[len - 1] == ' ')) {
+		line[--len] = '\0';
+	}
+	if (!len) {
+		return false;
+	}
+	snprintf(out, size, "%s", line);
+	return true;
+}
+
+// A free file name for a server -- and the file it already has, when this
+// server and this user are in it. Signing in again is a new token, not a second
+// entry for the same account.
+static void host_pick_slug_locked(const char *server, const char *user, char *out, size_t size) {
+	// 24 characters and a terminator: the "-99" below then cannot overrun the
+	// name, and the compiler can see that too.
+	char base[25];
+	slug_of(server, base, sizeof(base));
+	for (int i = 1; i < 100; i++) {
+		char candidate[SUBSONIC_SLUG_MAX];
+		if (i == 1) {
+			snprintf(candidate, sizeof(candidate), "%s", base);
+		} else {
+			snprintf(candidate, sizeof(candidate), "%s-%d", base, i);
+		}
+		char path[STORE_PATH_MAX];
+		if (!host_path(candidate, path, sizeof(path))) {
+			break;
+		}
+		if (!file_there(path)) {
+			snprintf(out, size, "%s", candidate);
+			return;
+		}
+		store_t probe;
+		store_init(&probe, path);
+		store_load(&probe);
+		char there[SUBSONIC_SERVER_MAX];
+		normalise_server(store_get(&probe, "server"), there, sizeof(there));
+		if (strcmp(there, server) == 0 && strcmp(store_get(&probe, "user"), user) == 0) {
+			snprintf(out, size, "%s", candidate);
+			return;
+		}
+	}
+	snprintf(out, size, "%s", base);
+}
+
+// What the row is called. A label that is not just the old address was written
+// by hand -- the file is plain text on the card -- and is the user's name for
+// this server, so it survives a change of address.
+static void login_label_locked(const char *slug, const char *server, char *out, size_t size) {
+	out[0] = '\0';
+	char path[STORE_PATH_MAX];
+	if (host_path(slug, path, sizeof(path))) {
+		store_t file;
+		store_init(&file, path);
+		store_load(&file);
+		char old_host[SUBSONIC_SERVER_MAX];
+		subsonic_server_host(store_get(&file, "server"), old_host, sizeof(old_host));
+		const char *old_label = store_get(&file, "label");
+		if (old_label[0] && strcmp(old_label, old_host) != 0) {
+			snprintf(out, size, "%s", old_label);
+			return;
+		}
+	}
+	subsonic_server_host(server, out, size);
+}
+
+// One file into the session, and the session into that file's settings. All or
+// nothing: a file that is not a server (no "server" key) leaves the current one
+// standing, so a stray .ini cannot sign the user out by being next in the folder.
+static bool store_into_session_locked(const store_t *file, const char *slug) {
+	session_t s;
+	memset(&s, 0, sizeof(s));
+	normalise_server(store_get(file, "server"), s.server, sizeof(s.server));
+	if (!s.server[0]) {
+		return false;
+	}
+	snprintf(s.user, sizeof(s.user), "%s", store_get(file, "user"));
+	snprintf(s.salt, sizeof(s.salt), "%s", store_get(file, "salt"));
+	snprintf(s.token, sizeof(s.token), "%s", store_get(file, "token"));
+	snprintf(s.password_hex, sizeof(s.password_hex), "%s", store_get(file, "password_hex"));
+
+	char label[SUBSONIC_LABEL_MAX];
+	snprintf(label, sizeof(label), "%s", store_get(file, "label"));
+	if (!label[0]) {
+		subsonic_server_host(s.server, label, sizeof(label));
+	}
+
+	int q = store_get_int(file, "quality", SUBSONIC_QUALITY_ORIGINAL);
+	if (q < 0 || q >= SUBSONIC_QUALITY_COUNT) {
+		q = SUBSONIC_QUALITY_ORIGINAL;
+	}
+
+	session = s;
+	settings = *file;
+	snprintf(session_slug, sizeof(session_slug), "%s", slug ? slug : "");
+	snprintf(session_label, sizeof(session_label), "%s", label);
+	quality = q;
+	return true;
+}
+
+static bool host_load_locked(const char *slug) {
+	char path[STORE_PATH_MAX];
+	if (!host_path(slug, path, sizeof(path))) {
+		return false;
+	}
+	store_t file;
+	store_init(&file, path);
+	if (!store_load(&file)) {
+		return false;
+	}
+	return store_into_session_locked(&file, slug);
+}
+
+static int host_cmp(const void *a, const void *b) {
+	const host_t *x = a;
+	const host_t *y = b;
+	int c = strcasecmp(x->label, y->label);
+	return c ? c : strcmp(x->slug, y->slug);
+}
+
+// Rebuilds the list from the folder. A file with no "server" in it is not one
+// of ours -- a temporary, somebody's note -- and is left out rather than listed
+// as a row with nothing in it.
+static void hosts_scan_locked(void) {
+	host_count = 0;
+	if (!hosts_dir[0]) {
+		return;
+	}
+	DIR *d = opendir(hosts_dir);
+	if (!d) {
+		return;
+	}
+	struct dirent *e;
+	while (host_count < SUBSONIC_HOSTS_MAX && (e = readdir(d)) != NULL) {
+		const char *name = e->d_name;
+		size_t len = strlen(name);
+		if (name[0] == '.' || len < 5 || strcmp(name + len - 4, ".ini") != 0 || len - 4 >= SUBSONIC_SLUG_MAX) {
+			continue;
+		}
+		char slug[SUBSONIC_SLUG_MAX];
+		snprintf(slug, sizeof(slug), "%.*s", (int)(len - 4), name);
+		char path[STORE_PATH_MAX];
+		if (!host_path(slug, path, sizeof(path))) {
+			continue;
+		}
+		store_t file;
+		store_init(&file, path);
+		store_load(&file);
+		char server[SUBSONIC_SERVER_MAX];
+		normalise_server(store_get(&file, "server"), server, sizeof(server));
+		if (!server[0]) {
+			continue;
+		}
+
+		host_t *h = &hosts[host_count++];
+		memset(h, 0, sizeof(*h));
+		snprintf(h->slug, sizeof(h->slug), "%s", slug);
+		snprintf(h->server, sizeof(h->server), "%s", server);
+		snprintf(h->user, sizeof(h->user), "%s", store_get(&file, "user"));
+		snprintf(h->label, sizeof(h->label), "%s", store_get(&file, "label"));
+		if (!h->label[0]) {
+			subsonic_server_host(server, h->label, sizeof(h->label));
+		}
+	}
+	closedir(d);
+	qsort(hosts, (size_t)host_count, sizeof(hosts[0]), host_cmp);
+}
+
+// The active server's whole state into its file. Written on sign-in, sign-out
+// and on a change of quality -- after the ping, never before, so a sign-in that
+// failed cannot replace a password that worked.
+static bool persist_locked(void) {
+	if (!settings.path[0] || !session_slug[0]) {
+		return false; // a card that will not take servers: this run only
+	}
+	store_set(&settings, "label", session_label);
+	store_set(&settings, "server", session.server);
+	store_set(&settings, "user", session.user);
+	store_set(&settings, "salt", session.salt);
+	store_set(&settings, "token", session.token);
+	store_set(&settings, "password_hex", session.password_hex);
+	store_set_int(&settings, "quality", quality);
+	if (!store_save(&settings)) {
+		set_note_locked("the card would not save the server");
+		return false;
+	}
+	return true;
+}
+
+// The version before several servers kept the one session in <dir>/session.ini.
+// It is moved into the new folder rather than read as well: two records of one
+// account are two answers to "what is signed in", and the first hand edit makes
+// them disagree.
+static void migrate_legacy(const char *dir) {
+	char legacy[STORE_PATH_MAX];
+	if (!dir || !dir[0] || !join_path(legacy, sizeof(legacy), dir, "session.ini", NULL) || !file_there(legacy)) {
+		return;
+	}
+	if (has_ini(hosts_dir)) {
+		printf("addon subsonic: %s holds the servers, the older session.ini stays unread\n", hosts_dir);
+		return;
+	}
+	char target[STORE_PATH_MAX];
+	if (!join_path(target, sizeof(target), hosts_dir, "default", ".ini") || rename(legacy, target) != 0) {
+		fprintf(stderr, "addon subsonic: %s -> %s: %s\n", legacy, target, strerror(errno));
+		return;
+	}
+	store_t file;
+	store_init(&file, target);
+	store_load(&file);
+	char server[SUBSONIC_SERVER_MAX];
+	char label[SUBSONIC_LABEL_MAX];
+	normalise_server(store_get(&file, "server"), server, sizeof(server));
+	subsonic_server_host(server, label, sizeof(label));
+	if (!store_get(&file, "label")[0] && label[0]) {
+		store_set(&file, "label", label);
+		store_save(&file);
+	}
+	active_write("default");
+	printf("addon subsonic: session.ini is now servers/default.ini\n");
+}
+
+// `dir` is the addon's folder on the card: host->dir in init(). Read once.
+void subsonic_load(const char *dir) {
+	hosts_dir[0] = '\0';
+	hosts_ready = false;
+	if (dir && dir[0]) {
+		snprintf(hosts_dir, sizeof(hosts_dir), "%s/servers", dir);
+		hosts_ready = make_dir(hosts_dir);
+	}
+	if (hosts_ready) {
+		migrate_legacy(dir);
+	}
+
+	pthread_mutex_lock(&session_lock);
+	memset(&session, 0, sizeof(session));
+	session_slug[0] = '\0';
+	session_label[0] = '\0';
+	store_init(&settings, NULL);
+	clear_note_locked();
+	hosts_scan_locked();
+
+	char active[SUBSONIC_SLUG_MAX];
+	bool loaded = active_read(active, sizeof(active)) && host_load_locked(active);
+	if (!loaded && host_count > 0) {
+		// No marker, or a marker for a file that went: the first server stands
+		// in rather than the page coming up with a list and nothing selected.
+		loaded = host_load_locked(hosts[0].slug);
+		if (loaded) {
+			active_write(hosts[0].slug);
+		}
+	}
+
+	if (loaded) {
+		bool in = session.server[0] && session.user[0] && (session.token[0] || session.password_hex[0]);
+		printf("addon subsonic: %s, %d server%s, looking at %s\n", in ? "saved session" : "signed out", host_count,
+			   host_count == 1 ? "" : "s", session_slug);
+	} else if (hosts_ready) {
+		printf("addon subsonic: no session, %d server%s\n", host_count, host_count == 1 ? "" : "s");
+	} else if (dir && dir[0]) {
+		// A card that will not take the servers folder (mounted read-only, full,
+		// going away): the one session of the older layout is still better than
+		// showing the user signed out. Nothing is written to it -- session_slug
+		// stays empty, so persist_locked() is a no-op.
+		char legacy[STORE_PATH_MAX];
+		store_t file;
+		if (join_path(legacy, sizeof(legacy), dir, "session.ini", NULL) && file_there(legacy)) {
+			store_init(&file, legacy);
+			if (store_load(&file) && store_into_session_locked(&file, "")) {
+				set_note_locked("the card will not keep servers: this session is in memory only");
+				printf("addon subsonic: keeping %s in memory, the card will not take a servers folder\n",
+					   session.server);
+			}
+		}
+	}
+	pthread_mutex_unlock(&session_lock);
+}
+
+void subsonic_hosts_refresh(void) {
+	pthread_mutex_lock(&session_lock);
+	hosts_scan_locked();
+	pthread_mutex_unlock(&session_lock);
+}
+
+int subsonic_hosts_count(void) {
+	pthread_mutex_lock(&session_lock);
+	int n = host_count;
+	pthread_mutex_unlock(&session_lock);
+	return n;
+}
+
+bool subsonic_host_at(int index, char *label, size_t label_size, char *server, size_t server_size, char *user,
+					  size_t user_size) {
+	pthread_mutex_lock(&session_lock);
+	bool ok = index >= 0 && index < host_count;
+	if (ok) {
+		const host_t *h = &hosts[index];
+		if (label && label_size) {
+			snprintf(label, label_size, "%s", h->label);
+		}
+		if (server && server_size) {
+			snprintf(server, server_size, "%s", h->server);
+		}
+		if (user && user_size) {
+			snprintf(user, user_size, "%s", h->user);
+		}
+	}
+	pthread_mutex_unlock(&session_lock);
+	return ok;
+}
+
+bool subsonic_host_slug_at(int index, char *out, size_t size) {
+	pthread_mutex_lock(&session_lock);
+	bool ok = index >= 0 && index < host_count;
+	if (ok && out && size) {
+		snprintf(out, size, "%s", hosts[index].slug);
+	}
+	pthread_mutex_unlock(&session_lock);
+	return ok;
+}
+
+bool subsonic_host_active_slug(char *out, size_t size) {
+	pthread_mutex_lock(&session_lock);
+	bool ok = session_slug[0] != '\0';
+	if (out && size) {
+		snprintf(out, size, "%s", session_slug);
+	}
+	pthread_mutex_unlock(&session_lock);
+	return ok;
+}
+
+bool subsonic_host_select(const char *slug) {
+	if (!slug || !slug[0]) {
+		return false;
+	}
+	pthread_mutex_lock(&session_lock);
+	bool ok = host_load_locked(slug);
+	if (ok) {
+		active_write(slug);
+		printf("addon subsonic: switched to %s (%s)\n", slug, session.server);
+	} else {
+		printf("addon subsonic: %s is not a server file, staying on %s\n", slug, session_slug);
+	}
+	pthread_mutex_unlock(&session_lock);
+	if (!ok) {
+		set_error("there is no server named %s", slug);
+	}
+	return ok;
+}
+
+bool subsonic_host_forget(const char *slug) {
+	if (!slug || !slug[0]) {
+		return false;
+	}
+	pthread_mutex_lock(&session_lock);
+	char path[STORE_PATH_MAX];
+	bool removed = host_path(slug, path, sizeof(path)) && unlink(path) == 0;
+	if (!removed) {
+		fprintf(stderr, "addon subsonic: cannot remove %s: %s\n", path, strerror(errno));
+	}
+	bool was_active = strcmp(session_slug, slug) == 0;
+	hosts_scan_locked();
+	if (was_active) {
+		// The server that was in use is gone: the first of the rest takes over,
+		// so the page never shows a session for a file that is not there.
+		bool loaded = host_count > 0 && host_load_locked(hosts[0].slug);
+		if (!loaded) {
+			memset(&session, 0, sizeof(session));
+			session_slug[0] = '\0';
+			session_label[0] = '\0';
+			store_init(&settings, NULL);
+			quality = SUBSONIC_QUALITY_ORIGINAL;
+		}
+		active_write(loaded ? session_slug : "");
+	}
+	printf("addon subsonic: forgot %s, %d server%s left\n", slug, host_count, host_count == 1 ? "" : "s");
+	pthread_mutex_unlock(&session_lock);
+	return removed;
+}
+
+bool subsonic_login_host(const char *slug, const char *server, const char *user, const char *password) {
 	if (!server || !server[0] || !user || !user[0] || !password) {
 		set_error("%s", "server, user name and password are needed");
 		return false;
@@ -492,6 +1039,10 @@ bool subsonic_login(const char *server, const char *user, const char *password) 
 	session_t s;
 	memset(&s, 0, sizeof(s));
 	normalise_server(server, s.server, sizeof(s.server));
+	if (!s.server[0]) {
+		set_error("%s", "the server address is empty");
+		return false;
+	}
 	snprintf(s.user, sizeof(s.user), "%s", user);
 	make_salt(s.salt, sizeof(s.salt));
 
@@ -525,7 +1076,9 @@ bool subsonic_login(const char *server, const char *user, const char *password) 
 	if (!ok && status == 426 && strncmp(s.server, "http://", 7) == 0) {
 		char previous[SUBSONIC_SERVER_MAX];
 		snprintf(previous, sizeof(previous), "%s", s.server);
-		snprintf(s.server, sizeof(s.server), "https://%s", previous + 7);
+		// Bounded by hand: the scheme costs eight characters, and a server at
+		// the limit would otherwise lose the end of its address to them.
+		snprintf(s.server, sizeof(s.server), "https://%.*s", (int)(sizeof(s.server) - 9), previous + 7);
 		printf("addon subsonic: %s wants TLS, asking again over https\n", previous);
 		ok = call_with(&s, "ping", NULL, &body, &doc, &resp, &code, &status);
 		if (!ok) {
@@ -544,10 +1097,43 @@ bool subsonic_login(const char *server, const char *user, const char *password) 
 	call_done(body, &doc);
 
 	pthread_mutex_lock(&session_lock);
+	// Which file this account lives in: the one the form was opened from, or a
+	// new one named after the address when it was "Add server".
+	char target[SUBSONIC_SLUG_MAX];
+	target[0] = '\0';
+	if (slug && slug[0]) {
+		snprintf(target, sizeof(target), "%s", slug);
+	} else if (hosts_dir[0]) {
+		host_pick_slug_locked(s.server, s.user, target, sizeof(target));
+	}
+	char label[SUBSONIC_LABEL_MAX];
+	login_label_locked(target, s.server, label, sizeof(label));
+
 	session = s;
-	persist_locked();
+	snprintf(session_slug, sizeof(session_slug), "%s", target);
+	snprintf(session_label, sizeof(session_label), "%s", label);
+	char path[STORE_PATH_MAX];
+	store_init(&settings, host_path(target, path, sizeof(path)) ? path : NULL);
+	store_load(&settings);
+	// A new file starts at the quality the user is already playing at; an
+	// existing one keeps the choice it was given.
+	int q = store_get_int(&settings, "quality", quality);
+	quality = (q >= 0 && q < SUBSONIC_QUALITY_COUNT) ? q : SUBSONIC_QUALITY_ORIGINAL;
+
+	clear_note_locked();
+	if (!persist_locked()) {
+		set_note_locked("signed in, but the card would not save it");
+	}
+	hosts_scan_locked();
+	if (target[0]) {
+		active_write(target);
+	}
 	pthread_mutex_unlock(&session_lock);
 	return true;
+}
+
+bool subsonic_login(const char *server, const char *user, const char *password) {
+	return subsonic_login_host(NULL, server, user, password);
 }
 
 void subsonic_logout(void) {
@@ -559,17 +1145,24 @@ void subsonic_logout(void) {
 	pthread_mutex_unlock(&session_lock);
 }
 
-// The addon is being unloaded. The session and the settings leave memory and
-// nothing is written: the file on the card is the record, an unload is not a
-// sign-out, and the write would land on a filesystem that may be going away with
-// the card. What this buys is the library that starts again in this process --
-// after a dlclose() that failed, say -- seeing the state a freshly loaded one
-// would fill in from the file anyway, rather than a password sitting in a page
-// nobody asked for.
+// The addon is being unloaded. The session, the servers and the settings leave
+// memory and nothing is written: the files on the card are the record, an
+// unload is not a sign-out, and the write would land on a filesystem that may be
+// going away with the card. What this buys is the library that starts again in
+// this process -- after a dlclose() that failed, say -- seeing the state a
+// freshly loaded one would fill in from the card anyway, rather than a password
+// sitting in a page nobody asked for.
 void subsonic_forget(void) {
 	pthread_mutex_lock(&session_lock);
 	memset(&session, 0, sizeof(session));
+	memset(hosts, 0, sizeof(hosts));
+	host_count = 0;
+	session_slug[0] = '\0';
+	session_label[0] = '\0';
+	hosts_dir[0] = '\0';
+	hosts_ready = false;
 	store_init(&settings, NULL);
+	clear_note_locked();
 	pthread_mutex_unlock(&session_lock);
 	quality = SUBSONIC_QUALITY_ORIGINAL;
 }

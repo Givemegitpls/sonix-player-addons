@@ -100,10 +100,15 @@ yandexlist_t *yandexlist_ref(yandexlist_t *l) {
 	return l;
 }
 
-// The bytes of a packed text: its four strings and their terminators.
+// The number of strings a packed detail holds, and the bytes it takes: the
+// strings and their terminators. One table so that packing, measuring and
+// unpacking cannot get out of step.
+#define PACKED_FIELDS 7
+
+// The bytes of a packed text: its strings and their terminators.
 static size_t text_size(const char *text) {
 	size_t n = 0;
-	for (int i = 0; i < 6; i++) {
+	for (int i = 0; i < PACKED_FIELDS; i++) {
 		n += strlen(text + n) + 1;
 	}
 	return n;
@@ -245,17 +250,20 @@ static page_t *page_for_locked(yandexlist_t *l, int index) {
 	return p;
 }
 
-// The four strings of a track in one allocation.
+// The strings of a track in one allocation: what a row shows, and the two ids
+// -- the artist's and the album's -- that its menu needs. The ids are here
+// rather than read back from the reference because the reference does not
+// carry the artist.
 static char *pack_text(const yandex_track_t *t) {
-	const char *fields[] = {t->title, t->artist, t->album, t->cover, t->pub_date, t->podcast_episode_type};
+	const char *fields[] = {t->title, t->artist, t->artist_id, t->album, t->cover, t->pub_date, t->podcast_episode_type};
 	size_t size = 0;
-	for (size_t i = 0; i < 6; i++)
+	for (size_t i = 0; i < PACKED_FIELDS; i++)
 		size += strlen(fields[i]) + 1;
 	char *text = malloc(size);
 	if (!text)
 		return NULL;
 	char *p = text;
-	for (size_t i = 0; i < 6; i++) {
+	for (size_t i = 0; i < PACKED_FIELDS; i++) {
 		size_t n = strlen(fields[i]) + 1;
 		memcpy(p, fields[i], n);
 		p += n;
@@ -425,6 +433,8 @@ static void unpack_locked(yandexlist_t *l, int index, const detail_t *d, yandex_
 	snprintf(out->title, sizeof(out->title), "%s", p);
 	p += strlen(p) + 1;
 	snprintf(out->artist, sizeof(out->artist), "%s", p);
+	p += strlen(p) + 1;
+	snprintf(out->artist_id, sizeof(out->artist_id), "%s", p);
 	p += strlen(p) + 1;
 	snprintf(out->album, sizeof(out->album), "%s", p);
 	p += strlen(p) + 1;

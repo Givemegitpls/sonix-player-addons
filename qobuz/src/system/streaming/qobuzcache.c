@@ -22,6 +22,10 @@
 
 static char cache_dir[512];
 
+// The cache folder below the card root -- "Addons/qobuz/cache" -- kept apart
+// from the mount point it hangs off. See qobuzcache_set_addon_dir().
+static char cache_rel[256];
+
 // Set by qobuzcache_stop(), asked before anything is sent or written. Not
 // locked: it only ever goes false -> true, and a reader that misses the store
 // costs one download that the stop then waits for.
@@ -52,6 +56,30 @@ static void register_abandon_once(void) {
 	}
 }
 
+// The card root is only the delimiter here: what is remembered is the part of
+// `addon_dir` below it, because a card that is pulled and put back has a new
+// mount point and the same contents.
+void qobuzcache_set_addon_dir(const char *addon_dir, const char *sd_root) {
+	cache_rel[0] = '\0';
+	if (!addon_dir || !addon_dir[0] || !sd_root || !sd_root[0]) {
+		return;
+	}
+	size_t root_len = strlen(sd_root);
+	if (strncmp(addon_dir, sd_root, root_len) != 0 || addon_dir[root_len] != '/') {
+		fprintf(stderr, "qobuzcache: '%s' is not on the card at '%s'\n", addon_dir, sd_root);
+		return;
+	}
+	const char *below = addon_dir + root_len;
+	while (*below == '/') {
+		below++;
+	}
+	int written = snprintf(cache_rel, sizeof(cache_rel), "%s/" QOBUZCACHE_DIRNAME, below);
+	if (written < 0 || (size_t)written >= sizeof(cache_rel)) {
+		fprintf(stderr, "qobuzcache: '%s' is too deep for a cache folder\n", addon_dir);
+		cache_rel[0] = '\0';
+	}
+}
+
 void qobuzcache_set_root(const char *sd_root) {
 	// Every init() of the addon begins here (addon.c), so this is also where a
 	// library that was stopped comes back to life: the flag qobuzcache_stop()
@@ -60,11 +88,13 @@ void qobuzcache_set_root(const char *sd_root) {
 	// back into the shared turn with it (qobuzcache_stop took it out).
 	stopping = false;
 	register_abandon_once();
-	if (!sd_root || !*sd_root) {
+	if (!sd_root || !*sd_root || !cache_rel[0]) {
+		// No card, or no folder of our own to put a cache in. Either way there
+		// is nowhere to write, and the card root is not ours to take.
 		cache_dir[0] = '\0';
 		return;
 	}
-	snprintf(cache_dir, sizeof(cache_dir), "%s/%s", sd_root, QOBUZCACHE_DIR);
+	snprintf(cache_dir, sizeof(cache_dir), "%s/%s", sd_root, cache_rel);
 }
 
 bool qobuzcache_ready(void) { return cache_dir[0] != '\0'; }
@@ -146,7 +176,10 @@ bool qobuzcache_find(long track_id, char *out, size_t size) {
 	return false;
 }
 
-// mkdir -p over the two levels needed (.local, then the cache directory).
+// mkdir -p over every level of the cache path: the addon's own folder is made
+// by init() (addon_cache_dir()), this is the same question asked again at the
+// moment of a download, when the card may have been somewhere else a minute
+// ago.
 static bool ensure_dir(void) {
 	if (!qobuzcache_ready()) {
 		return false;
@@ -424,49 +457,12 @@ void qobuzcache_note_played(const char *path) {
 	clear_files(true);
 }
 
-// The list covers the player downloads live in a sibling directory of the
-// tracks (.local/listart next to .local/qobuz-cache) and have the same
-// lifetime: transient data that must not survive a power cycle. The path is
-// derived from the track directory rather than asked of the GUI, so every exit
-// path (shutdown, restart, update, factory reset) clears both with one call.
-static void clear_art_files(void) {
-	char art[sizeof(cache_dir) + 16];
-	snprintf(art, sizeof(art), "%s", cache_dir);
-	char *slash = strrchr(art, '/');
-	if (!slash) {
-		return;
-	}
-	snprintf(slash + 1, sizeof(art) - (size_t)(slash + 1 - art), "listart");
-
-	DIR *d = opendir(art);
-	if (!d) {
-		return;
-	}
-	int removed = 0;
-	struct dirent *e;
-	while ((e = readdir(d)) != NULL) {
-		if (e->d_name[0] == '.') {
-			continue;
-		}
-		char path[sizeof(art) + 300];
-		if ((size_t)snprintf(path, sizeof(path), "%s/%s", art, e->d_name) >= sizeof(path)) {
-			continue;
-		}
-		if (remove(path) == 0) {
-			removed++;
-		}
-	}
-	closedir(d);
-	printf("qobuzcache: covers cleared (%d files)\n", removed);
-}
-
 void qobuzcache_clear_on_exit(void) {
 	if (!qobuzcache_ready()) {
 		return;
 	}
 	printf("qobuzcache: shutting down, clearing the cache\n");
 	clear_files(false);
-	clear_art_files();
 }
 
 // Reads one key back out of the tags sidecar. Returns false when it is absent.

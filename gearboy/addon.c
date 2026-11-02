@@ -9,7 +9,10 @@
 #include "src/system/gearboy/gbconf.h"
 #include "src/system/gearboy/gbdb.h"
 
+#include "common/addonfs.h"
+
 #include <stdio.h>
+#include <unistd.h>
 
 // Gearboy as an addon.
 //
@@ -26,13 +29,43 @@
 //                     same path, and the cartridge database rescans it every
 //                     time the list is opened, so a card that changed under
 //                     the player needs nothing more.
+//   gbdb_set_cache_dir()
+//                     where the ROM index goes. That used to be a directory of
+//                     its own in the shared .local/ tree; it is this addon's
+//                     cache now, <addon>/cache (below).
 //   panel_touch_*()   the touch panel, which the emulator takes over for
 //                     multitouch (it reads the evdev node itself) and gives
 //                     back on the way out. Those live in the player's main.c
 //                     and are exported to the addons.
 //
 // The ROMs, the saves and the BIOS files are the user's own, on the card, and
-// were never part of the binary.
+// were never part of the binary. The saves stay in Games/Saves beside the ROMs
+// for that reason: they belong to the game, not to the emulator, and a card
+// that gets a newer Gearboy must find them where the user left them (gbdb.c,
+// DIR_SAVES).
+
+// Moves the ROM index this addon used to keep in <card>/.local/gearboy-cache
+// into its own cache folder, once. The file is renamed, never copied, so a
+// failed attempt (a read-only card, a card pulled mid-way) leaves the old one
+// exactly as it was and the next start tries again; addon_migrate_path() logs
+// what it could not do. The directory it leaves goes only when it is empty: a
+// .local/ that something else writes to is not ours to tidy.
+static void migrate_cache(const char *card_root, const char *cache_dir) {
+	if (!card_root || !card_root[0]) {
+		return;
+	}
+
+	char old_dir[ADDON_PATH_MAX];
+	char old_file[ADDON_PATH_MAX + 16];
+	char new_file[ADDON_PATH_MAX + 16];
+	snprintf(old_dir, sizeof(old_dir), "%s/.local/gearboy-cache", card_root);
+	snprintf(old_file, sizeof(old_file), "%s/index.tsv", old_dir);
+	snprintf(new_file, sizeof(new_file), "%s/index.tsv", cache_dir);
+
+	if (addon_migrate_path(old_file, new_file)) {
+		(void)rmdir(old_dir);
+	}
+}
 
 static lv_obj_t *gearboy_addon_init(const sonix_addon_host_t *host) {
 	// The name the loader knows this addon by, for the screens it is told about
@@ -45,6 +78,19 @@ static lv_obj_t *gearboy_addon_init(const sonix_addon_host_t *host) {
 	// on the card, and the cartridges' saves in Games/Saves beside the ROMs.
 	gbdb_set_root(host->sd_root);
 	gbconf_init(host->dir);
+
+	// The ROM index is the addon's own file, so it lives in the addon's own
+	// folder: <addon>/cache, the place every addon's caches go (addonfs.h).
+	// Without the directory -- a read-only card, or one that has just gone --
+	// there is simply no index: the list still scans, it just reads each ROM
+	// again on every start instead of remembering its CRC.
+	char cache_dir[ADDON_PATH_MAX];
+	if (addon_cache_dir(host, cache_dir, sizeof(cache_dir))) {
+		migrate_cache(host->sd_root, cache_dir);
+		gbdb_set_cache_dir(cache_dir);
+	} else {
+		fprintf(stderr, "gearboy: no cache folder on this card; the ROMs are read again on every start\n");
+	}
 
 	// The emulator's own screens first: the list leads to them, and both are
 	// built by their init() before anything can be tapped.

@@ -5,5 +5,7 @@
   "section": "more",
   "order": 2,
   "version": "0.1",
-  "icon": "icon.png"
+  "icon": "icon.png",
+  "owns_paths": ["Addons/gearboy/cache/"],
+  "cache_path": "Addons/gearboy/cache/"
 }

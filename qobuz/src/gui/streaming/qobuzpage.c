@@ -56,7 +56,6 @@
 #define QOBUZ_MAX_HELD (4 * QOBUZ_PAGE_LIMIT)
 
 
-static lv_obj_t *login_screen;
 lv_obj_t *qobuz_list_screen;
 #define list_screen qobuz_list_screen
 static lv_obj_t *search_screen;
@@ -71,7 +70,7 @@ lv_obj_t *qobuz_screen;
 
 typedef enum {
 	JOB_NONE = 0,
-	JOB_LOGIN,
+	JOB_SIGN_IN,
 	JOB_SEARCH_TRACKS,
 	JOB_SEARCH_ALBUMS,
 	JOB_SEARCH_ARTISTS,
@@ -87,12 +86,12 @@ typedef enum {
 
 typedef struct {
 	job_kind_t kind;
-	char text[256];	   // search terms, or user name
-	char text2[128];   // password
+	char text[256];	   // search terms
 	char id_text[40];  // album identifier
 	long id;		   // numeric identifier
 	int index;		   // which track of the list playback starts from
 	int offset;		   // first entry of this page: 0 = new list
+	bool keep_current; // sign-in: leave the session alone when the card has no good token
 } job_t;
 
 static pthread_mutex_t job_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -129,11 +128,11 @@ static const char *page_owner;
 
 // Every top-level screen this file builds goes through here.
 //
-// There are five of them -- the home page init() returns, the list, the search,
-// the settings and the sign-in page -- and the shell can only unload a library
-// whose screens it knows about: a widget whose callback is code in a dlclose()d
-// .so is a crash on the next tap (addon.h, sonix_addon_own_screen). One
-// lv_obj_create(NULL) left outside this function is a page nobody unloads.
+// There are four of them -- the home page init() returns, the list, the search
+// and the settings -- and the shell can only unload a library whose screens it
+// knows about: a widget whose callback is code in a dlclose()d .so is a crash on
+// the next tap (addon.h, sonix_addon_own_screen). One lv_obj_create(NULL) left
+// outside this function is a page nobody unloads.
 static lv_obj_t *own_screen(void) {
 	lv_obj_t *screen = lv_obj_create(NULL);
 	sonix_addon_own_screen(page_owner, screen);
@@ -155,6 +154,11 @@ static int result_from; // where the last page received starts (0 = new list)
 static job_kind_t result_kind;
 static char result_error[256];
 static char result_title[160];
+
+// The account half, written by the worker and read by the page: whether a
+// check is in flight, and the sentence that came back (empty on success).
+static bool sign_in_pending;
+static char account_text[256];
 
 // What the list is showing right now, so a row tap knows what to do.
 static job_kind_t list_kind;
@@ -905,6 +909,26 @@ static void job_done_cb(void *user) {
 	(void)user;
 	busy_hide();
 
+	if (result_kind == JOB_SIGN_IN) {
+		sign_in_pending = false;
+		if (result_error[0]) {
+			// Kept for the row under the account: the sentence has to stay
+			// readable after the popup has gone.
+			snprintf(account_text, sizeof(account_text), "%s", result_error);
+		} else {
+			snprintf(account_text, sizeof(account_text), "signed in as %s",
+					 qobuz_display_name()[0] ? qobuz_display_name() : "Qobuz");
+		}
+		rebuild_home();
+		if (result_error[0]) {
+			gui_notify_popup(result_error);
+		} else {
+			switch_screen(qobuz_screen);
+			toast_success("signed_in");
+		}
+		return;
+	}
+
 	if (result_error[0]) {
 		gui_notify_popup(result_error);
 		page_loading = false;
@@ -912,12 +936,6 @@ static void job_done_cb(void *user) {
 	}
 
 	switch (result_kind) {
-	case JOB_LOGIN:
-		rebuild_home();
-		switch_screen(qobuz_screen);
-		toast_success("signed_in");
-		break;
-
 	case JOB_PLAY:
 		// Nothing: the worker already opened the player the instant the music
 		// started. This point is reached much later -- after the next track has
@@ -1626,11 +1644,25 @@ static void *worker_main(void *arg) {
 
 		int n = 0;
 		switch (job.kind) {
-		case JOB_LOGIN:
-			if (!qobuz_login(job.text, job.text2)) {
-				snprintf(result_error, sizeof(result_error), "%s", qobuz_last_error());
+		case JOB_SIGN_IN: {
+			qobuz_card_result_t result = qobuz_sign_in_from_card(job.keep_current);
+			if (result != QOBUZ_CARD_SIGNED_IN) {
+				if (result == QOBUZ_CARD_NO_KEYS) {
+					// Not the token's fault, and not the network's either: the
+					// pair is what every request is signed with, and without it
+					// nothing can be asked about any token.
+					snprintf(result_error, sizeof(result_error),
+							 "No application keys: a token alone is not enough. The addon could not "
+							 "get Qobuz's pair from the web player (or from settings.ini).");
+				} else {
+					snprintf(result_error, sizeof(result_error), "%s", qobuz_last_error());
+				}
+				if (!result_error[0]) {
+					snprintf(result_error, sizeof(result_error), "Qobuz did not accept the token");
+				}
 			}
 			break;
+		}
 
 		case JOB_SEARCH_TRACKS:
 			n = qobuz_search_tracks(job.text, off, result_tracks + off, want);
@@ -1733,7 +1765,7 @@ static int list_history_len;
 static job_t current_list_job;
 static bool have_current_list;
 
-static bool job_is_list(job_kind_t kind) { return kind != JOB_PLAY && kind != JOB_LOGIN && kind != JOB_NONE; }
+static bool job_is_list(job_kind_t kind) { return kind != JOB_PLAY && kind != JOB_SIGN_IN && kind != JOB_NONE; }
 
 // Peek for the back-swipe guard: is there a step to consume inside the page?
 // It changes nothing -- it only keeps another screen from being drawn under the
@@ -2038,130 +2070,107 @@ static void build_search_page(gui_config_t *cfg) {
 }
 
 // ---------------------------------------------------------------------------
-// sign in
+// the account, read from the card
+//
+// There is no password form here any more, and none is to be added back: with
+// the application pair this addon derives from the web player, Qobuz's
+// /user/login answers "invalid credentials" for accounts that are perfectly
+// valid, so two fields and a button could only ever fail. What works is the
+// account's user_auth_token, left in Addons/qobuz/token.txt on the card; every
+// call afterwards carries it in a header anyway (qobuz.h).
+//
+// The rows are in plain English, like the other addons': these strings are new
+// and the player's language files are on the read-only rootfs.
 // ---------------------------------------------------------------------------
 
-static lv_obj_t *user_field;
-static lv_obj_t *password_field;
-static lv_obj_t *password_eye_icon;
-static keyboard_t *login_keyboard;
+static lv_obj_t *account_value;
 
-static void password_eye_refresh(void) {
-	bool hidden = lv_textarea_get_password_mode(password_field);
-	lv_image_set_src(password_eye_icon, hidden ? &icon_eye : &icon_eye_off);
-	// The tight kerning applies only while the dots are shown.
-	keyboard_refresh_password(password_field);
-}
-
-static void password_eye_cb(lv_event_t *e) {
-	(void)e;
-	lv_textarea_set_password_mode(password_field, !lv_textarea_get_password_mode(password_field));
-	password_eye_refresh();
-}
-
-// The keyboard writes into one of the two fields: the last one touched.
-static void focus_field(lv_obj_t *field) {
-	lv_obj_t *other = field == user_field ? password_field : user_field;
-	keyboard_set_field(login_keyboard, field);
-	lv_obj_add_state(field, LV_STATE_FOCUSED);
-	lv_obj_remove_state(other, LV_STATE_FOCUSED);
-	// And the caret: on here, off on the other. The focused state alone is not
-	// enough -- LVGL blinks every textarea's caret from creation, and two
-	// carets were visible at once.
-	keyboard_show_caret(field, true);
-	keyboard_show_caret(other, false);
-}
-
-static void field_focus_cb(lv_event_t *e) { focus_field(lv_event_get_target(e)); }
-
-static void login_accept_cb(lv_event_t *e) {
-	(void)e;
-	const char *user = lv_textarea_get_text(user_field);
-	const char *password = lv_textarea_get_text(password_field);
-	if (!user || !*user || !password || !*password) {
-		gui_notify_popup("credentials_required");
-		return;
-	}
-
-	job_t job = {0};
-	job.kind = JOB_LOGIN;
-	snprintf(job.text, sizeof(job.text), "%s", user);
-	snprintf(job.text2, sizeof(job.text2), "%s", password);
-	run(&job, "qobuz_sign_in_to_qobuz");
-
-	// The password does not stay in the field a second longer than needed.
-	lv_textarea_set_text(password_field, "");
-}
-
-static lv_obj_t *make_field(lv_obj_t *parent, gui_config_t *cfg, const char *placeholder, int y) {
-	lv_obj_t *field = lv_textarea_create(parent);
-	lv_textarea_set_one_line(field, true);
-	lv_textarea_set_placeholder_text(field, tr(placeholder));
-	lv_obj_set_size(field, cfg->screen_width - 2 * cfg->padding, SC(62));
-	lv_obj_set_scrollbar_mode(field, LV_SCROLLBAR_MODE_OFF);
-	lv_obj_align(field, LV_ALIGN_TOP_LEFT, cfg->padding, y);
-	lv_obj_add_style(field, &theme_style_card, 0);
-	lv_obj_set_style_radius(field, SC(12), 0);
-	lv_obj_set_style_border_width(field, 0, 0);
-	lv_obj_set_style_shadow_width(field, 0, 0);
-	lv_obj_set_style_pad_all(field, SC(14), 0);
-	lv_obj_set_style_text_font(field, &font_ui_24, 0);
-	keyboard_style_caret(field);
-	lv_obj_add_event_cb(field, field_focus_cb, LV_EVENT_CLICKED, NULL);
-	return field;
-}
-
-static void build_login_page(gui_config_t *cfg) {
-	login_screen = own_screen();
-	lv_obj_add_style(login_screen, &theme_style_screen, 0);
-
-	settingsrow_title(login_screen, cfg, "qobuz_sign_in_to_qobuz");
-	int top = settingsrow_content_top(cfg);
-
-	user_field = make_field(login_screen, cfg, "qobuz_username_or_email", top);
-	password_field = make_field(login_screen, cfg, "password", top + SC(78));
-
-	// The password as on any modern system: dots from the first keystroke, and
-	// the eye to reveal the whole of it. Zero show time means the character is
-	// never readable, not even for an instant.
-	keyboard_style_password(password_field, 0);
-	lv_obj_set_style_pad_right(password_field, SC(60), 0);
-
-	lv_obj_t *eye = lv_btn_create(login_screen);
-	lv_obj_set_size(eye, SC(56), SC(56));
-	lv_obj_align(eye, LV_ALIGN_TOP_RIGHT, -cfg->padding - SC(4), top + SC(78) + SC(3));
-	lv_obj_set_style_bg_opa(eye, LV_OPA_TRANSP, 0);
-	lv_obj_set_style_shadow_width(eye, 0, 0);
-	lv_obj_set_style_border_width(eye, 0, 0);
-	lv_obj_add_event_cb(eye, password_eye_cb, LV_EVENT_CLICKED, NULL);
-
-	password_eye_icon = lv_image_create(eye);
-	lv_obj_add_style(password_eye_icon, &theme_style_icon, 0);
-	lv_obj_center(password_eye_icon);
-	password_eye_refresh();
-
-	lv_obj_t *note = lv_label_create(login_screen);
+static lv_obj_t *note_label(lv_obj_t *parent, const char *text) {
+	lv_obj_t *note = lv_label_create(parent);
 	lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
-	lv_obj_set_width(note, cfg->screen_width - 2 * cfg->padding);
-	lv_obj_align(note, LV_ALIGN_TOP_LEFT, cfg->padding, top + SC(156));
+	lv_obj_set_width(note, lv_pct(100));
 	lv_obj_add_style(note, &theme_style_text_dim, 0);
-	lv_obj_set_style_text_font(note, &font_ui_18, 0);
-	lv_label_set_text(note, tr("qobuz_login_note"));
-
-	login_keyboard = keyboard_create(login_screen, cfg->screen_width, SC(316), user_field, NULL, "ok", login_accept_cb,
-									 NULL);
-	switcher_attach_back_gesture(login_screen);
+	lv_obj_set_style_text_font(note, &font_ui_20, 0);
+	lv_label_set_text(note, text);
+	return note;
 }
 
-static void open_login_cb(lv_event_t *e) {
+// The one line under the account: the answer to the last attempt, or what there
+// is to do when nothing has been tried yet.
+static const char *account_line(bool signed_in) {
+	if (sign_in_pending) {
+		return "Checking the token with Qobuz...";
+	}
+	// Before the answer, not after it: a read-only card changes what "signed in"
+	// means -- it works now and it is gone at the next start -- and the name on
+	// the row above already says who.
+	if (signed_in && qobuz_session_not_kept()) {
+		return "Read-only card: the session is not saved, it ends with this run.";
+	}
+	if (account_text[0]) {
+		return account_text;
+	}
+	if (!signed_in) {
+		return "Put the user_auth_token from the Qobuz web player into " QOBUZ_TOKEN_REL
+			   " on the card, then tap \"Sign in from the card\".";
+	}
+	return "";
+}
+
+// The token file, as a card rather than as a row with a value: the path is
+// longer than the half of a 320-pixel row that would be left for it. The name
+// sits where every row's name sits, the path underneath in the dim value style.
+static void token_file_row(lv_obj_t *parent) {
+	lv_obj_t *card = lv_obj_create(parent);
+	lv_obj_set_width(card, lv_pct(100));
+	lv_obj_set_height(card, SC(100));
+	lv_obj_add_style(card, &theme_style_card, 0);
+	lv_obj_set_style_radius(card, SC(12), 0);
+	lv_obj_set_style_border_width(card, 0, 0);
+	lv_obj_set_style_shadow_width(card, 0, 0);
+	lv_obj_set_style_pad_hor(card, SC(20), 0);
+	lv_obj_set_style_pad_ver(card, SC(14), 0);
+	lv_obj_set_scrollable(card, false);
+	// Presses reach the page container, as on any other row, so the swipe-back
+	// gesture can start here too.
+	lv_obj_set_event_bubble(card, true);
+
+	lv_obj_t *name = lv_label_create(card);
+	lv_label_set_text(name, "Token file");
+	lv_obj_add_style(name, &theme_style_text, 0);
+	lv_obj_set_style_text_font(name, &font_ui_24, 0);
+	lv_obj_align(name, LV_ALIGN_TOP_LEFT, 0, 0);
+
+	lv_obj_t *value = lv_label_create(card);
+	lv_obj_add_style(value, &theme_style_text_dim, 0);
+	lv_obj_set_style_text_font(value, &font_ui_16, 0);
+	lv_label_set_long_mode(value, LV_LABEL_LONG_DOT);
+	lv_obj_set_width(value, lv_pct(100));
+	lv_label_set_text(value, QOBUZ_TOKEN_REL);
+	lv_obj_align(value, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+}
+
+// Both ways in are the same read of the same file: one drops the session first
+// (a fresh start on a card whose token has been replaced, and no session left
+// if it turns out to be no good), the other keeps it (a user who has just
+// edited the file and wants the running session to survive a bad paste).
+static void sign_in_run(bool keep_current) {
+	job_t job = {0};
+	job.kind = JOB_SIGN_IN;
+	job.keep_current = keep_current;
+	sign_in_pending = true;
+	account_text[0] = '\0';
+	run(&job, "loading");
+}
+
+static void sign_in_from_card_cb(lv_event_t *e) {
 	(void)e;
-	lv_textarea_set_text(user_field, "");
-	lv_textarea_set_text(password_field, "");
-	lv_textarea_set_password_mode(password_field, true);
-	password_eye_refresh();
-	keyboard_reset(login_keyboard);
-	focus_field(user_field);
-	switch_screen(login_screen);
+	sign_in_run(false);
+}
+
+static void read_again_cb(lv_event_t *e) {
+	(void)e;
+	sign_in_run(true);
 }
 
 // ---------------------------------------------------------------------------
@@ -2252,6 +2261,8 @@ static void quality_pick_cb(lv_event_t *e) {
 static void do_logout(void *user) {
 	(void)user;
 	qobuz_logout();
+	account_text[0] = '\0';
+	sign_in_pending = false;
 	// The remembered favourites and playlists belonged to that account: under
 	// another user they would be lies.
 	qobuzsync_forget();
@@ -2372,21 +2383,10 @@ static bool wifi_is_connected(void) {
 
 static void rebuild_home(void) {
 	lv_obj_clean(home_container);
+	account_value = NULL;
 
-	if (!qobuz_configured()) {
-		update_corner_buttons();
-		lv_obj_t *note = lv_label_create(home_container);
-		lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
-		lv_obj_set_width(note, lv_pct(100));
-		lv_obj_add_style(note, &theme_style_text_dim, 0);
-		lv_obj_set_style_text_font(note, &font_ui_20, 0);
-		lv_label_set_text(note, tr("api_keys_unavailable"));
-		return;
-	}
-
-	// The network comes before the login, and not the other way round: signing
-	// in is a conversation with Qobuz's servers, so with no network the "Sign
-	// in" row could only fail. The notice says what is actually missing.
+	// The network comes first: every list comes from the server, and the token
+	// is checked with it, so with no network both rows below could only fail.
 	if (!wifi_is_connected()) {
 		update_corner_buttons();
 		// The same notice as the Wi-Fi transfer page: centred message, with the
@@ -2405,15 +2405,27 @@ static void rebuild_home(void) {
 		return;
 	}
 
-	if (!qobuz_logged_in()) {
-		update_corner_buttons();
-		settingsrow_add(home_container, "sign_in", NULL, open_login_cb, NULL);
-		lv_obj_t *hint = lv_label_create(home_container);
-		lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
-		lv_obj_set_width(hint, lv_pct(100));
-		lv_obj_add_style(hint, &theme_style_text_dim, 0);
-		lv_obj_set_style_text_font(hint, &font_ui_22, 0);
-		lv_label_set_text(hint, tr("streaming_token_note"));
+	// The account rows are always there, signed in or not: with no form left,
+	// the token on the card and the two ways to read it are the whole of what
+	// the user does here, and a row that only appears once it worked would hide
+	// the way to make it work.
+	bool signed_in = qobuz_logged_in();
+	settingsrow_add(home_container, "Account", &account_value, NULL, NULL);
+	lv_obj_set_style_text_font(account_value, &font_ui_20, 0);
+	const char *name = qobuz_display_name();
+	lv_label_set_text(account_value, signed_in ? (name && name[0] ? name : "signed in") : "no token");
+
+	const char *line = account_line(signed_in);
+	if (line[0]) {
+		note_label(home_container, line);
+	}
+
+	token_file_row(home_container);
+	settingsrow_action(home_container, "Sign in from the card", sign_in_from_card_cb, NULL);
+	settingsrow_action(home_container, "Read again", read_again_cb, NULL);
+
+	update_corner_buttons();
+	if (!signed_in) {
 		return;
 	}
 
@@ -2423,8 +2435,8 @@ static void rebuild_home(void) {
 	settingsrow_add(home_container, "favourite_albums", NULL, simple_job_cb, (void *)(intptr_t)JOB_FAV_ALBUMS);
 	settingsrow_add(home_container, "my_playlists", NULL, simple_job_cb, (void *)(intptr_t)JOB_USER_PLAYLISTS);
 	settingsrow_add(home_container, "new_releases", NULL, simple_job_cb, (void *)(intptr_t)JOB_FEATURED);
-
-	update_corner_buttons();
+	// The same row the settings page carries, for the page one signs in on.
+	settingsrow_action(home_container, "Sign out", logout_cb, NULL);
 }
 
 // "Show album" in the player, for a Qobuz track: opens the album's track list
@@ -2451,6 +2463,7 @@ static void home_loaded_cb(lv_event_t *e) {
 	// The page is rebuilt on every open, not once at startup: everything it
 	// depends on -- the network, the sign-in, the app keys -- can change while
 	// the user is elsewhere, so it is all re-read here.
+	lv_obj_scroll_to_y(home_container, 0, LV_ANIM_OFF);
 	rebuild_home();
 }
 
@@ -2481,11 +2494,36 @@ static void build_list_page(gui_config_t *cfg) {
 	player_sheet_attach_drag(list_container, true);
 }
 
+// The home, taller than the panel: the account rows, the four lists and sign-out
+// do not fit in one screen. settingsrow_page()'s container is a fixed column;
+// this one scrolls, like the other addons' long pages.
+static lv_obj_t *scrolling_home(lv_obj_t *screen, gui_config_t *cfg) {
+	settingsrow_title(screen, cfg, "qobuz");
+
+	int top = settingsrow_content_top(cfg);
+	lv_obj_t *container = lv_obj_create(screen);
+	lv_obj_set_size(container, lv_pct(100), cfg->screen_height - top);
+	lv_obj_align(container, LV_ALIGN_TOP_LEFT, 0, top);
+	lv_obj_set_style_bg_opa(container, 0, 0);
+	lv_obj_set_style_border_width(container, 0, 0);
+	lv_obj_set_style_radius(container, 0, 0);
+	lv_obj_set_style_pad_hor(container, cfg->padding, 0);
+	lv_obj_set_style_pad_ver(container, cfg->padding, 0);
+	lv_obj_set_style_pad_gap(container, SC(8), 0);
+	lv_obj_set_flex_flow(container, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_flex_align(container, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_scroll_dir(container, LV_DIR_VER);
+	lv_obj_set_scrollbar_mode(container, LV_SCROLLBAR_MODE_ACTIVE);
+	lv_obj_set_scroll_elastic(container, false);
+	switcher_attach_back_gesture(container);
+	return container;
+}
+
 void qobuzpage_init(gui_config_t *cfg, const char *addon_id) {
 
 	page_owner = addon_id;
 	qobuz_screen = own_screen();
-	home_container = settingsrow_page(qobuz_screen, cfg, "qobuz");
+	home_container = scrolling_home(qobuz_screen, cfg);
 
 	// Two buttons top right, like the Music gear: settings and search. The title
 	// must be told the corner is taken, otherwise its text runs under them.
@@ -2496,7 +2534,6 @@ void qobuzpage_init(gui_config_t *cfg, const char *addon_id) {
 	build_list_page(cfg);
 	build_search_page(cfg);
 	build_settings_page(cfg);
-	build_login_page(cfg);
 	build_busy_layer();
 	qobuzcache_set_slow_start_cb(on_slow_start);
 	device_state_add_prepare_cb(qobuz_prepare_track);
@@ -2518,6 +2555,14 @@ void qobuzpage_init(gui_config_t *cfg, const char *addon_id) {
 
 	qobuzcache_set_root(storage_sd_root());
 	rebuild_home();
+
+	// A token that came from the card is not a session until Qobuz has accepted
+	// it, and no network call may run on the GUI thread: the check is the first
+	// thing this worker is given, and the page says "checking" meanwhile. A
+	// rejected one is dropped by the job itself (qobuz_sign_in_from_card).
+	if (qobuz_session_unchecked()) {
+		sign_in_run(false);
+	}
 
 	lv_obj_add_event_cb(qobuz_screen, home_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 	switcher_attach_back_gesture(qobuz_screen);
@@ -2607,16 +2652,14 @@ bool qobuzpage_stop(void) {
 	}
 
 	// 6. Every record the player keeps of the pages built here. The shell now
-	// knows all five from sonix_addon_own_screen() and sweeps them itself, but
+	// knows all four from sonix_addon_own_screen() and sweeps them itself, but
 	// the records are pointers rather than objects, so they go here while the
 	// screens are still alive -- the forgoings are idempotent.
 	switcher_forget_screen(list_screen);
 	switcher_forget_screen(search_screen);
-	switcher_forget_screen(login_screen);
 	switcher_forget_screen(qsettings_screen);
 	player_forget_screen(list_screen);
 	player_forget_screen(search_screen);
-	player_forget_screen(login_screen);
 	player_forget_screen(qsettings_screen);
 
 	// 7. What the widgets held that is ours: the slots of the shared cover
@@ -2632,13 +2675,12 @@ bool qobuzpage_stop(void) {
 		busy_layer = NULL;
 	}
 
-	// 7b. The four screens this file opened beside the one init() returns. The
+	// 7b. The three screens this file opened beside the one init() returns. The
 	// shell deletes them too -- gui_obj_alive() is what keeps that from being a
-	// double free -- but deleting them here takes the two keyboards and every
-	// row of the list down now, while the code that owns them is still in place.
+	// double free -- but deleting them here takes the keyboard and every row of
+	// the list down now, while the code that owns them is still in place.
 	// qobuz_screen is deliberately left alone: addon.h gives that one to the
 	// shell.
-	lv_obj_delete(login_screen);
 	lv_obj_delete(qobuz_list_screen);
 	lv_obj_delete(search_screen);
 	lv_obj_delete(qsettings_screen);
@@ -2646,7 +2688,6 @@ bool qobuzpage_stop(void) {
 	// 8. init() has to work a second time in the same process -- on a fresh
 	// mapping, or on this one if dlclose() refused to unmap it -- so no pointer
 	// to a widget and no state of this run may survive.
-	login_screen = NULL;
 	qobuz_list_screen = NULL;
 	search_screen = NULL;
 	qsettings_screen = NULL;
@@ -2659,10 +2700,9 @@ bool qobuzpage_stop(void) {
 	search_field = NULL;
 	search_clear_btn = NULL;
 	search_keyboard = NULL;
-	user_field = NULL;
-	password_field = NULL;
-	password_eye_icon = NULL;
-	login_keyboard = NULL;
+	account_value = NULL;
+	account_text[0] = '\0';
+	sign_in_pending = false;
 	for (int i = 0; i < 3; i++) {
 		search_pills[i] = NULL;
 	}

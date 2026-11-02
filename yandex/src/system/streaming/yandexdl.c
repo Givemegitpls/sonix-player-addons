@@ -1010,6 +1010,10 @@ static bool save_track_pinned_to(const yandex_track_t *t, unsigned asked, const 
 	tags.year = have_meta ? meta.year : 0;
 
 	// <music>/Yandex Music/<album artist>/<album (year)>/<NN - title>
+	//
+	// Not the addon's folder: this is where the user's library keeps saved
+	// music, beside their own files, and the scanner is meant to find it. Only
+	// the index of what was saved (yandexsaved.h) is the addon's.
 	char music[600], artist_dir[160], album_dir[200], album_name[220], base[220], title[200];
 	music_root(card_root, music, sizeof(music));
 	podcastdl_safe_name(tags.album_artist, "Unknown Artist", artist_dir, sizeof(artist_dir));
@@ -1216,7 +1220,7 @@ static void library_look(void *user) {
 
 static void *worker_main(void *arg) {
 	(void)arg;
-	yandexlive_enter();
+	yandexlive_enter(YANDEXLIVE_DL);
 	// Nice ten: a saved album is not urgent, but SCHED_IDLE would starve it
 	// for as long as anything plays (see thread_be_low_priority).
 	thread_be_low_priority("yandex save");
@@ -1341,7 +1345,7 @@ static void *worker_main(void *arg) {
 			music_dirty = false;
 		}
 	}
-	yandexlive_leave();
+	yandexlive_leave(YANDEXLIVE_DL);
 	return NULL;
 }
 
@@ -1478,7 +1482,7 @@ bool yandexdl_stop(void) {
 	status.queued = 0;
 	pthread_cond_broadcast(&ready);
 	pthread_mutex_unlock(&lock);
-	bool safe = yandexlive_wait("the save worker", YANDEXLIVE_WAIT_MS);
+	bool safe = yandexlive_wait(YANDEXLIVE_DL, "the save worker", YANDEXLIVE_WAIT_MS);
 
 	// Whatever it was doing has returned by now. What is left is memory and the
 	// status of a queue that no longer exists.

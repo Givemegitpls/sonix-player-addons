@@ -7,6 +7,6 @@
   "version": "0.1",
   "icon": "icon.png",
   "service": true,
-  "owns_paths": [".local/qobuz-cache/", ".local/listart/", ".local/qobuz-art/"],
-  "cache_path": ".local/qobuz-cache/"
+  "owns_paths": ["Addons/qobuz/cache/"],
+  "cache_path": "Addons/qobuz/cache/"
 }

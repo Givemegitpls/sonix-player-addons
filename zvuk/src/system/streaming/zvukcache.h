@@ -25,17 +25,25 @@
 //     is complete, the convention of the other caches: a power cut in the
 //     middle leaves a file the cache knows not to trust.
 //
-// Its own directory, so a path says which service it came from.
+// A directory of its own, so a path says which service it came from -- inside
+// this addon's folder, not the card's ".local" tree, which is the player's.
 //
 // Thread contract: zvukcache_start() blocks for the prebuffer and must run
 // on a worker thread; the rest is cheap and callable from anywhere.
 
-#define ZVUKCACHE_DIR ".local/zvuk-cache"
 #define ZVUKCACHE_MAX_BYTES (1024L * 1024L * 1024L)
 #define ZVUKCACHE_PRUNE_HEADROOM (96L * 1024 * 1024)
 #define ZVUKCACHE_CLEAR_EVERY 10
 #define ZVUKCACHE_PROTECTED_MAX 64
 
+// The cache's directory, "<addon>/cache", as addon_cache_dir() made it. NULL or
+// empty means the card would not have it (read-only, or gone): the cache then
+// answers "no cache" and tracks stream without being kept.
+void zvukcache_set_addon_dir(const char *cache);
+
+// The card, as the service registry hands it. It no longer says where the cache
+// is -- that follows the addon's folder, above -- only whether there is a card
+// at all: NULL or empty disables the cache.
 void zvukcache_set_root(const char *sd_root);
 bool zvukcache_ready(void);
 const char *zvukcache_dir(void);

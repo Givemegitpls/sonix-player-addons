@@ -21,9 +21,9 @@ extern lv_obj_t *zvukpage_screen;
 
 // Builds the page. `id` is the addon's directory name, which every screen it
 // builds is registered with (sonix_addon_own_screen); `sd_root` is the card, for
-// the token file, the covers and the saved tracks; `cfg` is the shell's
-// geometry.
-void zvukpage_init(gui_config_t *cfg, const char *id, const char *sd_root);
+// the covers and the saved tracks; `dir` is the addon's own folder
+// (<card>/Addons/<id>), where the token file is; `cfg` is the shell's geometry.
+void zvukpage_init(gui_config_t *cfg, const char *id, const char *sd_root, const char *dir);
 
 // The other end of init(). Withdraws the theme hooks and the save listener,
 // closes an open row menu, confirm and busy toast, gives back listart's slots

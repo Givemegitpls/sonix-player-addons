@@ -4,36 +4,54 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "subsonic.h"
 
+#include "common/addonfs.h"
+
 #include "src/addon/addon.h"
 #include "src/gui/fonts/fonts.h"
+#include "src/gui/nowplaying/player.h"
+#include "src/gui/shell/confirm.h"
 #include "src/gui/shell/gui.h"
+#include "src/gui/shell/icons.h"
 #include "src/gui/shell/keyboard.h"
+#include "src/gui/shell/popover.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
-#include "src/system/streaming/radio.h"
+#include "src/gui/shell/toast.h"
+#include "src/system/playback/device_state.h"
+
+#include "src/system/streaming/streamturn.h"
+#include "src/system/streaming/subsoniccache.h"
+#include "src/system/streaming/subsonicplay.h"
+#include "src/system/streaming/subsonicservice.h"
 
 #include "lvgl/lvgl.h"
 
 // The Subsonic app: a browser for the user's own library on a Navidrome, Gonic,
 // Airsonic or Ampache server, and a player for it.
 //
-// Three screens and no more:
+// Four screens and no more:
 //
-//   home   the account, and the five ways in: artists, newest, random,
-//          playlists, search;
-//   list   one list at a time, with a stack of its own -- artists -> albums ->
-//          tracks, playlists -> tracks -- so that going back walks the levels
-//          the user walked instead of leaving the addon;
-//   entry  one line of text and a keyboard, reused for the server, the user
-//          name, the password and the search.
+//   home    the server in use, the account, and the five ways in: artists,
+//           newest, random, playlists, search;
+//   list    one list at a time, with a stack of its own -- artists -> albums ->
+//           tracks, playlists -> tracks -- so that going back walks the levels
+//           the user walked instead of leaving the addon;
+//   entry   one line of text and a keyboard, reused for the server, the user
+//           name, the password and the search;
+//   servers the accounts this card holds: tap one to switch to it, add another,
+//           forget the one in use.
 //
 // Nothing that talks to the network runs on the UI thread: a request is a
 // detached worker that fills the shared arrays and posts itself back, and a
 // reply that arrives after the user has moved on is dropped by its generation.
+// Switching servers is the same rule taken one step further -- the ids, covers
+// and quality of the server that was there before have to go, and a request
+// still on the wire must not land in the new one's rows.
 //
 // An addon can also be unloaded -- the card leaving, the .so on it replaced by a
 // newer one -- and the detached workers are what that has to survive: stop(), at
@@ -79,6 +97,8 @@ static lv_obj_t *home_screen;
 static lv_obj_t *home_page;
 static lv_obj_t *list_screen;
 static lv_obj_t *list_container;
+static lv_obj_t *servers_screen;
+static lv_obj_t *servers_page;
 static lv_obj_t *entry_screen;
 static lv_obj_t *entry_field;
 static lv_obj_t *entry_title;
@@ -116,10 +136,33 @@ static pthread_mutex_t worker_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t worker_gone = PTHREAD_COND_INITIALIZER;
 static int workers_live;
 
-// What the sign-in flow has typed so far.
+// What the sign-in flow has typed so far, and which server's file it is
+// writing to: the active one when the form was opened from the account row, ""
+// when it was "Add server".
 static char pending_server[SUBSONIC_SERVER_MAX];
 static char pending_user[SUBSONIC_NAME_MAX];
 static char pending_password[SUBSONIC_NAME_MAX];
+
+// One textarea and one keyboard serve four questions: the three of a sign-in
+// (server, user, password) and the search. Which one an OK belongs to is a step
+// and not a function pointer, because the steps after it have to know which
+// server's file they are filling in -- and a saved callback would be a pointer
+// into this library that stop() has to remember to clear.
+typedef enum {
+	ENTRY_NONE = 0,
+	ENTRY_SIGNIN,
+	ENTRY_SEARCH,
+} entry_kind_t;
+
+typedef enum {
+	STEP_SERVER = 0,
+	STEP_USER,
+	STEP_PASSWORD,
+} entry_step_t;
+
+static entry_kind_t entry_kind;
+static entry_step_t entry_step;
+static char entry_slug[SUBSONIC_SLUG_MAX];
 
 // ---------------------------------------------------------------------------
 // Screens
@@ -146,6 +189,12 @@ static lv_obj_t *scrolling_page(lv_obj_t *screen, const char *title) {
 	lv_obj_set_scrollbar_mode(container, LV_SCROLLBAR_MODE_ACTIVE);
 	lv_obj_set_scroll_elastic(container, false);
 	switcher_attach_back_gesture(container);
+	// A press that drags leftwards opens the player sheet over this page, the
+	// same gesture every other list in the player takes: the sheet is parked
+	// off the right edge and the drag pulls it in. Attached to the screen as
+	// well, so the row area and the margins behave alike.
+	player_sheet_attach_drag(screen, true);
+	player_sheet_attach_drag(container, true);
 	return container;
 }
 
@@ -184,35 +233,146 @@ static void row(lv_obj_t *parent, const char *name, const char *value, lv_event_
 // ---------------------------------------------------------------------------
 // Playing a track
 //
-// The track becomes a radio station, because that is the player's one public
-// way to hand a URL to the audio path: radio.c owns the transport, the codec
-// detection and the now-playing line, and an addon is not going to grow a
-// second one. What the user sees is a station called "artist - title".
+// A tap starts the whole visible list, not one stream: the player's queue
+// becomes these tracks (subsonicplay_list), and the tapped one plays as soon as
+// its file is on the card. That is what makes shuffle, repeat, the queue page,
+// "play next" and the star work -- none of them means anything for a live
+// stream, which is what this addon used to hand radio_play().
+//
+// The row menu is the player's popover, opened from the ellipsis on a track
+// row. The actions are the queue's (play, play next, add to queue) and the
+// account's (star), and each runs after the popover has closed.
 // ---------------------------------------------------------------------------
 
-static void play_track(const subsonic_track_t *track) {
-	radio_station_t station;
-	memset(&station, 0, sizeof(station));
-
-	if (track->artist[0] && track->title[0]) {
-		lv_snprintf(station.name, sizeof(station.name), "%s - %s", track->artist, track->title);
-	} else {
-		lv_snprintf(station.name, sizeof(station.name), "%s", track->title);
+// The visible rows, copied out under the lock: a worker fills the arrays for
+// the next list, and an action that starts the queue must not read them while
+// that is happening. NULL when what is on screen is not a list of tracks.
+static subsonic_track_t *tracks_snapshot(int *count) {
+	*count = 0;
+	pthread_mutex_lock(&data_lock);
+	int n = result_count;
+	bool tracks_shown = result_kind == JOB_TRACKS || result_kind == JOB_PLAYLIST_TRACKS || result_kind == JOB_RANDOM ||
+						result_kind == JOB_SEARCH;
+	subsonic_track_t *copy = NULL;
+	if (tracks_shown && n > 0) {
+		copy = malloc((size_t)n * sizeof(*copy));
+		if (copy) {
+			memcpy(copy, tracks, (size_t)n * sizeof(*copy));
+			*count = n;
+		}
 	}
-	// No uuid: this station is not in radio-browser's directory, and radio.c
-	// reports every uuid it is given back to it as a listen. An empty one is
-	// how a station from anywhere else says "not yours".
-	station.bitrate = track->bit_rate;
-	subsonic_stream_url(track->id, station.url, sizeof(station.url));
+	pthread_mutex_unlock(&data_lock);
+	return copy;
+}
 
-	const char *problem = radio_station_problem(&station);
-	if (problem) {
-		gui_notify_popup(problem);
+// What the queue module tells the page: playback started (the sheet has a new
+// track and a new cover), or why it did not. On the UI thread.
+static void playback_event(bool started, const char *text) {
+	if (started) {
+		player_refresh_now_playing();
 		return;
 	}
-	if (!radio_play(&station)) {
-		gui_notify_popup("the player could not start the stream");
+	toast_error(text && text[0] ? text : "the track could not be played");
+}
+
+static void list_play_from(int index) {
+	int count = 0;
+	subsonic_track_t *list = tracks_snapshot(&count);
+	if (!list) {
+		return;
 	}
+	if (!subsonicplay_list(list, count, index)) {
+		toast_error("the queue could not be started");
+	}
+	free(list);
+}
+
+static void row_track_cb(lv_event_t *e) {
+	// A gesture that ends over a row is not a tap on it: events bubble.
+	if (switcher_back_drag_active() || player_sheet_drag_active()) {
+		return;
+	}
+	list_play_from((int)(intptr_t)lv_event_get_user_data(e));
+}
+
+// The track the open popover belongs to, copied when it opens: the item's
+// action runs after the popover has closed, and the rows may be rebuilt while
+// it is up.
+static subsonic_track_t menu_track;
+static int menu_index;
+
+static void menu_play(void *user) {
+	(void)user;
+	list_play_from(menu_index);
+}
+
+static void menu_play_next(void *user) {
+	(void)user;
+	if (!subsonicplay_play_next(&menu_track)) {
+		toast_error("the queue refused the addition");
+	}
+}
+
+static void menu_enqueue(void *user) {
+	(void)user;
+	if (!subsonicplay_enqueue(&menu_track)) {
+		toast_error("the queue refused the addition");
+	}
+}
+
+// The write's answer arrives on the favourites worker, never on the UI thread.
+static void star_failed_async(void *user) {
+	char *why = user;
+	toast_error(why && why[0] ? why : "the server refused the change");
+	free(why);
+}
+
+static void star_done(bool ok, const char *error, void *user) {
+	(void)user;
+	// The mirror has already flipped, so the star on the sheet is right either
+	// way; only a refusal has anything to say.
+	char *why = ok ? NULL : strdup(error && error[0] ? error : "");
+	if (why) {
+		if (!gui_post(star_failed_async, why)) {
+			free(why);
+		}
+	}
+}
+
+static void menu_star(void *user) {
+	bool want = user != NULL;
+	subsonicservice_star(menu_track.id, want, star_done, NULL);
+}
+
+static void row_menu_cb(lv_event_t *e) {
+	lv_event_stop_bubbling(e); // the tap belongs to the menu, not to the row
+	if (switcher_back_drag_active() || player_sheet_drag_active()) {
+		return;
+	}
+	int index = (int)(intptr_t)lv_event_get_user_data(e);
+	int count = 0;
+	subsonic_track_t *list = tracks_snapshot(&count);
+	if (!list || index < 0 || index >= count) {
+		free(list);
+		return;
+	}
+	menu_track = list[index];
+	menu_index = index;
+	free(list);
+
+	bool starred = subsonicservice_is_starred(menu_track.id);
+	popover_item_t items[4];
+	memset(items, 0, sizeof(items));
+	items[0].label = "Play";
+	items[0].action = menu_play;
+	items[1].label = "Play next";
+	items[1].action = menu_play_next;
+	items[2].label = "Add to queue";
+	items[2].action = menu_enqueue;
+	items[3].label = starred ? "Unstar" : "Star";
+	items[3].action = menu_star;
+	items[3].user = starred ? NULL : (void *)1;
+	popover_show(lv_event_get_current_target(e), items, 4);
 }
 
 // ---------------------------------------------------------------------------
@@ -268,9 +428,38 @@ static void row_album_cb(lv_event_t *e) {
 	start_job(JOB_TRACKS, a->id, NULL);
 }
 
-static void row_track_cb(lv_event_t *e) {
-	int index = (int)(intptr_t)lv_event_get_user_data(e);
-	play_track(&tracks[index]);
+// A track row is the shell's row plus an ellipsis on its right: the tap plays
+// the list from this row, the ellipsis opens the menu. The duration moves left
+// to make room for it.
+static void track_row(lv_obj_t *parent, int index) {
+	const subsonic_track_t *track = &tracks[index];
+	char short_name[SUBSONIC_TITLE_MAX];
+	char sub[TEXT_MAX];
+	lv_snprintf(sub, sizeof(sub), "%d:%02d", track->duration / 60, track->duration % 60);
+	lv_obj_t *value = NULL;
+	lv_obj_t *r = settingsrow_add(parent, clip(short_name, sizeof(short_name), track->title), &value, row_track_cb,
+								  (void *)(intptr_t)index);
+	if (value) {
+		lv_label_set_text(value, sub);
+		lv_obj_align(value, LV_ALIGN_RIGHT_MID, -SC(48), 0);
+	}
+
+	// A plain object with the tap on it: no button style to undo, and the
+	// handler stops the event (lv_event_stop_bubbling) so it never reaches the
+	// row underneath, where a tap is "play".
+	lv_obj_t *more = lv_obj_create(r);
+	lv_obj_set_size(more, SC(56), SC(56));
+	lv_obj_align(more, LV_ALIGN_RIGHT_MID, 0, 0);
+	lv_obj_set_style_bg_opa(more, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_border_width(more, 0, 0);
+	lv_obj_set_style_shadow_width(more, 0, 0);
+	lv_obj_set_style_pad_all(more, 0, 0);
+	lv_obj_add_event_cb(more, row_menu_cb, LV_EVENT_CLICKED, (void *)(intptr_t)index);
+	lv_obj_t *dots = lv_image_create(more);
+	lv_image_set_src(dots, &icon_ellipsis_vertical);
+	lv_obj_add_style(dots, &theme_style_icon, 0);
+	lv_obj_set_style_image_opa(dots, LV_OPA_70, 0);
+	lv_obj_center(dots);
 }
 
 static void row_playlist_cb(lv_event_t *e) {
@@ -321,10 +510,7 @@ static void list_show_level(void) {
 		case JOB_PLAYLIST_TRACKS:
 		case JOB_RANDOM:
 		case JOB_SEARCH:
-			// The duration, not the artist: a name and a four-character value fit
-			// side by side, and the artist is already in the now-playing line.
-			lv_snprintf(sub, sizeof(sub), "%d:%02d", tracks[i].duration / 60, tracks[i].duration % 60);
-			row(list_container, tracks[i].title, sub, row_track_cb, (void *)(intptr_t)i);
+			track_row(list_container, i);
 			break;
 		case JOB_PLAYLISTS:
 			lv_snprintf(sub, sizeof(sub), "%d", playlists[i].song_count);
@@ -339,6 +525,48 @@ static void list_show_level(void) {
 
 static void home_build(void);
 
+// Everything this page holds about the library it last showed. Switching
+// servers is a switch of ids, covers and quality: the rows of the old one must
+// not come back, and a request still on the wire must not land in the new one's
+// rows. The generation bump is what makes an in-flight answer unwritable --
+// its job_finished() finds the number it was given no longer current.
+static void page_reset(void) {
+	pthread_mutex_lock(&data_lock);
+	level_count = 0;
+	result_kind = JOB_NONE;
+	result_count = 0;
+	result_error[0] = '\0';
+	memset(artists, 0, sizeof(artists));
+	memset(albums, 0, sizeof(albums));
+	memset(tracks, 0, sizeof(tracks));
+	memset(playlists, 0, sizeof(playlists));
+	pthread_mutex_unlock(&data_lock);
+
+	pthread_mutex_lock(&gen_lock);
+	request_generation++;
+	pthread_mutex_unlock(&gen_lock);
+
+	// The account is (or may be) a different one: the queue's ids belong to the
+	// server that was left, and the star's mirror to its account. Signing in is
+	// also a page_reset(), which is what fetches the new account's stars.
+	subsonicplay_forget();
+	if (subsonic_logged_in()) {
+		subsonicservice_refresh_stars();
+	}
+
+	entry_kind = ENTRY_NONE;
+	entry_slug[0] = '\0';
+	memset(pending_password, 0, sizeof(pending_password));
+}
+
+// The sign-in form starts from the active server (an expired token is then one
+// field to retype), and a new server's form starts empty.
+static void seed_from_host(void) {
+	subsonic_server(pending_server, sizeof(pending_server));
+	subsonic_user_name(pending_user, sizeof(pending_user));
+	memset(pending_password, 0, sizeof(pending_password));
+}
+
 static void job_finished(void *user) {
 	int generation = (int)(intptr_t)user;
 	pthread_mutex_lock(&gen_lock);
@@ -351,10 +579,24 @@ static void job_finished(void *user) {
 	}
 
 	if (kind == JOB_LOGIN) {
-		memset(pending_password, 0, sizeof(pending_password));
+		// The account that answered is now the active server, and it may not be
+		// the one whose rows this page was showing.
+		char failure[192];
+		pthread_mutex_lock(&data_lock);
+		lv_snprintf(failure, sizeof(failure), "%s", result_error);
+		pthread_mutex_unlock(&data_lock);
+
+		page_reset();
+		seed_from_host();
 		home_build();
 		switch_screen(home_screen);
-		gui_notify_popup(count >= 0 ? "signed in" : (result_error[0] ? result_error : "sign-in failed"));
+		char note[192];
+		subsonic_hosts_note(note, sizeof(note));
+		if (count >= 0 && note[0]) {
+			gui_notify_popup(note);
+		} else {
+			gui_notify_popup(count >= 0 ? "signed in" : (failure[0] ? failure : "sign-in failed"));
+		}
 		return;
 	}
 	list_show_level();
@@ -368,6 +610,13 @@ typedef struct {
 	job_kind_t kind;
 	char id[SUBSONIC_ID_MAX];
 	char query[SUBSONIC_TITLE_MAX];
+	// JOB_LOGIN only: what was typed, and the file it goes into. Copied out of
+	// the page's fields here, on the UI thread, so the worker reads nothing the
+	// user can still be typing into.
+	char server[SUBSONIC_SERVER_MAX];
+	char user[SUBSONIC_NAME_MAX];
+	char password[SUBSONIC_NAME_MAX];
+	char slug[SUBSONIC_SLUG_MAX];
 	int generation;
 } job_t;
 
@@ -411,7 +660,10 @@ static void *worker(void *arg) {
 		count = subsonic_search_tracks(job->query, 0, tracks, LIST_MAX);
 		break;
 	case JOB_LOGIN:
-		count = subsonic_login(pending_server, pending_user, pending_password) ? 0 : -1;
+		// Slug NULL is "a server this card does not have yet"; the addon names
+		// its file after the address and activates it.
+		count = subsonic_login_host(job->slug[0] ? job->slug : NULL, job->server, job->user, job->password) ? 0 : -1;
+		memset(job->password, 0, sizeof(job->password));
 		break;
 	default:
 		break;
@@ -452,19 +704,9 @@ static void *worker(void *arg) {
 	return NULL;
 }
 
-static void start_job(job_kind_t kind, const char *id, const char *query) {
-	job_t *job = calloc(1, sizeof(*job));
-	if (!job) {
-		return;
-	}
-	job->kind = kind;
-	if (id) {
-		lv_snprintf(job->id, sizeof(job->id), "%s", id);
-	}
-	if (query) {
-		lv_snprintf(job->query, sizeof(job->query), "%s", query);
-	}
-
+// Whether a job may be started at all, and the count that keeps stop() honest
+// about the thread it is about to create.
+static bool job_launch(job_t *job) {
 	// Counted here and not in the worker's first statement: between
 	// pthread_create() and that statement stop() would read nought, return, and
 	// leave the thread to run this library's code as its first act. start_job()
@@ -478,7 +720,7 @@ static void start_job(job_kind_t kind, const char *id, const char *query) {
 	pthread_mutex_unlock(&worker_lock);
 	if (!go) {
 		free(job);
-		return;
+		return false;
 	}
 
 	pthread_mutex_lock(&gen_lock);
@@ -491,11 +733,50 @@ static void start_job(job_kind_t kind, const char *id, const char *query) {
 		workers_live--;
 		pthread_cond_broadcast(&worker_gone);
 		pthread_mutex_unlock(&worker_lock);
+		job_kind_t kind = job->kind;
 		free(job);
-		list_show_message("could not start a worker thread");
-		return;
+		if (kind == JOB_LOGIN) {
+			gui_notify_popup("could not start a worker thread");
+		} else {
+			list_show_message("could not start a worker thread");
+		}
+		return false;
 	}
 	pthread_detach(thread);
+	return true;
+}
+
+static void start_job(job_kind_t kind, const char *id, const char *query) {
+	job_t *job = calloc(1, sizeof(*job));
+	if (!job) {
+		return;
+	}
+	job->kind = kind;
+	if (id) {
+		lv_snprintf(job->id, sizeof(job->id), "%s", id);
+	}
+	if (query) {
+		lv_snprintf(job->query, sizeof(job->query), "%s", query);
+	}
+	job_launch(job);
+}
+
+// The sign-in chain finished: the three answers and the file they belong to
+// leave the page's fields here, and the worker talks to the network.
+static void start_sign_in(void) {
+	job_t *job = calloc(1, sizeof(*job));
+	if (!job) {
+		gui_notify_popup("could not start a worker thread");
+		return;
+	}
+	job->kind = JOB_LOGIN;
+	lv_snprintf(job->slug, sizeof(job->slug), "%s", entry_slug);
+	lv_snprintf(job->server, sizeof(job->server), "%s", pending_server);
+	lv_snprintf(job->user, sizeof(job->user), "%s", pending_user);
+	lv_snprintf(job->password, sizeof(job->password), "%s", pending_password);
+	if (job_launch(job)) {
+		memset(pending_password, 0, sizeof(pending_password));
+	}
 }
 
 static void job_start_visual(job_kind_t kind, const char *id, const char *query) {
@@ -535,30 +816,61 @@ static void list_open(job_kind_t kind, const char *title, const char *query) {
 // Text entry
 // ---------------------------------------------------------------------------
 
-static void (*entry_done)(const char *text);
+// One textarea and one keyboard serve four questions: the three of a sign-in
+// (server, user, password) and the search. Which one an OK belongs to is
+// `entry_kind` and `entry_step`, declared above with the fields they read.
+
+static void ask_user(const char *server);
+static void ask_password(const char *user);
+static void sign_in_finish(const char *password);
+static void search_done(const char *query);
 
 static void entry_ok_cb(lv_event_t *e) {
 	(void)e;
 	char text[TEXT_MAX];
 	lv_snprintf(text, sizeof(text), "%s", lv_textarea_get_text(entry_field));
-	void (*done)(const char *) = entry_done;
-	entry_done = NULL;
+
+	// Read and cleared before the step runs: a step that rejects what was typed
+	// leaves the screen up and arms the next one itself, and a step that starts
+	// a job leaves nothing armed at all.
+	entry_kind_t kind = entry_kind;
+	entry_step_t step = entry_step;
+	entry_kind = ENTRY_NONE;
+
 	// The keyboard is *not* hidden here: a step that rejects what was typed
 	// (an empty server, say) leaves its screen up, and a keyboard that vanished
 	// under the message would have to be tapped back into existence. The steps
 	// that leave the screen hide it themselves.
-	if (done) {
-		done(text);
+	switch (kind) {
+	case ENTRY_SIGNIN:
+		switch (step) {
+		case STEP_SERVER:
+			ask_user(text);
+			break;
+		case STEP_USER:
+			ask_password(text);
+			break;
+		default:
+			sign_in_finish(text);
+			break;
+		}
+		break;
+	case ENTRY_SEARCH:
+		search_done(text);
+		break;
+	default:
+		break;
 	}
 }
 
-static void entry_open(const char *title, const char *initial, bool password, void (*done)(const char *)) {
+static void entry_open(entry_kind_t kind, entry_step_t step, const char *title, const char *initial, bool password) {
 	lv_label_set_text(entry_title, title);
 	lv_textarea_set_text(entry_field, initial ? initial : "");
 	lv_textarea_set_password_mode(entry_field, password);
 	keyboard_set_field(entry_keyboard, entry_field);
 	keyboard_set_visible(entry_keyboard, true);
-	entry_done = done;
+	entry_kind = kind;
+	entry_step = step;
 	switch_screen(entry_screen);
 }
 
@@ -587,7 +899,9 @@ static void trim_copy(char *dst, size_t size, const char *src) {
 	}
 }
 
-// The password arrived: everything is in hand, ask the server.
+// The password arrived: everything is in hand, ask the server. The job carries
+// what was typed and the file it belongs to, so the worker never reads the
+// page's fields while the user may be typing the next thing.
 static void sign_in_finish(const char *password) {
 	trim_copy(pending_password, sizeof(pending_password), password);
 	if (!pending_server[0] || !pending_user[0]) {
@@ -596,17 +910,18 @@ static void sign_in_finish(const char *password) {
 	}
 	keyboard_set_visible(entry_keyboard, false);
 	switch_screen(home_screen);
-	start_job(JOB_LOGIN, NULL, NULL);
+	start_sign_in();
 }
 
-// The user name arrived: ask for the password.
+// The user name arrived: ask for the password. The step stays a sign-in, and
+// the target file is the one the chain was opened for.
 static void ask_password(const char *user) {
 	trim_copy(pending_user, sizeof(pending_user), user);
 	if (!pending_user[0]) {
 		gui_notify_popup("the user name is empty");
 		return; // the entry screen stays up
 	}
-	entry_open("Password", "", true, sign_in_finish);
+	entry_open(ENTRY_SIGNIN, STEP_PASSWORD, "Password", "", true);
 }
 
 // The server arrived: ask for the user name.
@@ -616,18 +931,91 @@ static void ask_user(const char *server) {
 		gui_notify_popup("the server is empty");
 		return;
 	}
-	entry_open("User name", pending_user, false, ask_password);
+	entry_open(ENTRY_SIGNIN, STEP_USER, "User name", pending_user, false);
 }
 
-static void ask_server(void) { entry_open("Server", pending_server, false, ask_user); }
+// Starts the three questions, writing into `slug` -- "" for a server this card
+// does not have yet. `seed` fills the address and the name from the server in
+// use, so signing in again after a token expired is one field and not three.
+static void sign_in_open(const char *slug, bool seed) {
+	lv_snprintf(entry_slug, sizeof(entry_slug), "%s", slug ? slug : "");
+	if (seed) {
+		subsonic_server(pending_server, sizeof(pending_server));
+		subsonic_user_name(pending_user, sizeof(pending_user));
+	} else {
+		pending_server[0] = '\0';
+		pending_user[0] = '\0';
+	}
+	memset(pending_password, 0, sizeof(pending_password));
+	entry_open(ENTRY_SIGNIN, STEP_SERVER, "Server", pending_server, false);
+}
 
 // ---------------------------------------------------------------------------
 // Home
 // ---------------------------------------------------------------------------
 
+// The name of the server in use, for the row that opens the servers screen. The
+// addon keeps the list in memory and refreshes it on load, sign-in, switch and
+// removal, so a screen build reads no files.
+static bool active_label(char *out, size_t size) {
+	char active[SUBSONIC_SLUG_MAX];
+	if (!out || !size) {
+		return false;
+	}
+	out[0] = '\0';
+	if (!subsonic_host_active_slug(active, sizeof(active))) {
+		return false;
+	}
+	int n = subsonic_hosts_count();
+	for (int i = 0; i < n; i++) {
+		char slug[SUBSONIC_SLUG_MAX];
+		char label[SUBSONIC_LABEL_MAX];
+		if (subsonic_host_slug_at(i, slug, sizeof(slug)) && strcmp(slug, active) == 0 &&
+			subsonic_host_at(i, label, sizeof(label), NULL, 0, NULL, 0)) {
+			lv_snprintf(out, size, "%s", label);
+			return true;
+		}
+	}
+	// The file is there and the list is not: the slug at least says which one.
+	lv_snprintf(out, size, "%s", active);
+	return true;
+}
+
+static const char *quality_name(int q) {
+	switch (q) {
+	case SUBSONIC_QUALITY_MP3_320:
+		return "320 kbps";
+	case SUBSONIC_QUALITY_MP3_192:
+		return "192 kbps";
+	case SUBSONIC_QUALITY_OPUS_128:
+		return "128 kbps";
+	default:
+		return "Original";
+	}
+}
+
+static void servers_build(void);
+
 static void account_cb(lv_event_t *e) {
 	(void)e;
-	ask_server();
+	char slug[SUBSONIC_SLUG_MAX];
+	subsonic_host_active_slug(slug, sizeof(slug));
+	sign_in_open(slug, true);
+}
+
+static void servers_cb(lv_event_t *e) {
+	(void)e;
+	servers_build();
+	switch_screen(servers_screen);
+}
+
+// One tap, one step round the four choices: the file as it is on the server
+// first -- it is the only one that keeps a lossless library lossless -- then the
+// transcodes, in the order of their bitrates.
+static void quality_cb(lv_event_t *e) {
+	(void)e;
+	subsonic_set_quality((subsonic_get_quality() + 1) % SUBSONIC_QUALITY_COUNT);
+	home_build();
 }
 
 static void artists_cb(lv_event_t *e) {
@@ -669,12 +1057,18 @@ static void search_done(const char *query) {
 
 static void search_cb(lv_event_t *e) {
 	(void)e;
-	entry_open("Search", "", false, search_done);
+	// The step is the sign-in flow's; a search has none and ignores it.
+	entry_open(ENTRY_SEARCH, STEP_SERVER, "Search", "", false);
 }
 
+// The active server, and only that one: the others keep their tokens.
 static void sign_out_cb(lv_event_t *e) {
 	(void)e;
 	subsonic_logout();
+	// A cached track still plays after this, and its star must not keep
+	// answering for an account that is gone.
+	subsonicservice_forget_stars();
+	subsonicplay_forget();
 	home_build();
 	gui_notify_popup("signed out");
 }
@@ -686,6 +1080,24 @@ static void home_build(void) {
 	}
 	lv_obj_clean(home_page);
 
+	char label[SUBSONIC_LABEL_MAX];
+	bool have_host = active_label(label, sizeof(label));
+	if (!have_host && subsonic_logged_in()) {
+		// A session with no file behind it -- a card that would not take a
+		// servers folder, or one from the older layout. Still a server, and
+		// still the way to the servers screen.
+		char server[SUBSONIC_SERVER_MAX];
+		subsonic_server(server, sizeof(server));
+		subsonic_server_host(server, label, sizeof(label));
+		have_host = label[0] != '\0';
+	}
+
+	// Which server, before whose account: it is the row a house with two of
+	// them reaches for first.
+	if (have_host) {
+		row(home_page, "Server", label, servers_cb, NULL);
+	}
+
 	if (subsonic_logged_in()) {
 		char value[TEXT_MAX];
 		subsonic_display_name(value, sizeof(value));
@@ -695,15 +1107,163 @@ static void home_build(void) {
 		row(home_page, "Random", "", random_cb, NULL);
 		row(home_page, "Playlists", "", playlists_cb, NULL);
 		row(home_page, "Search", "", search_cb, NULL);
-		row(home_page, "Sign out", "", sign_out_cb, NULL);
 	} else {
 		row(home_page, "Sign in", "server, user, password", account_cb, NULL);
+	}
+
+	// A choice that is stored per server, so it is only offered when there is
+	// one to store it for.
+	if (have_host) {
+		row(home_page, "Quality", quality_name(subsonic_get_quality()), quality_cb, NULL);
+	}
+	if (subsonic_logged_in()) {
+		row(home_page, "Sign out", "", sign_out_cb, NULL);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The servers screen
+// ---------------------------------------------------------------------------
+
+// Taps on a row make that the server in use: the session is reloaded under the
+// addon, and the page forgets everything that belonged to the one before.
+static void server_row_cb(lv_event_t *e) {
+	int index = (int)(intptr_t)lv_event_get_user_data(e);
+	char slug[SUBSONIC_SLUG_MAX];
+	if (!subsonic_host_slug_at(index, slug, sizeof(slug))) {
+		return;
+	}
+	if (!subsonic_host_select(slug)) {
+		gui_notify_popup("this server could not be opened");
+		return;
+	}
+	page_reset();
+	seed_from_host();
+	home_build();
+	switch_screen(home_screen);
+}
+
+static void add_server_cb(lv_event_t *e) {
+	(void)e;
+	sign_in_open("", false);
+}
+
+// After the card's own "are you sure?": the active server's file goes, and the
+// page comes up for whichever server is first of those left.
+static void forget_done(void *user) {
+	(void)user;
+	char slug[SUBSONIC_SLUG_MAX];
+	if (!subsonic_host_active_slug(slug, sizeof(slug))) {
+		return;
+	}
+	if (!subsonic_host_forget(slug)) {
+		gui_notify_popup("this server could not be removed");
+		return;
+	}
+	page_reset();
+	seed_from_host();
+	home_build();
+	servers_build();
+	gui_notify_popup("server removed");
+}
+
+static void remove_server_cb(lv_event_t *e) {
+	(void)e;
+	char slug[SUBSONIC_SLUG_MAX];
+	if (!subsonic_host_active_slug(slug, sizeof(slug))) {
+		return;
+	}
+	char label[SUBSONIC_LABEL_MAX];
+	if (!active_label(label, sizeof(label))) {
+		lv_snprintf(label, sizeof(label), "%s", slug);
+	}
+	char message[TEXT_MAX];
+	lv_snprintf(message, sizeof(message),
+				"%s will be removed from this card.\nThe account is forgotten; nothing on the server is touched.",
+				label);
+	confirm_show("Remove server", message, "remove", forget_done, NULL);
+}
+
+static void servers_build(void) {
+	if (!servers_page) {
+		return;
+	}
+	lv_obj_clean(servers_page);
+	subsonic_hosts_refresh();
+
+	char active[SUBSONIC_SLUG_MAX];
+	bool have_active = subsonic_host_active_slug(active, sizeof(active));
+	int n = subsonic_hosts_count();
+	char active_name[SUBSONIC_LABEL_MAX] = "";
+
+	for (int i = 0; i < n; i++) {
+		char slug[SUBSONIC_SLUG_MAX];
+		char label[SUBSONIC_LABEL_MAX];
+		char server[SUBSONIC_SERVER_MAX];
+		char user[SUBSONIC_NAME_MAX];
+		if (!subsonic_host_slug_at(i, slug, sizeof(slug)) ||
+			!subsonic_host_at(i, label, sizeof(label), server, sizeof(server), user, sizeof(user))) {
+			continue;
+		}
+		char host[SUBSONIC_SERVER_MAX];
+		subsonic_server_host(server, host, sizeof(host));
+		char value[TEXT_MAX];
+		if (user[0]) {
+			lv_snprintf(value, sizeof(value), "%s @ %s", user, host);
+		} else {
+			lv_snprintf(value, sizeof(value), "%s", host);
+		}
+		// The one in use is marked in the name. A plain asterisk: the row's
+		// font is the player's, and not every bullet is drawn in it.
+		char name[SUBSONIC_LABEL_MAX + 4];
+		if (have_active && strcmp(slug, active) == 0) {
+			lv_snprintf(name, sizeof(name), "* %s", label);
+			lv_snprintf(active_name, sizeof(active_name), "%s", label);
+		} else {
+			lv_snprintf(name, sizeof(name), "%s", label);
+		}
+		row(servers_page, name, value, server_row_cb, (void *)(intptr_t)i);
+	}
+
+	if (n == 0) {
+		lv_obj_t *label = lv_label_create(servers_page);
+		lv_label_set_text(label, "no servers yet");
+		lv_obj_add_style(label, &theme_style_text_dim, 0);
+		lv_obj_set_style_text_font(label, &font_ui_24, 0);
+		lv_obj_set_width(label, lv_pct(100));
+		lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+	}
+
+	row(servers_page, "Add server", "", add_server_cb, NULL);
+	if (have_active) {
+		// Which one it would take is the question the row has to answer, and the
+		// name is too long for this row's width: the label goes in the value.
+		row(servers_page, "Remove server", active_name, remove_server_cb, NULL);
 	}
 }
 
 // ---------------------------------------------------------------------------
 // The addon
 // ---------------------------------------------------------------------------
+
+// "Show album" from the player's track menu: the addon's list screen, asking for
+// that album's tracks, which is where the sheet's back chevron then returns
+// from. The album id comes from the sidecar written when the track was
+// downloaded (subsoniccache.c), so no database lookup is involved.
+static void *open_album_cb(const char *album_id, const char *title) {
+	if (!album_id || !album_id[0] || !list_screen || !subsonic_logged_in()) {
+		return NULL;
+	}
+	level_count = 0;
+	level_t *l = &levels[level_count++];
+	l->kind = JOB_TRACKS;
+	lv_snprintf(l->id, sizeof(l->id), "%s", album_id);
+	lv_snprintf(l->title, sizeof(l->title), "%s", title && title[0] ? title : "Subsonic");
+	heading_set(l->title);
+	switch_screen(list_screen);
+	job_start_visual(JOB_TRACKS, l->id, NULL);
+	return list_screen;
+}
 
 static lv_obj_t *subsonic_init(const sonix_addon_host_t *host) {
 	config = host->cfg;
@@ -735,16 +1295,46 @@ static lv_obj_t *subsonic_init(const sonix_addon_host_t *host) {
 	pthread_mutex_unlock(&data_lock);
 
 	level_count = 0;
-	entry_done = NULL;
+	entry_kind = ENTRY_NONE;
+	entry_step = STEP_SERVER;
+	entry_slug[0] = '\0';
 
 	subsonic_load(host->dir);
 
+	// The cache and the queue: everything that plays a track as a file of the
+	// card. <addon>/cache, made here; a card that refuses it (read-only, or
+	// gone) leaves it NULL, and a Subsonic track then cannot be played at all --
+	// it is not a stream that could be handed to radio_play() instead.
+	char cache[512];
+	bool have_cache = addon_cache_dir(host, cache, sizeof(cache));
+	subsoniccache_set_addon_dir(have_cache ? cache : NULL);
+	subsoniccache_set_root(host->sd_root);
+
+	// The prepare callback goes in here, not on the first tap: the player
+	// restores its queue at boot and can start a track of ours before this page
+	// is ever opened.
+	subsonicplay_init(playback_event);
+
+	// The star's mirror: the account's starred songs, fetched once on a worker
+	// so that the sheet's star answers without a network round trip.
+	if (subsonic_logged_in()) {
+		subsonicservice_refresh_stars();
+	}
+
 	// What is already known fills the form: signing in again after a token
 	// expired is then one field, not three.
-	subsonic_server(pending_server, sizeof(pending_server));
-	subsonic_user_name(pending_user, sizeof(pending_user));
+	seed_from_host();
 
 	home_build();
+
+	// Anything the load could not do with the card -- a servers folder it would
+	// not create, a session it kept in memory only -- is said once, here: a
+	// player in the hand has no log to read.
+	char note[192];
+	subsonic_hosts_note(note, sizeof(note));
+	if (note[0]) {
+		gui_notify_popup(note);
+	}
 
 	// Every screen this addon puts on the display, handed to the shell as it is
 	// made: this is the list addon_unload() walks to move the display off
@@ -779,6 +1369,16 @@ static lv_obj_t *subsonic_init(const sonix_addon_host_t *host) {
 		keyboard_create(entry_screen, config->screen_width, SC(316), entry_field, NULL, "ok", entry_ok_cb, NULL);
 	keyboard_set_visible(entry_keyboard, false);
 
+	servers_screen = lv_obj_create(NULL);
+	sonix_addon_own_screen(self_id, servers_screen);
+	servers_page = scrolling_page(servers_screen, "Servers");
+
+	// The two account hooks only the page can supply: "show album" opens the
+	// list above. The badge stays NULL -- this player's icon set carries the
+	// Qobuz and Tidal marks and no Subsonic one, so the artwork keeps none; the
+	// sheet's cover is the real one, read from the cached file.
+	subsonicservice_attach_gui(open_album_cb);
+
 	return home_screen;
 }
 
@@ -789,6 +1389,13 @@ static lv_obj_t *subsonic_init(const sonix_addon_host_t *host) {
 // more, false when a request is still inside it and the shell has to keep the
 // mapping instead.
 static bool subsonic_addon_stop(void) {
+	// 0. The network first, and the shared download turn with it. A download
+	// thread parked in streamturn_acquire() only leaves once it has the turn,
+	// and the turn may be held by another service's track; asking everyone to
+	// abandon is what makes the waits below bounded in that case rather than the
+	// length of somebody else's album.
+	streamturn_abandon_all();
+
 	// 1. No new work from here: start_job() reads this before it counts or
 	// creates anything, and a worker reads it before it says its result came
 	// back. Nothing may be posted after this point, because the callback is code
@@ -827,6 +1434,15 @@ static bool subsonic_addon_stop(void) {
 		fprintf(stderr, "subsonic: stop: %d request(s) still running, keeping the library mapped\n", left);
 	}
 
+	// 2b. The modules this page started, in the order of their dependencies.
+	// Each withdraws its own registration with the player -- the prepare
+	// callback and the watch timer (subsonicplay_stop), the streamturn abandon
+	// hook (subsoniccache_stop) -- before it waits, because all three are code
+	// in this library. Every one of them runs even after another has said no.
+	bool safe = subsonicplay_stop();
+	safe = subsonicservice_stop() && safe;
+	safe = subsoniccache_stop() && safe;
+
 	// 3. What the last run put in the shared state. Left alone while a worker is
 	// still writing it (the arrays are its, and the lock would make this wait for
 	// the network all over again), and cleared otherwise, above all for the case
@@ -850,17 +1466,27 @@ static bool subsonic_addon_stop(void) {
 
 	level_count = 0;
 
-	// The next step of the sign-in flow, when one was waiting for an entry
-	// screen's OK: a function in this library, and the keyboard that would call
-	// it is the player's.
-	entry_done = NULL;
+	// The step of the sign-in flow, when one was waiting for an entry screen's
+	// OK. It is an enum, but the screens and the keyboard that carried it are
+	// the player's, so nothing of this library may still be armed for the next
+	// tap.
+	entry_kind = ENTRY_NONE;
+	entry_step = STEP_SERVER;
+	entry_slug[0] = '\0';
 
 	// What was typed is the user's, and one of the three is a password.
 	memset(pending_password, 0, sizeof(pending_password));
 	memset(pending_user, 0, sizeof(pending_user));
 	memset(pending_server, 0, sizeof(pending_server));
 
-	// 4. The session, from memory only. The file on the card is the record and
+	// The "are you sure?" card a removal may be standing behind is the player's
+	// and survives this addon: its OK button calls a function in this library,
+	// so it is closed here (qobuz's stop() does the same, and for the same
+	// reason). A card of the player's own would be closed too, which is why this
+	// is done only when our screens are already gone.
+	confirm_close();
+
+	// 4. The session, from memory only. The files on the card are the record and
 	// stop() is an unload, not a sign-out: writing here would be a write to a
 	// filesystem that may be going away, and would end the session of the copy
 	// that is loaded next.
@@ -886,6 +1512,8 @@ static bool subsonic_addon_stop(void) {
 	home_page = NULL;
 	list_screen = NULL;
 	list_container = NULL;
+	servers_screen = NULL;
+	servers_page = NULL;
 	entry_screen = NULL;
 	entry_field = NULL;
 	entry_title = NULL;
@@ -896,7 +1524,7 @@ static bool subsonic_addon_stop(void) {
 	// report -- the shell keeps the mapping and refuses to open this addon again
 	// for the rest of the run, which is a leak instead of a jump into an unmapped
 	// page.
-	return left == 0;
+	return left == 0 && safe;
 }
 
 static const sonix_addon_t subsonic = {
@@ -914,6 +1542,14 @@ static const sonix_addon_stop_t subsonic_lifecycle = {
 
 const sonix_addon_t *sonix_addon_entry(uint32_t api) {
 	return api == SONIX_ADDON_API ? &subsonic : NULL;
+}
+
+// The second symbol: what the rest of the player asks about the cache and the
+// account (subsonicservice.c). The loader asks for it as soon as the library is
+// open, before init(), which is why the table is a static here and every
+// function in it survives the cache not being set up yet.
+const sonix_addon_service_t *sonix_addon_service_entry(uint32_t api) {
+	return api == SONIX_ADDON_API ? subsonicservice_table() : NULL;
 }
 
 const sonix_addon_stop_t *sonix_addon_stop_entry(uint32_t api) {

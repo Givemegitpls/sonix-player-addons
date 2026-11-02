@@ -144,7 +144,7 @@ static void run_job(const job_t *job) {
 
 static void *worker_main(void *arg) {
 	(void)arg;
-	yandexlive_enter();
+	yandexlive_enter(YANDEXLIVE_SYNC);
 	// Nice ten, not SCHED_IDLE (which the other services' sync threads use).
 	// The likes are the one thing here, and a like is a tap waiting for its
 	// answer. With Bluetooth LDAC encoding and a track decoding, the device
@@ -177,7 +177,7 @@ static void *worker_main(void *arg) {
 		pthread_mutex_unlock(&lock);
 		run_job(&job);
 	}
-	yandexlive_leave();
+	yandexlive_leave(YANDEXLIVE_SYNC);
 	return NULL;
 }
 
@@ -222,7 +222,7 @@ bool yandexsync_stop(void) {
 	load_queued = false;
 	pthread_cond_broadcast(&ready);
 	pthread_mutex_unlock(&lock);
-	bool safe = yandexlive_wait("the sync worker", YANDEXLIVE_WAIT_MS);
+	bool safe = yandexlive_wait(YANDEXLIVE_SYNC, "the sync worker", YANDEXLIVE_WAIT_MS);
 
 	pthread_mutex_lock(&lock);
 	memset(queue, 0, sizeof(queue));

@@ -30,7 +30,16 @@
 // comes out, and whatever plays it neither knows nor needs to know where it
 // came from.
 
-#define TIDALCACHE_DIR ".local/tidal-cache"
+// The cache is a folder of the addon's own -- <addon>/cache -- and not a place
+// in the card root or in the `.local/` tree, which belongs to the player
+// (addons/common/addonfs.h). The tracks, their tags and their covers are all
+// this one directory.
+#define TIDALCACHE_DIRNAME "cache"
+
+// Where it was until the move, below the card root. Named here, next to what
+// replaced it, because addon.c renames the old directory into the new one once
+// (addonfs.h) and the two names belong together.
+#define TIDALCACHE_DIR_OLD ".local/tidal-cache"
 
 // The same ceiling as Qobuz. The two count separately, so in the worst case --
 // using both on the same day -- they take twice as much. That is deliberate:
@@ -43,6 +52,17 @@
 // it).
 void tidalcache_set_root(const char *sd_root);
 bool tidalcache_ready(void);
+
+// The addon's own folder on the card: `host->dir`, and the card it sits in.
+// From then on the cache is "<addon>/cache", and set_root() puts the two
+// together, so that a card which comes back at another mount point takes the
+// cache with it. Only the part below the card root is kept: the mount point
+// moves, the folder inside the card does not.
+//
+// Called from init(), after addon_cache_dir() has made the folder. With no
+// folder set the cache stays disabled -- an addon that could not say where it
+// lives has nowhere to write.
+void tidalcache_set_addon_dir(const char *addon_dir, const char *sd_root);
 
 // The path this track would have. Says nothing about whether it exists.
 void tidalcache_path(long track_id, const char *mime, char *out, size_t size);
@@ -150,7 +170,9 @@ void tidalcache_note_played(const char *path);
 // automatic sweep skips them. Call from the GUI thread.
 void tidalcache_set_protected(const char *const *paths, int count);
 
-// Call on the way out (shutdown, reboot).
+// Call on the way out (shutdown, reboot). Only this cache is touched: the list
+// covers the pages download live in the player's own `.local/listart` and are
+// the player's to clear (listart.h), not an addon's.
 void tidalcache_clear_on_exit(void);
 
 // Current size, and how to empty it.

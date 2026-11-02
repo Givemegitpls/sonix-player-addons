@@ -22,9 +22,22 @@
 // states (.state1). One directory for all of them, beside the ROMs rather than
 // inside their folders, so saves can be copied off in one go and the same
 // cartridge present in both GB and GBC does not collide on a file name.
+//
+// Not in the addon's folder, deliberately: these files belong to the games in
+// the user's own Games/ tree, not to Gearboy. A card that loses the addon, or
+// gets a new one, keeps its saves where the user put the ROMs; moving them into
+// <addon>/ would make deleting an addon delete the user's progress.
 #define DIR_SAVES "Games/Saves"
 
-#define CACHE_DIR ".local/gearboy-cache"
+// Where the CRCs of the ROMs already read are kept: the addon's own folder on
+// the card, `<addon>/cache/index.tsv`, and not a directory in the shared
+// `.local/` tree. The index describes what this addon found and belongs to
+// nobody else: in `.local/` it was a directory a factory reset had to guess
+// about and a user could attribute to anything (docs/ADDONS.md).
+//
+// The directory is not built here. The addon makes it at init() and hands it
+// over with gbdb_set_cache_dir(); a card that refused it leaves the cache off
+// and the scan still runs, which is the read-only case.
 #define CACHE_FILE "index.tsv"
 
 // A Game Boy cartridge is between 32 KB and 8 MB. Anything outside that is not
@@ -38,11 +51,18 @@
 #define CRC_CHUNK (32 * 1024)
 
 static char root_path[GBROM_PATH_MAX];
+static char cache_dir_path[GBROM_PATH_MAX];
 static pthread_mutex_t root_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void gbdb_set_root(const char *sd_root) {
 	pthread_mutex_lock(&root_lock);
 	snprintf(root_path, sizeof(root_path), "%s", sd_root ? sd_root : "");
+	pthread_mutex_unlock(&root_lock);
+}
+
+void gbdb_set_cache_dir(const char *cache_dir) {
+	pthread_mutex_lock(&root_lock);
+	snprintf(cache_dir_path, sizeof(cache_dir_path), "%s", cache_dir ? cache_dir : "");
 	pthread_mutex_unlock(&root_lock);
 }
 
@@ -79,6 +99,19 @@ static bool card_root(char *out, size_t size) {
 	bool have = root_path[0] != '\0';
 	if (have) {
 		snprintf(out, size, "%s", root_path);
+	}
+	pthread_mutex_unlock(&root_lock);
+	return have;
+}
+
+// Copied out for the same reason the root is: the scan runs on its own thread
+// and may start before init() has finished handing the paths over. False when
+// the addon has no cache folder on this card, which is not an error here.
+static bool own_cache_dir(char *out, size_t size) {
+	pthread_mutex_lock(&root_lock);
+	bool have = cache_dir_path[0] != '\0';
+	if (have) {
+		snprintf(out, size, "%s", cache_dir_path);
 	}
 	pthread_mutex_unlock(&root_lock);
 	return have;
@@ -195,13 +228,17 @@ static bool cache_push(cache_t *c, const cache_entry_t *e) {
 // same-sized buffer could not hold. gcc warns about it, correctly.
 #define WORK_PATH_MAX (GBROM_PATH_MAX + 64)
 
-static void cache_path(char *out, size_t size, const char *root) {
-	snprintf(out, size, "%s/%s/%s", root, CACHE_DIR, CACHE_FILE);
+// `dir` is the addon's cache folder. The precision bounds what the %s may take,
+// the way collect_dir() does below: the caller's buffer is at most
+// GBROM_PATH_MAX, which does fit, but the compiler cannot see that through a
+// parameter and warns about a truncation that cannot happen.
+static void cache_path(char *out, size_t size, const char *dir) {
+	snprintf(out, size, "%.*s/%s", (int)size - (int)sizeof(CACHE_FILE) - 1, dir, CACHE_FILE);
 }
 
-static void cache_load(cache_t *c, const char *root) {
+static void cache_load(cache_t *c, const char *dir) {
 	char path[WORK_PATH_MAX];
-	cache_path(path, sizeof(path), root);
+	cache_path(path, sizeof(path), dir);
 
 	FILE *f = fopen(path, "r");
 	if (!f) {
@@ -252,25 +289,23 @@ static void cache_load(cache_t *c, const char *root) {
 	fclose(f);
 }
 
-// mkdir -p for the two levels needed: .local almost always exists already (the
-// log lives there), gearboy-cache almost never does on the first run.
-static void ensure_cache_dir(const char *root) {
-	char path[WORK_PATH_MAX];
-	snprintf(path, sizeof(path), "%s/.local", root);
-	mkdir(path, 0777);
-	snprintf(path, sizeof(path), "%s/%s", root, CACHE_DIR);
-	mkdir(path, 0777);
+// The addon made this directory at init(); this covers a card the user tidied
+// up between two scans, and a first run on a card where the folder was never
+// bumped into. One level, because the parent is the addon's own folder on the
+// card, which exists -- it holds addon.so.
+static void ensure_cache_dir(const char *dir) {
+	mkdir(dir, 0777);
 }
 
 // Written to a temporary file and renamed, never written in place: if power is
 // lost halfway through -- which happens on a battery device that shuts itself
 // down -- the old file survives intact instead of becoming half a new one.
-static void cache_save(const cache_t *c, const char *root) {
-	ensure_cache_dir(root);
+static void cache_save(const cache_t *c, const char *dir) {
+	ensure_cache_dir(dir);
 
 	char path[WORK_PATH_MAX];
 	char tmp[WORK_PATH_MAX + 8];
-	cache_path(path, sizeof(path), root);
+	cache_path(path, sizeof(path), dir);
 	snprintf(tmp, sizeof(tmp), "%s.new", path);
 
 	FILE *f = fopen(tmp, "w");
@@ -547,7 +582,14 @@ int gbdb_scan(gbrom_t **out, bool (*progress)(int done, int total, void *user), 
 	}
 
 	cache_t cache = {0};
-	cache_load(&cache, root);
+	// The index is optional. A read-only card, or one whose folder the addon
+	// could not make, means every ROM is read on every scan and nothing is
+	// written; the list itself works either way.
+	char cache_root[WORK_PATH_MAX];
+	bool have_cache = own_cache_dir(cache_root, sizeof(cache_root));
+	if (have_cache) {
+		cache_load(&cache, cache_root);
+	}
 
 	// First pass: entries answered by the cache are done; the rest are read
 	// through to compute their CRC. This is the only expensive part, and the
@@ -641,7 +683,9 @@ int gbdb_scan(gbrom_t **out, bool (*progress)(int done, int total, void *user), 
 			snprintf(e.name, sizeof(e.name), "%s", r->from_db ? r->name : "");
 			cache_push(&fresh, &e);
 		}
-		cache_save(&fresh, root);
+		if (have_cache) {
+			cache_save(&fresh, cache_root);
+		}
 		cache_free(&fresh);
 	}
 

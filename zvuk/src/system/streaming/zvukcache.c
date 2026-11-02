@@ -32,7 +32,8 @@
 #define BUF_SIZE (64 * 1024)
 #define MARKER ".incompleto"
 
-static char cache_dir[400];
+static char cache_dir[400];	 // the one in use, "" while the card is gone
+static char addon_cache[400]; // "<addon>/cache", the path init() gave: the card coming back re-arms it
 static __thread char last_error[256];
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -79,19 +80,22 @@ static void set_error(const char *fmt, ...) {
 
 const char *zvukcache_last_error(void) { return last_error; }
 
+void zvukcache_set_addon_dir(const char *cache) {
+	pthread_mutex_lock(&lock);
+	sidecar_generation++;
+	snprintf(addon_cache, sizeof(addon_cache), "%s", cache && cache[0] ? cache : "");
+	snprintf(cache_dir, sizeof(cache_dir), "%s", addon_cache);
+	pthread_mutex_unlock(&lock);
+	if (!addon_cache[0]) {
+		fprintf(stderr, "zvukcache: no cache directory on the card; tracks play but are not kept\n");
+	}
+}
+
 void zvukcache_set_root(const char *sd_root) {
 	pthread_mutex_lock(&lock);
 	sidecar_generation++;
+	snprintf(cache_dir, sizeof(cache_dir), "%s", sd_root && sd_root[0] ? addon_cache : "");
 	pthread_mutex_unlock(&lock);
-	cache_dir[0] = '\0';
-	if (!sd_root || !sd_root[0]) {
-		return;
-	}
-	char local[420];
-	snprintf(local, sizeof(local), "%s/.local", sd_root);
-	mkdir(local, 0755);
-	snprintf(cache_dir, sizeof(cache_dir), "%s/%s", sd_root, ZVUKCACHE_DIR);
-	mkdir(cache_dir, 0755);
 }
 
 bool zvukcache_ready(void) { return cache_dir[0] != '\0'; }
@@ -993,16 +997,22 @@ void zvukcache_clear_on_exit(void) {
 // No card descriptor is held during HTTP. Re-admission also rejects a
 // result from before a USB handoff, a card change or playback cancellation.
 static int sidecar_pin(const char *path, unsigned generation) {
-	char root[400], prefix[460];
+	char root[400], dir[400];
 	int pin = zvuk_storage_pin_card(root, sizeof(root));
 	if (pin < 0) {
 		return -1;
 	}
-	snprintf(prefix, sizeof(prefix), "%s/" ZVUKCACHE_DIR "/", root);
 	pthread_mutex_lock(&lock);
 	bool current_generation = generation == sidecar_generation;
+	snprintf(dir, sizeof(dir), "%s", cache_dir);
 	pthread_mutex_unlock(&lock);
-	if (!current_generation || strncmp(path, prefix, strlen(prefix)) != 0) {
+	// The cache is in the addon's folder now, so "is this still the same card's
+	// cache" is two questions: the pinned root is what the cache's path starts
+	// with, and the file is inside that cache.
+	size_t root_len = strlen(root), dir_len = strlen(dir);
+	bool same = current_generation && dir_len > root_len && strncmp(dir, root, root_len) == 0 &&
+				strncmp(path, dir, dir_len) == 0 && path[dir_len] == '/';
+	if (!same) {
 		close(pin);
 		return -1;
 	}
@@ -1110,6 +1120,7 @@ bool zvukcache_stop(void) {
 	// from the host it is given, and a protected path from the previous card
 	// would keep a file of that card from being swept.
 	cache_dir[0] = '\0';
+	addon_cache[0] = '\0'; // the directory was the old card's: init() sets it again
 	network_wanted = false;
 	pthread_mutex_lock(&keep_lock);
 	protected_count = 0;

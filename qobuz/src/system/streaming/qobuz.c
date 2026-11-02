@@ -1,10 +1,15 @@
 #include "qobuz.h"
 
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "src/system/core/config.h"
 #include "src/system/net/http.h"
@@ -47,6 +52,13 @@ static long creds_at;        // when the derived pair was taken, 0 = never
 static bool creds_by_user;   // named in sonix/streaming.json: never refreshed
 static bool creds_fetching;  // a derivation is running: see qobuz_ensure_keys()
 
+// The token in `auth_token` came out of the card's token.txt in this run, and
+// the server has not said yes to it yet: see qobuz_session_unchecked().
+static bool session_unchecked;
+// The last attempt to write the session was refused by the card. A read-only
+// card runs fine and forgets the account at the next start.
+static bool session_not_kept;
+
 static void qobuz_load_keys(void);
 static bool qobuz_ensure_keys(bool force);
 static bool request_file_url(long track_id, int want_format, char *url_out, size_t url_size, char *mime,
@@ -73,12 +85,193 @@ static void set_error(const char *fmt, ...) {
 
 static void clear_error(void) { last_error[0] = '\0'; }
 
+// Not a plain memset: one on a buffer that is going out of scope may be dropped
+// by the compiler. Everything this file scrubs with it has held a secret.
+static void scrub(void *p, size_t n) {
+	volatile unsigned char *v = p;
+	while (n--) {
+		*v++ = 0;
+	}
+}
+
 // ---------------------------------------------------------------------------
 // session
 // ---------------------------------------------------------------------------
 
+// The token file the account comes from: <addon>/token.txt, beside the
+// settings and the session. False when there is no card, and then there is
+// nothing to read.
+static bool token_file_path(char *out, size_t size) {
+	const char *dir = qobuzconf_dir();
+	out[0] = '\0';
+	if (!dir || !dir[0]) {
+		return false;
+	}
+	int n = snprintf(out, size, "%s/%s", dir, QOBUZ_TOKEN_FILE);
+	if (n <= 0 || (size_t)n >= size) {
+		out[0] = '\0';
+		return false;
+	}
+	return true;
+}
+
+// What a fresh card gets, once. Every line but the last is a comment: the
+// reader skips them, so the template itself is an account nobody has filled in
+// yet, which is the honest answer for a card that has no token on it.
+#define TOKEN_TEMPLATE                                                                                                 \
+	"# Qobuz user_auth_token, one line.\n"                                                                             \
+	"#\n"                                                                                                             \
+	"# Take it from the Qobuz web player (play.qobuz.com) while signed in:\n"                                           \
+	"# the browser keeps it in its local storage under \"user_auth_token\".\n"                                          \
+	"# Paste it after the '=' below, or replace this whole file with the token\n"                                        \
+	"# on a line of its own. Spaces, quotes and the newline are dropped.\n"                                             \
+	"#\n"                                                                                                             \
+	"# It is not the account's password, and a password is never asked for here.\n"                                     \
+	"# When it expires, take a new one the same way.\n"                                                                 \
+	"user_auth_token =\n"
+
+// O_EXCL, so a card that already carries a token is never overwritten, and
+// neither is a comment the user added. Not common/store: store_save() rewrites
+// the file from the keys it parsed, which would drop every line of this.
+static void ensure_token_file(const char *path) {
+	struct stat st;
+	if (stat(path, &st) == 0) {
+		return;
+	}
+	int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd < 0) {
+		if (errno != EEXIST) {
+			fprintf(stderr, "qobuz: cannot write %s: %s\n", path, strerror(errno));
+		}
+		return;
+	}
+	const char *text = TOKEN_TEMPLATE;
+	size_t length = strlen(text);
+	ssize_t wrote = write(fd, text, length);
+	close(fd);
+	if (wrote != (ssize_t)length) {
+		fprintf(stderr, "qobuz: short write to %s\n", path);
+		return;
+	}
+	// vfat keeps no mode bits, so this is a nod to a card formatted otherwise:
+	// the file becomes a secret as soon as the user pastes one in.
+	chmod(path, 0600);
+	printf("qobuz: wrote the token template to %s\n", path);
+}
+
+// The value of a line that came in as "user_auth_token = ..." or "token: ...".
+// A whole line copied out of a browser's storage inspector is one line too, and
+// what the reader wants is the value, not the name. A bare token is left alone:
+// '=' may be padding in one.
+static char *line_value(char *line) {
+	static const char *const KEYS[] = {"user_auth_token", "token"};
+	for (size_t i = 0; i < sizeof(KEYS) / sizeof(KEYS[0]); i++) {
+		size_t n = strlen(KEYS[i]);
+		if (strncmp(line, KEYS[i], n) != 0) {
+			continue;
+		}
+		char *p = line + n;
+		while (*p == ' ' || *p == '\t') {
+			p++;
+		}
+		if (*p != '=' && *p != ':') {
+			continue;
+		}
+		p++;
+		while (*p == ' ' || *p == '\t') {
+			p++;
+		}
+		return p;
+	}
+	return line;
+}
+
+// The token as the file holds it: the first line that is neither blank nor a
+// comment, trimmed. False when the file is not there or has no token in it.
+static bool read_token_file(const char *path, char *out, size_t size) {
+	out[0] = '\0';
+	FILE *f = fopen(path, "r");
+	if (!f) {
+		return false;
+	}
+	char line[QOBUZCONF_TOKEN_MAX * 2];
+	while (fgets(line, sizeof(line), f)) {
+		char *start = line;
+		// A UTF-8 BOM, as an editor on Windows leaves it.
+		if ((unsigned char)start[0] == 0xef && (unsigned char)start[1] == 0xbb &&
+			(unsigned char)start[2] == 0xbf) {
+			start += 3;
+		}
+		while (*start == ' ' || *start == '\t') {
+			start++;
+		}
+		if (*start == '\0' || *start == '#' || *start == '\r' || *start == '\n') {
+			continue;
+		}
+		start = line_value(start);
+		size_t n = strlen(start);
+		while (n > 0 && (isspace((unsigned char)start[n - 1]) || start[n - 1] == '"' || start[n - 1] == '\'')) {
+			start[--n] = '\0';
+		}
+		while (*start == '"' || *start == '\'') {
+			start++;
+		}
+		if (!*start) {
+			continue;
+		}
+		snprintf(out, size, "%.*s", (int)(size - 1), start);
+		break;
+	}
+	fclose(f);
+	scrub(line, sizeof(line));
+	return out[0] != '\0';
+}
+
+// A token file that is there is the account this run starts with, and it
+// overrides whatever session.ini carried: a token replaced on the card has to
+// take effect at the next start. It is not called a session until the server
+// has accepted it, which is a worker's job (qobuz_sign_in_from_card).
+static void seed_from_card(void) {
+	char path[512];
+	if (!token_file_path(path, sizeof(path))) {
+		return;
+	}
+	ensure_token_file(path);
+
+	// A sign-out that outlives the run: the file is still there and is still the
+	// account, but the user said to stop using it. "Sign in from the card" reads
+	// it again and clears the mark.
+	if (qobuzconf_signed_out()) {
+		return;
+	}
+
+	char token[QOBUZCONF_TOKEN_MAX];
+	if (!read_token_file(path, token, sizeof(token))) {
+		return;
+	}
+
+	// The stored name is kept only when it belongs to this same token: a
+	// different token's account is not this one's.
+	char user[QOBUZCONF_USER_MAX] = "";
+	if (strcmp(token, auth_token) == 0) {
+		snprintf(user, sizeof(user), "%s", display_name);
+	}
+	snprintf(auth_token, sizeof(auth_token), "%s", token);
+	snprintf(display_name, sizeof(display_name), "%s", user);
+	session_unchecked = true;
+	session_not_kept = false;
+	printf("qobuz: token from %s, waiting for Qobuz to accept it\n", path);
+	scrub(token, sizeof(token));
+	scrub(user, sizeof(user));
+}
+
 void qobuz_init(void) {
 	snprintf(base_url, sizeof(base_url), "%s", config_get("qobuz", "base_url", QOBUZ_BASE_DEFAULT));
+	if (strcmp(base_url, QOBUZ_BASE_DEFAULT) != 0) {
+		// Worth a line: a base address that is not Qobuz's is a test, and the
+		// first question about a test that fails is which server it reached.
+		printf("qobuz: base address %s\n", base_url);
+	}
 
 	qobuz_load_keys();
 
@@ -94,6 +287,9 @@ void qobuz_init(void) {
 		config_set("qobuz", "user", "");
 		config_save();
 	}
+
+	// The token file, if the card has one, is the account this run starts from.
+	seed_from_card();
 
 	format_id = (int)config_get_int("qobuz", "format", QOBUZ_FORMAT_HIRES192);
 	if (format_id != QOBUZ_FORMAT_MP3 && format_id != QOBUZ_FORMAT_CD && format_id != QOBUZ_FORMAT_HIRES96 &&
@@ -116,6 +312,8 @@ void qobuz_reload_session(void) {
 	snprintf(auth_token, sizeof(auth_token), "%s", token);
 	snprintf(display_name, sizeof(display_name), "%s", user);
 	printf("qobuz: %s\n", auth_token[0] ? "token found in the addon's folder" : "no token in the addon's folder");
+	scrub(token, sizeof(token));
+	scrub(user, sizeof(user));
 }
 
 // See qobuz.h. Everything qobuz_init() reads again is left alone; what is
@@ -134,6 +332,8 @@ void qobuz_forget(void) {
 	creds_at = 0;
 	creds_by_user = false;
 	creds_fetching = false;
+	session_unchecked = false;
+	session_not_kept = false;
 	last_error[0] = '\0';
 }
 
@@ -246,6 +446,9 @@ bool qobuz_configured(void) { return (app_id[0] && app_secret[0]) || auth_token[
 bool qobuz_logged_in(void) { return qobuz_configured() && auth_token[0]; }
 const char *qobuz_display_name(void) { return display_name; }
 
+bool qobuz_session_unchecked(void) { return session_unchecked; }
+bool qobuz_session_not_kept(void) { return session_not_kept; }
+
 int qobuz_get_format(void) { return format_id; }
 
 void qobuz_set_format(int wanted) {
@@ -261,6 +464,8 @@ void qobuz_set_format(int wanted) {
 void qobuz_logout(void) {
 	auth_token[0] = '\0';
 	display_name[0] = '\0';
+	session_unchecked = false;
+	session_not_kept = false;
 	qobuzconf_save_session("", "");
 	printf("qobuz: session closed\n");
 }
@@ -353,81 +558,113 @@ static void api_done(char *body, json_doc_t *doc) {
 }
 
 // ---------------------------------------------------------------------------
-// sign-in
+// signing in, from the card
+//
+// There is no username/password path here and none is to be added back: with
+// the application pair this addon derives, Qobuz's /user/login answers "invalid
+// credentials" for accounts that are perfectly valid, and the password never
+// needed to be sent anyway -- every call after a login carries the token in
+// X-User-Auth-Token. What signs in is that token, read from token.txt; one
+// /user/get answers whether Qobuz accepts it and who it belongs to.
 // ---------------------------------------------------------------------------
 
-bool qobuz_login(const char *username, const char *password) {
-	clear_error();
-
-	qobuz_ensure_keys(false);
-	if (!app_id[0] || !app_secret[0]) {
-		set_error("%s", tr("api_keys_unavailable"));
-		return false;
-	}
-	if (!username || !*username || !password || !*password) {
-		set_error("%s", tr("credentials_required"));
-		return false;
-	}
-
-	char url[512];
-	snprintf(url, sizeof(url), "%s/user/login?app_id=%s", base_url, app_id);
-
-	// Username and password go in the headers, not in the query: that is the
-	// form the original binary uses, so it is the one known to work with these
-	// app keys. Qobuz also accepts ?username=..&password=<md5>, which is where
-	// to look if the form below ever stops being accepted.
-	//
-	// device_manufacturer_id carries the app_secret: that is what the original
-	// sends, not a typo -- its code at 0x00784bd0 does exactly this.
-	char extra[768];
-	snprintf(extra, sizeof(extra), "username: %s\r\npassword: %s\r\ndevice_manufacturer_id: %s\r\n", username,
-			 password, app_secret);
-
-	// No token during login: an old one, if any, has nothing to do with it.
+// Asks Qobuz who `token` belongs to. The token goes in the same header every
+// other call carries, and the session is put back exactly as it was afterwards:
+// this is a question, not a sign-in.
+static bool token_owner(const char *token, char *user, size_t user_size) {
 	char saved[sizeof(auth_token)];
 	snprintf(saved, sizeof(saved), "%s", auth_token);
-	auth_token[0] = '\0';
+	snprintf(auth_token, sizeof(auth_token), "%s", token);
+
+	char url[512];
+	snprintf(url, sizeof(url), "%s/user/get?app_id=%s", base_url, app_id);
 
 	char *body = NULL;
 	json_doc_t doc;
-	if (!api_call(url, extra, &body, &doc)) {
-		snprintf(auth_token, sizeof(auth_token), "%s", saved);
-		return false;
-	}
-
-	int root = json_root(&doc);
-	char token[sizeof(auth_token)] = "";
-	json_obj_str(&doc, root, "user_auth_token", token, sizeof(token));
-	if (!token[0]) {
+	bool ok = api_call(url, NULL, &body, &doc);
+	if (ok) {
+		// The account's own answer: a display name when it has one, then the
+		// login, then the address. /user/get is the one call whose only
+		// business is the account, and it is a few hundred bytes.
+		int root = json_root(&doc);
+		user[0] = '\0';
+		if (!json_obj_str(&doc, root, "display_name", user, user_size) || !user[0]) {
+			if (!json_obj_str(&doc, root, "login", user, user_size) || !user[0]) {
+				json_obj_str(&doc, root, "email", user, user_size);
+			}
+		}
 		api_done(body, &doc);
-		snprintf(auth_token, sizeof(auth_token), "%s", saved);
-		set_error("%s", tr("qobuz_gave_no_session_token"));
-		return false;
 	}
 
-	int user = json_get(&doc, root, "user");
-	char name[QOBUZ_NAME_MAX] = "";
-	if (user >= 0) {
-		json_obj_str(&doc, user, "display_name", name, sizeof(name));
-		if (!name[0]) {
-			json_obj_str(&doc, user, "login", name, sizeof(name));
+	snprintf(auth_token, sizeof(auth_token), "%s", saved);
+	scrub(saved, sizeof(saved));
+	return ok;
+}
+
+qobuz_card_result_t qobuz_sign_in_from_card(bool keep_current) {
+	clear_error();
+
+	// What a failure leaves behind: Read again keeps what was signed in; Sign
+	// in from the card, and the check init() starts, do not -- a token the
+	// server rejects must not be left as a session.
+	char previous_token[sizeof(auth_token)];
+	char previous_user[sizeof(display_name)];
+	snprintf(previous_token, sizeof(previous_token), "%s", auth_token);
+	snprintf(previous_user, sizeof(previous_user), "%s", display_name);
+
+	char path[512];
+	char token[QOBUZCONF_TOKEN_MAX];
+	if (!token_file_path(path, sizeof(path)) || !read_token_file(path, token, sizeof(token))) {
+		set_error("no token in %s", QOBUZ_TOKEN_REL);
+		if (!keep_current) {
+			qobuz_logout();
 		}
-		if (!name[0]) {
-			json_obj_str(&doc, user, "email", name, sizeof(name));
-		}
-	}
-	if (!name[0]) {
-		snprintf(name, sizeof(name), "%s", username);
+		scrub(token, sizeof(token));
+		scrub(previous_token, sizeof(previous_token));
+		scrub(previous_user, sizeof(previous_user));
+		return QOBUZ_CARD_NO_TOKEN;
 	}
 
-	api_done(body, &doc);
+	// The pair is Qobuz's and every request needs it, this one included. When
+	// it cannot be derived the honest answer is that a token alone is not
+	// enough -- the token has not been judged at all.
+	qobuz_ensure_keys(false);
+	if (!app_id[0] || !app_secret[0]) {
+		set_error("%s", tr("api_keys_unavailable"));
+		scrub(token, sizeof(token));
+		scrub(previous_token, sizeof(previous_token));
+		scrub(previous_user, sizeof(previous_user));
+		return QOBUZ_CARD_NO_KEYS;
+	}
+
+	char name[QOBUZCONF_USER_MAX];
+	bool ok = token_owner(token, name, sizeof(name));
+	if (!ok) {
+		if (keep_current) {
+			snprintf(auth_token, sizeof(auth_token), "%s", previous_token);
+			snprintf(display_name, sizeof(display_name), "%s", previous_user);
+		} else {
+			qobuz_logout();
+		}
+		scrub(token, sizeof(token));
+		scrub(name, sizeof(name));
+		scrub(previous_token, sizeof(previous_token));
+		scrub(previous_user, sizeof(previous_user));
+		return QOBUZ_CARD_REFUSED;
+	}
 
 	snprintf(auth_token, sizeof(auth_token), "%s", token);
 	snprintf(display_name, sizeof(display_name), "%s", name);
-	qobuzconf_save_session(auth_token, display_name);
+	session_unchecked = false;
+	session_not_kept = !qobuzconf_save_session(auth_token, display_name);
 
-	printf("qobuz: logged in as %s\n", display_name);
-	return true;
+	scrub(token, sizeof(token));
+	scrub(name, sizeof(name));
+	scrub(previous_token, sizeof(previous_token));
+	scrub(previous_user, sizeof(previous_user));
+	printf("qobuz: signed in as %s%s\n", display_name,
+		   session_not_kept ? " (the card will not keep the session)" : "");
+	return QOBUZ_CARD_SIGNED_IN;
 }
 
 // ---------------------------------------------------------------------------

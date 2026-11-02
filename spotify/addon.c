@@ -22,8 +22,6 @@
 #include "src/gui/shell/theme.h"
 #include "src/system/streaming/radio.h"
 
-#include "common/store.h"
-
 #include "lvgl/lvgl.h"
 
 // Spotify, as an addon.
@@ -60,8 +58,33 @@
 //
 //   <card>/Addons/spotify/addon.so                     this library
 //   <card>/Addons/spotify/assets/spotify-engine-mips   the engine, if it was built
-//   <card>/Addons/spotify/credentials.ini              username / password
+//   <card>/Addons/spotify/credentials.ini              `access_token = ...`, and nothing else
 //   <card>/Addons/spotify/state/                       librespot's own cache
+//
+// Everything is inside the addon's own folder: the credentials beside addon.so,
+// the engine's cache in its `state/` subdirectory. That last one is declared in
+// addon.json -- owns_paths and cache_path -- because the player has to know it is
+// this addon's before it opens this library: the factory reset empties it from
+// the manifest alone, and nothing else on the card claims it. Nothing is written
+// to the card's root or to the shared .local/ tree (addons/common/addonfs.h).
+//
+// The account, and why there is no password form here:
+//
+// Spotify has withdrawn the username/password flow for the client librespot
+// imitates. `Session::connect` with a password answers LoginFailed on a real
+// account (engine-mips/src/session.rs, "A token is tried instead of the pair"),
+// so a form with two fields and a Sign in button would be a page whose one
+// button cannot work. This addon therefore has no such form, and must not grow
+// one back. The credential that does work is an `access_token = ...` line in
+// credentials.ini, which the engine reads on login; after the first success it
+// caches the session in `state/` (librespot's own Cache), so the file is needed
+// once and again only after a Sign out.
+//
+// The addon never opens credentials.ini: the token is the engine's secret, its
+// reader scrubs it out of every answer, and a copy on this side would only be a
+// second place for it to reach a label or a log. The one thing this side writes
+// is the commented template a fresh card gets, once, so the file the user has to
+// edit exists and says what goes in it.
 //
 // The socket cannot live on the card -- vfat has no unix sockets -- so it goes
 // to /tmp, named after the player's pid so that two player processes on one
@@ -146,8 +169,10 @@ typedef struct {
 
 typedef enum {
 	JOB_STATUS = 0,
-	JOB_LOGIN,
 	JOB_LOGOUT,
+	// logout, then login: the cached session has to go before the file is read
+	// again, or a stale cache answers for the token the user just edited.
+	JOB_SIGN_IN,
 	JOB_SEARCH,
 	JOB_PLAYLISTS,
 	JOB_PLAYLIST_TRACKS,
@@ -188,6 +213,9 @@ static pthread_mutex_t data_lock = PTHREAD_MUTEX_INITIALIZER;
 static char engine_note[64] = "engine not built";
 static char account_state[32] = "unknown";
 static char account_error[160];
+// 1 premium, 0 free, -1 the engine has not said. Only a premium account can
+// stream at all, so the page has to be able to say which one this is.
+static int account_premium = -1;
 static char list_error[160];
 static item_t items[LIST_MAX];
 static int item_count;
@@ -215,23 +243,21 @@ typedef struct {
 } worker_slot_t;
 static worker_slot_t workers[WORKER_MAX];
 
-static store_t credentials;
-
 static lv_obj_t *home_screen;
 static lv_obj_t *home_page;
 static lv_obj_t *list_screen;
 static lv_obj_t *list_container;
-static lv_obj_t *login_screen;
 static lv_obj_t *search_screen;
 static lv_obj_t *search_field;
-static lv_obj_t *login_user_field;
-static lv_obj_t *login_password_field;
-static keyboard_t *login_keyboard;
 static keyboard_t *search_keyboard;
 
 static lv_obj_t *row_engine_value;
 static lv_obj_t *row_account_value;
-static lv_obj_t *row_error_value;
+static lv_obj_t *row_premium_value;
+static lv_obj_t *row_token_value;
+// The one sentence a free account needs: Spotify will not stream audio to it.
+// Hidden unless the engine has said premium = false.
+static lv_obj_t *account_hint;
 
 // The one-second status poll, this run's own: created in init(), deleted in
 // stop(). Kept for that reason alone.
@@ -240,7 +266,7 @@ static lv_timer_t *tick_timer;
 // The id the host gave this addon, copied in init(). Every top-level screen the
 // addon makes is registered with sonix_addon_own_screen() under it, so the shell
 // knows what to switch off and delete when the library is unloaded -- the screen
-// init() returns and the three the pages switch to by themselves.
+// init() returns and the two the pages switch to by themselves.
 static char addon_id[ADDON_ID_MAX];
 
 // ---------------------------------------------------------------------------
@@ -563,6 +589,24 @@ static bool json_top_string(const char *json, const char *key, char *out, size_t
 	return json_field_string(json, json + strlen(json), key, out, size);
 }
 
+// The account's `premium` flag: 1 for a premium account, 0 for a free one, -1
+// when the engine did not say (signed out, or Spotify answered nothing). Only a
+// premium account can stream, and the engine only puts the field in when it
+// knows (engine-mips/src/session.rs, `Inner::status`).
+static int json_premium(const char *json) {
+	const char *value = json_member(json, json + strlen(json), "premium", NULL);
+	if (!value) {
+		return -1;
+	}
+	if (strncmp(value, "true", 4) == 0) {
+		return 1;
+	}
+	if (strncmp(value, "false", 5) == 0) {
+		return 0;
+	}
+	return -1;
+}
+
 static int parse_items(const char *json, item_t *out, int max) {
 	const char *end = NULL;
 	const char *value = json_member(json, json + strlen(json), "items", &end);
@@ -665,6 +709,9 @@ static void set_account(const char *state, const char *error) {
 	pthread_mutex_lock(&data_lock);
 	copy_text(account_state, sizeof(account_state), state);
 	copy_text(account_error, sizeof(account_error), error ? error : "");
+	// Whatever premium was, it was about the session that has just gone: an
+	// engine that cannot answer must not leave "premium: yes" on the page.
+	account_premium = -1;
 	pthread_mutex_unlock(&data_lock);
 }
 
@@ -957,9 +1004,11 @@ static void take_status(const char *reply, const char *why) {
 	}
 	if (json_top_string(reply, "state", state, sizeof(state))) {
 		json_top_string(reply, "error", error, sizeof(error));
+		int premium = json_premium(reply);
 		pthread_mutex_lock(&data_lock);
 		copy_text(account_state, sizeof(account_state), state);
 		copy_text(account_error, sizeof(account_error), error);
+		account_premium = premium;
 		pthread_mutex_unlock(&data_lock);
 		return;
 	}
@@ -1010,8 +1059,8 @@ static bool is_list_job(job_kind_t kind) {
 static const char *job_name(job_kind_t kind) {
 	switch (kind) {
 	case JOB_STATUS: return "status";
-	case JOB_LOGIN: return "login";
 	case JOB_LOGOUT: return "logout";
+	case JOB_SIGN_IN: return "sign in from the card";
 	case JOB_SEARCH: return "search";
 	case JOB_PLAYLISTS: return "playlists";
 	case JOB_PLAYLIST_TRACKS: return "playlist_tracks";
@@ -1055,7 +1104,24 @@ static void *worker(void *argument) {
 		goto finish;
 	}
 	bool up = engine_ensure_locked(why, sizeof(why));
-	bool answered = up && engine_exchange_locked(job->request, reply, ENGINE_REPLY_MAX, why, sizeof(why));
+	bool answered = false;
+	if (up && job->kind == JOB_SIGN_IN) {
+		// The cache first. `login` reads credentials.json before the INI file
+		// (session.rs, `connect`), so a token the user has just edited would be
+		// ignored while a cached session from the previous one still answers.
+		// `logout` is the engine's op that drops both the session and that file;
+		// only then is `login` guaranteed to read the file.
+		char discarded[256];
+		char why_logout[160];
+		why_logout[0] = '\0';
+		if (!engine_exchange_locked("{\"op\":\"logout\"}", discarded, sizeof(discarded), why_logout,
+									sizeof(why_logout))) {
+			fprintf(stderr, "spotify: sign in: the logout before it did not answer: %s\n", why_logout);
+		}
+		answered = engine_exchange_locked(job->request, reply, ENGINE_REPLY_MAX, why, sizeof(why));
+	} else if (up) {
+		answered = engine_exchange_locked(job->request, reply, ENGINE_REPLY_MAX, why, sizeof(why));
+	}
 	pthread_mutex_unlock(&engine_lock);
 
 	if (!answered) {
@@ -1072,8 +1138,8 @@ static void *worker(void *argument) {
 		} else {
 			set_account("failed", why);
 		}
-	} else if (job->kind == JOB_STATUS || job->kind == JOB_LOGIN || job->kind == JOB_LOGOUT) {
-		// Both of these lock data_lock themselves: it is not recursive.
+	} else if (job->kind == JOB_STATUS || job->kind == JOB_LOGOUT || job->kind == JOB_SIGN_IN) {
+		// All of these lock data_lock themselves: it is not recursive.
 		take_status(reply, why);
 	} else if (is_list_job(job->kind)) {
 		pthread_mutex_lock(&data_lock);
@@ -1249,19 +1315,18 @@ static void own_screen(lv_obj_t *screen) {
 	}
 }
 
-// The same four screens again, from the first time the shell actually shows
+// The same three screens again, from the first time the shell actually shows
 // home. Not redundant in this build: lib_open() takes init()'s return value as
 // the first entry of its own list *after* init() returned, and resets the count
-// to one as it does -- so what the four calls above registered during init() is
+// to one as it does -- so what the three calls above registered during init() is
 // gone by the time the tile is on screen. Switching to home is the first moment
 // that bookkeeping is finished, and the call is a set (a screen already known is
-// ignored), so this costs four strcmps and works whether or not that reset stays.
+// ignored), so this costs three strcmps and works whether or not that reset stays.
 static bool screens_owned;
 
 static void own_all_screens(void) {
 	own_screen(home_screen);
 	own_screen(list_screen);
-	own_screen(login_screen);
 	own_screen(search_screen);
 }
 
@@ -1438,26 +1503,49 @@ static void refresh_home(void) {
 	char note[64];
 	char state[32];
 	char error[160];
+	int premium = -1;
 	pthread_mutex_lock(&data_lock);
 	copy_text(note, sizeof(note), engine_note);
 	copy_text(state, sizeof(state), account_state);
 	copy_text(error, sizeof(error), account_error);
+	premium = account_premium;
 	pthread_mutex_unlock(&data_lock);
 
 	if (row_engine_value) {
 		lv_label_set_text(row_engine_value, note);
 	}
 	if (row_account_value) {
-		lv_label_set_text(row_account_value, state);
+		// The state, or the engine's own sentence when it gave one: a `failed`
+		// status, an engine that did not answer, and a login with no token all
+		// carry a reason, and that reason is the useful half. The value label
+		// sits beside the name and is not clipped by the row itself, and those
+		// sentences are long ("Permission denied { Login failed with reason: Bad
+		// credentials }"): they would be drawn over the name, so they are cut by
+		// hand. The whole sentence is in the popup that follows a login.
+		char value[64];
+		if (error[0]) {
+			clip(value, sizeof(value), error, 18);
+		} else {
+			copy_text(value, sizeof(value), state);
+		}
+		lv_label_set_text(row_account_value, value);
 	}
-	if (row_error_value) {
-		// The row's value label sits beside the name and is not clipped by the
-		// row itself: the engine's reasons are full sentences ("Permission
-		// denied { Login failed with reason: Bad credentials }") and would be
-		// drawn over the name.
-		char short_error[64];
-		clip(short_error, sizeof(short_error), error, 18);
-		lv_label_set_text(row_error_value, short_error);
+	if (row_premium_value) {
+		// Only the engine knows, and only while signed in: `premium` is in its
+		// status answer. A free account cannot stream at all (session.rs), so
+		// "no" here is the answer to "why does every track fail".
+		const char *text = "unknown";
+		if (strcmp(state, "signed_in") == 0) {
+			text = premium == 1 ? "yes" : premium == 0 ? "no" : "unknown";
+		}
+		lv_label_set_text(row_premium_value, text);
+	}
+	if (account_hint) {
+		if (strcmp(state, "signed_in") == 0 && premium == 0) {
+			lv_obj_set_hidden(account_hint, false);
+		} else {
+			lv_obj_set_hidden(account_hint, true);
+		}
 	}
 }
 
@@ -1484,7 +1572,7 @@ static void job_finished(void *user) {
 	job_t *job = user;
 	if (is_list_job(job->kind)) {
 		list_show();
-	} else if (job->kind == JOB_LOGIN || job->kind == JOB_LOGOUT) {
+	} else if (job->kind == JOB_LOGOUT || job->kind == JOB_SIGN_IN) {
 		refresh_home();
 		popup_account();
 	} else {
@@ -1494,88 +1582,86 @@ static void job_finished(void *user) {
 }
 
 // ---------------------------------------------------------------------------
-// Credentials
+// The credentials file
 //
-// The engine's interface is an INI file with `username = ...` and
-// `password = ...`; common/store writes exactly that shape, atomically, and
-// renames over the old file so a card pulled mid-write keeps the previous
-// credentials whole. Mode 0600 afterwards: the file is a password.
+// One key that works: `access_token = ...`. Spotify has withdrawn the
+// username/password flow for the client librespot imitates, and a login with a
+// password answers LoginFailed on a real account (engine-mips/src/session.rs),
+// which is why there is no form here to type one into.
+//
+// The addon does not read this file. The engine does, on login, and its reader
+// skips `#` lines -- so the template below is inert until the user fills it in,
+// and a hand-added token works whether it sits under the comment or replaces it.
+// Reading it here would put a secret in this process's memory for no purpose,
+// and the engine already scrubs it out of every sentence it answers with.
 // ---------------------------------------------------------------------------
 
-static bool save_credentials(const char *user, const char *password) {
-	store_set(&credentials, "username", user);
-	store_set(&credentials, "password", password);
-	if (!store_save(&credentials)) {
-		return false;
+// The file a fresh card gets, once. Every line is a comment: read_credentials()
+// in the engine sees nothing in it, which is a login that fails with
+// "credentials file has no username and password" -- the honest answer for a
+// card nobody has put a token on yet.
+static const char CREDENTIALS_TEMPLATE[] =
+	"# Spotify: a username and a password no longer work.\n"
+	"# Spotify withdrew that flow for the client this addon imitates, so the\n"
+	"# engine answers LoginFailed on a real account.\n"
+	"#\n"
+	"# The one credential that works is an access token. Uncomment the line\n"
+	"# below (delete the leading '#') and put the token after the '='. The\n"
+	"# engine reads it on \"Sign in from the card\" and keeps the session in\n"
+	"# state/ afterwards, so this file is needed once.\n"
+	"# access_token = \n";
+
+// O_EXCL, so a card that already has a token in it is never overwritten by a
+// page open, and stop()/init() in one process cannot truncate what the user
+// just wrote. Not common/store: store_save() rewrites the file from the keys it
+// parsed, which would drop every comment the template is made of.
+static void write_credentials_template(void) {
+	if (access(credentials_path, F_OK) == 0) {
+		return;
 	}
+	int fd = open(credentials_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd < 0) {
+		if (errno != EEXIST) {
+			fprintf(stderr, "spotify: credentials template %s: %s\n", credentials_path, strerror(errno));
+		}
+		return;
+	}
+	const char *text = CREDENTIALS_TEMPLATE;
+	size_t length = strlen(text);
+	ssize_t wrote = write(fd, text, length);
+	close(fd);
+	if (wrote != (ssize_t)length) {
+		fprintf(stderr, "spotify: credentials template: short write to %s\n", credentials_path);
+		return;
+	}
+	// vfat keeps no mode bits, so this is a nod to a card formatted otherwise:
+	// the file is about to become a token.
 	chmod(credentials_path, 0600);
-	return true;
+	fprintf(stderr, "spotify: wrote the credentials template to %s\n", credentials_path);
 }
 
 // ---------------------------------------------------------------------------
 // Signing in
 // ---------------------------------------------------------------------------
 
-static void login_field_cb(lv_event_t *e) {
-	lv_obj_t *field = lv_event_get_target(e);
-	lv_obj_t *other = field == login_user_field ? login_password_field : login_user_field;
-	keyboard_set_field(login_keyboard, field);
-	lv_obj_add_state(field, LV_STATE_FOCUSED);
-	lv_obj_remove_state(other, LV_STATE_FOCUSED);
-	// Two carets blinking at once do not say which field the keys write into.
-	keyboard_show_caret(field, true);
-	keyboard_show_caret(other, false);
-}
-
-static void login_submit_cb(lv_event_t *e) {
+// Both ways in are one row each: there is nothing to type, only a file to read
+// (Sign in from the card) and an engine op to drop the session (Sign out).
+static void sign_in_from_card_cb(lv_event_t *e) {
 	(void)e;
-	char user[STORE_VALUE_MAX];
-	char password[STORE_VALUE_MAX];
-	copy_text(user, sizeof(user), lv_textarea_get_text(login_user_field));
-	trim_text(user);
-	copy_text(password, sizeof(password), lv_textarea_get_text(login_password_field));
-	if (!user[0] || !password[0]) {
-		gui_notify_popup("a username and a password are needed");
-		return;
-	}
-	if (!save_credentials(user, password)) {
-		gui_notify_popup("the card refused credentials.ini");
-		return;
-	}
-	memset(password, 0, sizeof(password));
-	// The password does not stay in the field a second longer than it has to.
-	lv_textarea_set_text(login_password_field, "");
-	keyboard_set_visible(login_keyboard, false);
-	switch_screen(home_screen);
+	// The row says "authenticating" for the length of the engine's attempt: a
+	// login with no token still takes a round trip, and a page that says
+	// signed_out until the popup arrives reads as a dead button.
 	set_account("authenticating", "");
 	refresh_home();
-	start_job(JOB_LOGIN, "{\"op\":\"login\"}", "Sign in");
-}
-
-static void sign_in_cb(lv_event_t *e) {
-	(void)e;
-	lv_textarea_set_text(login_user_field, store_get(&credentials, "username"));
-	lv_textarea_set_text(login_password_field, "");
-	keyboard_reset(login_keyboard);
-	lv_obj_add_state(login_user_field, LV_STATE_FOCUSED);
-	lv_obj_remove_state(login_password_field, LV_STATE_FOCUSED);
-	keyboard_set_field(login_keyboard, login_user_field);
-	keyboard_show_caret(login_user_field, true);
-	keyboard_show_caret(login_password_field, false);
-	keyboard_set_visible(login_keyboard, true);
-	switch_screen(login_screen);
+	start_job(JOB_SIGN_IN, "{\"op\":\"login\"}", "Sign in from the card");
 }
 
 static void sign_out_cb(lv_event_t *e) {
 	(void)e;
-	// The password goes off the card, the username stays: signing in again is
-	// then one field. The engine drops its own cached session on logout.
-	store_set(&credentials, "password", "");
-	if (store_save(&credentials)) {
-		chmod(credentials_path, 0600);
-	}
-	lv_textarea_set_text(login_password_field, "");
-	set_account("signed out", "");
+	// The engine's logout is what drops the session and state/credentials.json;
+	// the token in credentials.ini stays where the user put it, or the next sign
+	// in would have nothing to read.
+	set_account("signed_out", "");
 	refresh_home();
 	start_job(JOB_LOGOUT, "{\"op\":\"logout\"}", "Sign out");
 }
@@ -1622,23 +1708,68 @@ static void playlists_cb(lv_event_t *e) {
 // The pages that are built once
 // ---------------------------------------------------------------------------
 
+// The credentials file, as a card rather than a one-line row: the path is
+// thirty characters and does not share a line with the name on a 320-pixel
+// panel. The name sits where every row's name sits, the path underneath in the
+// dim value style.
+static void token_row_build(lv_obj_t *parent) {
+	lv_obj_t *card = lv_obj_create(parent);
+	lv_obj_set_width(card, lv_pct(100));
+	lv_obj_set_height(card, SC(100));
+	lv_obj_add_style(card, &theme_style_card, 0);
+	lv_obj_set_style_radius(card, SC(12), 0);
+	lv_obj_set_style_border_width(card, 0, 0);
+	lv_obj_set_style_shadow_width(card, 0, 0);
+	lv_obj_set_style_pad_hor(card, SC(20), 0);
+	lv_obj_set_style_pad_ver(card, SC(14), 0);
+	lv_obj_set_scrollable(card, false);
+	// Presses reach the page container, as on any other row, so the swipe-back
+	// gesture can start here too.
+	lv_obj_set_event_bubble(card, true);
+
+	lv_obj_t *name = lv_label_create(card);
+	lv_label_set_text(name, "Token file");
+	lv_obj_add_style(name, &theme_style_text, 0);
+	lv_obj_set_style_text_font(name, &font_ui_24, 0);
+	lv_obj_align(name, LV_ALIGN_TOP_LEFT, 0, 0);
+
+	row_token_value = lv_label_create(card);
+	lv_obj_add_style(row_token_value, &theme_style_text_dim, 0);
+	lv_obj_set_style_text_font(row_token_value, &font_ui_16, 0);
+	lv_label_set_long_mode(row_token_value, LV_LABEL_LONG_DOT);
+	lv_obj_set_width(row_token_value, lv_pct(100));
+	lv_label_set_text(row_token_value, "Addons/spotify/credentials.ini");
+	lv_obj_align(row_token_value, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+}
+
 static void home_build(void) {
 	home_screen = lv_obj_create(NULL);
 	own_screen(home_screen);
 	// The moment the shell has finished its own list, it shows this page: that is
-	// where the other three screens are registered a second time (own_all_screens).
+	// where the other two screens are registered a second time (own_all_screens).
 	lv_obj_add_event_cb(home_screen, home_shown_cb, LV_EVENT_SCREEN_LOADED, NULL);
 	home_page = scrolling_page(home_screen, "Spotify");
 
 	// The engine first: everything below it is only meaningful if this row says
 	// the engine is there.
 	settingsrow_add(home_page, "Engine", &row_engine_value, NULL, NULL);
+	// The account, in the engine's own words. There is no password form: Spotify
+	// withdrew that flow, so the only way in is a token in the file below.
 	settingsrow_add(home_page, "Account", &row_account_value, NULL, NULL);
-	settingsrow_action(home_page, "Sign in", sign_in_cb, NULL);
+	settingsrow_add(home_page, "Premium", &row_premium_value, NULL, NULL);
+	account_hint = lv_label_create(home_page);
+	lv_label_set_long_mode(account_hint, LV_LABEL_LONG_WRAP);
+	lv_obj_set_width(account_hint, lv_pct(100));
+	lv_obj_add_style(account_hint, &theme_style_text_dim, 0);
+	lv_obj_set_style_text_font(account_hint, &font_ui_18, 0);
+	lv_label_set_text(account_hint, "a free account cannot stream: Spotify will not serve the audio");
+	lv_obj_set_hidden(account_hint, true);
+	token_row_build(home_page);
+
+	settingsrow_action(home_page, "Sign in from the card", sign_in_from_card_cb, NULL);
 	settingsrow_action(home_page, "Search", search_cb, NULL);
 	settingsrow_action(home_page, "Playlists", playlists_cb, NULL);
 	settingsrow_action(home_page, "Sign out", sign_out_cb, NULL);
-	settingsrow_add(home_page, "Last error", &row_error_value, NULL, NULL);
 
 	refresh_home();
 }
@@ -1666,53 +1797,6 @@ static void build_list_screen(void) {
 	list_container = scrolling_page(list_screen, "Spotify");
 }
 
-static void build_login_screen(void) {
-	login_screen = lv_obj_create(NULL);
-	own_screen(login_screen);
-	lv_obj_add_style(login_screen, &theme_style_screen, 0);
-	settingsrow_title(login_screen, config, "Spotify sign in");
-	int top = settingsrow_content_top(config);
-
-	login_user_field = make_field(login_screen, "username", top);
-	login_password_field = make_field(login_screen, "password", top + SC(78));
-	// Dots from the first keystroke, and never a readable character: zero show
-	// time is the rule every other field in this player follows.
-	lv_textarea_set_password_mode(login_password_field, true);
-	keyboard_style_password(login_password_field, 0);
-	lv_obj_add_event_cb(login_user_field, login_field_cb, LV_EVENT_CLICKED, NULL);
-	lv_obj_add_event_cb(login_password_field, login_field_cb, LV_EVENT_CLICKED, NULL);
-	keyboard_show_caret(login_password_field, false);
-
-	lv_obj_t *button = lv_btn_create(login_screen);
-	lv_obj_set_size(button, config->screen_width - 2 * config->padding, SC(56));
-	lv_obj_align(button, LV_ALIGN_TOP_LEFT, config->padding, top + SC(156));
-	lv_obj_add_style(button, &theme_style_card, 0);
-	lv_obj_set_style_radius(button, SC(12), 0);
-	lv_obj_set_style_border_width(button, 0, 0);
-	lv_obj_set_style_shadow_width(button, 0, 0);
-	lv_obj_add_event_cb(button, login_submit_cb, LV_EVENT_CLICKED, NULL);
-	lv_obj_t *button_label = lv_label_create(button);
-	lv_label_set_text(button_label, "Sign in");
-	lv_obj_add_style(button_label, &theme_style_text, 0);
-	lv_obj_set_style_text_font(button_label, &font_ui_24, 0);
-	lv_obj_center(button_label);
-
-	lv_obj_t *note = lv_label_create(login_screen);
-	lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
-	lv_obj_set_width(note, config->screen_width - 2 * config->padding);
-	lv_obj_align(note, LV_ALIGN_TOP_LEFT, config->padding, top + SC(224));
-	lv_obj_add_style(note, &theme_style_text_dim, 0);
-	lv_obj_set_style_text_font(note, &font_ui_18, 0);
-	lv_label_set_text(note, engine_binary_present
-								? "credentials.ini stays on the card; the engine keeps its session in state/."
-								: "the engine is not on this card (assets/spotify-engine-mips), so signing in cannot work.");
-
-	login_keyboard =
-		keyboard_create(login_screen, config->screen_width, SC(316), login_user_field, NULL, "ok", login_submit_cb, NULL);
-	keyboard_set_visible(login_keyboard, true);
-	switcher_attach_back_gesture(login_screen);
-}
-
 static void build_search_screen(void) {
 	search_screen = lv_obj_create(NULL);
 	own_screen(search_screen);
@@ -1731,7 +1815,7 @@ static void build_search_screen(void) {
 
 static bool addon_on_screen(void) {
 	lv_obj_t *active = lv_screen_active();
-	return active && (active == home_screen || active == list_screen || active == login_screen || active == search_screen);
+	return active && (active == home_screen || active == list_screen || active == search_screen);
 }
 
 // Whether the player is playing something this engine serves. A stream that is
@@ -1800,16 +1884,18 @@ static lv_obj_t *spotify_init(const sonix_addon_host_t *host) {
 		fprintf(stderr, "spotify: no %s in %s: the addon runs without a protocol half\n", ENGINE_BINARY, addon_dir);
 	}
 
-	store_init(&credentials, credentials_path);
-	bool known = store_load(&credentials);
-	fprintf(stderr, "spotify: credentials %s (%s)\n", credentials_path, known ? "read" : "none");
+	// The template goes down before the page that points at it exists: a card
+	// with no credentials.ini gets the commented file, and a card that has one
+	// (a token the user put there) is never touched.
+	write_credentials_template();
+	fprintf(stderr, "spotify: credentials %s (%s)\n", credentials_path,
+			access(credentials_path, R_OK) == 0 ? "present" : "none");
 
 	// The screens are built once per load: the shell unloads the library rather
 	// than calling init() again, and stop() below is what makes a second run of
 	// this function in one process a clean start.
 	home_build();
 	build_list_screen();
-	build_login_screen();
 	build_search_screen();
 
 	// The status poll, this run's own: stop() deletes it, and a run that somehow
@@ -1830,29 +1916,27 @@ static lv_obj_t *spotify_init(const sonix_addon_host_t *host) {
 
 // The widgets of this run. The screens themselves are the shell's: every one of
 // them was registered with sonix_addon_own_screen(), and the shell deletes them
-// after stop() returns -- with the keyboards inside them, which keyboard.c now
-// unlinks and frees on LV_EVENT_DELETE.
+// after stop() returns -- with the search keyboard inside one of them, which
+// keyboard.c now unlinks and frees on LV_EVENT_DELETE.
 static void forget_widgets(void) {
 	home_screen = NULL;
 	home_page = NULL;
 	list_screen = NULL;
 	list_container = NULL;
-	login_screen = NULL;
 	search_screen = NULL;
 	search_field = NULL;
-	login_user_field = NULL;
-	login_password_field = NULL;
-	login_keyboard = NULL;
 	search_keyboard = NULL;
 	row_engine_value = NULL;
 	row_account_value = NULL;
-	row_error_value = NULL;
+	row_premium_value = NULL;
+	row_token_value = NULL;
+	account_hint = NULL;
 }
 
 static bool stop_with_workers_running(void);
 
 // The stop half of the interface (src/addon/addon.h). Runs on the GUI thread;
-// the shell deletes the four registered screens and, when this returns true,
+// the shell deletes the three registered screens and, when this returns true,
 // dlclose()s this library right after -- so nothing below may leave a thread, a
 // timer, a child or a static behind.
 //
@@ -1869,9 +1953,9 @@ static bool stop_with_workers_running(void);
 //      past the bound) and then joined -- the join, not the counter, is what
 //      says the thread has left this library's code;
 //   3. the engine process, and the socket file beside it;
-//   4. the pointers: four screens and two keyboards that belong to the shell
-//      from here (it deletes them next -- they are registered with
-//      sonix_addon_own_screen(), so it has all four), and every piece of per-run
+//   4. the pointers: three screens and a keyboard that belong to the shell from
+//      here (it deletes them next -- they are registered with
+//      sonix_addon_own_screen(), so it has all three), and every piece of per-run
 //      state a second init() would inherit.
 //
 // There is no atexit() in this library, and there must never be one again: the
@@ -1910,8 +1994,8 @@ static bool spotify_stop(void) {
 	unlink(engine_socket);
 
 	// 4. The pointers. The screens are the shell's to delete after this returns;
-	// the keyboards live inside them, so a stored keyboard_t* would be a
-	// dangling pointer in the next run.
+	// the search keyboard lives inside its screen, so a stored keyboard_t* would
+	// be a dangling pointer in the next run.
 	forget_widgets();
 
 	config = NULL;
@@ -1928,6 +2012,7 @@ static bool spotify_stop(void) {
 	copy_text(engine_note, sizeof(engine_note), "engine not built");
 	copy_text(account_state, sizeof(account_state), "unknown");
 	account_error[0] = '\0';
+	account_premium = -1;
 	list_error[0] = '\0';
 	memset(items, 0, sizeof(items));
 	item_count = 0;
@@ -1938,8 +2023,6 @@ static bool spotify_stop(void) {
 	stopping = false; // init() is a fresh start after this
 	pthread_mutex_unlock(&job_lock);
 
-	// The credentials store is a struct in this library, not an open file.
-	memset(&credentials, 0, sizeof(credentials));
 	return true;
 }
 

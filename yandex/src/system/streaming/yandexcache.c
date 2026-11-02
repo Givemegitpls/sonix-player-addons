@@ -30,7 +30,8 @@
 #define MAX_BOX (32L * 1024 * 1024) // a flac-mp4 fragment larger than this is refused
 #define MAX_INIT (1024L * 1024)
 
-static char cache_dir[400];
+static char cache_dir[400];	 // the one in use, "" while the card is gone
+static char addon_cache[400]; // "<addon>/cache", the path init() gave: the card coming back re-arms it
 static __thread char last_error[256];
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -81,19 +82,22 @@ static void set_error(const char *fmt, ...) {
 
 const char *yandexcache_last_error(void) { return last_error; }
 
+void yandexcache_set_addon_dir(const char *cache) {
+	pthread_mutex_lock(&lock);
+	sidecar_generation++;
+	snprintf(addon_cache, sizeof(addon_cache), "%s", cache && cache[0] ? cache : "");
+	snprintf(cache_dir, sizeof(cache_dir), "%s", addon_cache);
+	pthread_mutex_unlock(&lock);
+	if (!addon_cache[0]) {
+		fprintf(stderr, "yandexcache: no cache directory on the card; tracks play but are not kept\n");
+	}
+}
+
 void yandexcache_set_root(const char *sd_root) {
 	pthread_mutex_lock(&lock);
 	sidecar_generation++;
+	snprintf(cache_dir, sizeof(cache_dir), "%s", sd_root && sd_root[0] ? addon_cache : "");
 	pthread_mutex_unlock(&lock);
-	cache_dir[0] = '\0';
-	if (!sd_root || !sd_root[0]) {
-		return;
-	}
-	char local[400];
-	snprintf(local, sizeof(local), "%s/.local", sd_root);
-	mkdir(local, 0755);
-	snprintf(cache_dir, sizeof(cache_dir), "%s/%s", sd_root, YANDEXCACHE_DIR);
-	mkdir(cache_dir, 0755);
 }
 
 bool yandexcache_ready(void) { return cache_dir[0] != '\0'; }
@@ -642,7 +646,7 @@ static void *download_main(void *arg) {
 	// Counted in yandexlive for the whole of it: stop() waits for this count
 	// before it forgets the card and closes libcrypto, and this thread is the
 	// one that reads both.
-	yandexlive_enter();
+	yandexlive_enter(YANDEXLIVE_CACHE);
 	// Below the interface and the audio threads, so the TLS and the card
 	// writes of a download give way to them on this single core; but not idle
 	// class like a sync thread, because playback is reading this file as it
@@ -688,7 +692,7 @@ static void *download_main(void *arg) {
 	}
 	pthread_mutex_unlock(&lock);
 	free(d);
-	yandexlive_leave();
+	yandexlive_leave(YANDEXLIVE_CACHE);
 	return NULL;
 }
 
@@ -1115,7 +1119,7 @@ void yandexcache_clear_on_exit(void) {
 // that module: nothing here owns it.
 bool yandexcache_stop(void) {
 	yandexcache_abandon_all();
-	bool safe = yandexlive_wait("the cache", YANDEXLIVE_WAIT_MS);
+	bool safe = yandexlive_wait(YANDEXLIVE_CACHE, "the cache", YANDEXLIVE_WAIT_MS);
 
 	// After the wait, and never before: abandon_all is reached from other
 	// services' workers, and the pointer must stay valid for as long as any of
@@ -1127,7 +1131,8 @@ bool yandexcache_stop(void) {
 
 	pthread_mutex_lock(&lock);
 	cache_dir[0] = '\0';
-	current = NULL;	 // its thread has returned and freed it
+	addon_cache[0] = '\0'; // the directory was the old card's: init() sets it again
+	current = NULL;		   // its thread has returned and freed it
 	detached = NULL;
 	sidecar_generation++; // answers already on their way belong to the old card
 	pthread_mutex_unlock(&lock);
@@ -1150,16 +1155,22 @@ bool yandexcache_stop(void) {
 // No card descriptor is held during HTTP. Re-admission also rejects a
 // result from before a USB handoff, a card change or playback cancellation.
 static int sidecar_pin(const char *path, unsigned generation) {
-	char root[400], prefix[460];
+	char root[400], dir[400];
 	int pin = yandex_storage_pin_card(root, sizeof(root));
 	if (pin < 0) {
 		return -1;
 	}
-	snprintf(prefix, sizeof(prefix), "%s/" YANDEXCACHE_DIR "/", root);
 	pthread_mutex_lock(&lock);
 	bool current_generation = generation == sidecar_generation;
+	snprintf(dir, sizeof(dir), "%s", cache_dir);
 	pthread_mutex_unlock(&lock);
-	if (!current_generation || strncmp(path, prefix, strlen(prefix)) != 0) {
+	// The cache is in the addon's folder now, so "is this still the same card's
+	// cache" is two questions: the pinned root is what the cache's path starts
+	// with, and the file is inside that cache.
+	size_t root_len = strlen(root), dir_len = strlen(dir);
+	bool same = current_generation && dir_len > root_len && strncmp(dir, root, root_len) == 0 &&
+				strncmp(path, dir, dir_len) == 0 && path[dir_len] == '/';
+	if (!same) {
 		close(pin);
 		return -1;
 	}

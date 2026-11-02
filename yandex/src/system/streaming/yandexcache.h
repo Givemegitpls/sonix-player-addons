@@ -27,15 +27,21 @@
 //   * flac-mp4 is unwrapped into a plain .flac as it arrives (mp4flac.c), one
 //     fragment at a time, like Tidal's hi-res segments.
 //
-// A separate directory from the other services, so that a path tells which
-// service it came from (yandexcache_owns) and two catalogues' ids never meet.
+// A directory of its own, so that a path tells which service it came from
+// (yandexcache_owns) and two catalogues' ids never meet -- and inside this
+// addon's folder, not the card's ".local" tree, which is the player's.
 //
 // Thread contract: yandexcache_start() blocks for the prebuffer and must run
 // on a worker thread; the rest is cheap and callable from anywhere.
 
-#define YANDEXCACHE_DIR ".local/yandex-cache"
+// The cache's directory, "<addon>/cache", as addon_cache_dir() made it. NULL or
+// empty means the card would not have it (read-only, or gone): the cache then
+// answers "no cache" and tracks stream without being kept.
+void yandexcache_set_addon_dir(const char *cache);
 
-// Where the card is. NULL or empty disables the cache.
+// The card, as the service registry hands it. It no longer says where the cache
+// is -- that follows the addon's folder, above -- only whether there is a card
+// at all: NULL or empty disables the cache.
 void yandexcache_set_root(const char *sd_root);
 bool yandexcache_ready(void);
 

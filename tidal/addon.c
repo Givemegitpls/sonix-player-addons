@@ -1,5 +1,9 @@
 #include "src/addon/addon.h"
 
+#include <stdio.h>
+
+#include "common/addonfs.h"
+
 #include "src/gui/streaming/tidalpage.h"
 #include "src/system/streaming/tidal.h"
 #include "src/system/streaming/tidalcache.h"
@@ -32,9 +36,34 @@
 
 static lv_obj_t *tidal_addon_init(const sonix_addon_host_t *host) {
 	// The card first: the keys and the session are the addon's own files in
-	// host->dir (tidalconf.h), which is also where the old place they came from
-	// is migrated once, and so is everything the cache does.
+	// host->dir (tidalconf.h), and the cache is the addon's own directory there
+	// too now -- <addon>/cache, see tidalcache.h.
 	tidalconf_init(host->dir, host->sd_root);
+
+	// The move out of the .local/ tree the player owns is attempted before the
+	// folder is made: addon_migrate_path() reads an existing destination as
+	// "already migrated" (addonfs.h), and the empty directory addon_cache_dir()
+	// would have just created looks exactly like a finished move. The old name
+	// comes from tidalcache.h and the leaf is the "cache" addonfs.h makes, so
+	// the directory this renames into is the one the cache opens later.
+	char cache[ADDON_PATH_MAX];
+	int len = snprintf(cache, sizeof(cache), "%s/" TIDALCACHE_DIRNAME, host->dir);
+	if (len > 0 && (size_t)len < sizeof(cache) && host->sd_root && host->sd_root[0]) {
+		char old[ADDON_PATH_MAX];
+		snprintf(old, sizeof(old), "%s/" TIDALCACHE_DIR_OLD, host->sd_root);
+		addon_migrate_path(old, cache);
+	}
+
+	if (addon_cache_dir(host, cache, sizeof(cache))) {
+		tidalcache_set_addon_dir(host->dir, host->sd_root);
+	} else {
+		// A card that will not hold the folder -- read-only, or one that has
+		// just gone -- leaves Tidal with no cache rather than with a cache
+		// somewhere else: every track it plays is a file in there, so it will
+		// say so when a track is asked for instead of writing into the player's
+		// tree.
+		fprintf(stderr, "tidal: no cache folder on the card, nothing can be played\n");
+	}
 	tidalcache_set_root(host->sd_root);
 	tidal_init();
 

@@ -1,5 +1,7 @@
 #include "src/addon/addon.h"
 
+#include "common/addonfs.h"
+
 #include "src/gui/streaming/yandexstate.h"
 #include "src/system/net/crypto.h"
 #include "src/system/net/openssl_runtime.h"
@@ -22,9 +24,9 @@
 // (the download cache), yandexdl.c (saving into the library), yandexplay.c (the
 // queue), yandexlist.c (a long list's ids and their pages), yandexsaved.c (the
 // index of what was saved), yandexsync.c (the likes) and yandexwave.c (the
-// station's conversation). The page (yandexpage.c, Graphite 2) is not here yet:
-// this stage is the service and a settings screen that shows the keys and the
-// account, so the whole thing can be built and opened without one.
+// station's conversation). The page is this stage's own (src/gui/streaming/
+// yandexstate.c: a home of sections, one list screen and a search), written for
+// this player rather than ported from Graphite 2.
 //
 // Two entry points, which is what being a service costs:
 //
@@ -45,15 +47,56 @@
 // Keys and the token: the four application keys (client_id, client_secret,
 // sign_key, client_header) and the two addresses are the addon's own, in
 // <card>/Addons/yandex/settings.ini; in the fork they came out of
-// streaming-keys.bin, which an addon cannot open. The user's token is a file at
-// the card's root, yandex_token.txt, which the addon reads itself (there is no
-// cardimport here) and keeps the session it gets in its own folder. Nothing of
-// it is in device_config.ini, and nothing is compiled in.
+// streaming-keys.bin, which an addon cannot open. The user's token is a file in
+// the same folder, token.txt, which the addon reads itself (there is no
+// cardimport here) and keeps the session it gets beside it. Nothing of it is in
+// device_config.ini, and nothing is compiled in.
+//
+// The rule for everything below: an addon writes under its own folder and
+// nowhere else -- settings beside addon.so, caches and indexes under it too.
+// What earlier builds left at the card's root and in the card's shared ".local"
+// tree is moved in once, at init() (yandex_migrate_card_files). The saved music
+// is the exception that proves it: <music>/Yandex Music/ is the user's library,
+// not this addon's storage, and it stays where the scanner finds it.
 
 // The id the host gave this library (sonix_addon_host_t::id): the shell keeps
 // screens by it, so every sonix_addon_own_screen() call needs it. The manifest
 // owns the string and outlives the library, so the pointer is kept as it came.
 static const char *yandex_addon_id;
+
+// The three files this addon used to keep outside its own folder: the token at
+// the card's root, the index of what was saved and the audio cache in the
+// card's shared ".local" tree -- which is the player's, and which a factory
+// reset, the USB export and the card watcher each had to guess about.
+//
+// One-shot and conservative: addon_migrate_path() renames rather than copies,
+// does nothing when the new path is already there (the move is done) or the old
+// one is not (there was nothing to move), and on a failure -- a read-only card,
+// a card just pulled -- logs and leaves both alone, so the next start tries
+// again. A missing token is the normal case, not a failure: it is how a user
+// signs in, and the addon runs without one.
+//
+// The cache's directory is moved before addon_cache_dir() creates it: an empty
+// directory at the new path would read as "already migrated" and the move would
+// never happen.
+static void yandex_migrate_card_files(const sonix_addon_host_t *host) {
+	if (!host || !host->dir || !host->dir[0] || !host->sd_root || !host->sd_root[0]) {
+		return;
+	}
+	char old_path[512], new_path[512];
+
+	snprintf(old_path, sizeof(old_path), "%s/yandex_token.txt", host->sd_root);
+	snprintf(new_path, sizeof(new_path), "%s/%s", host->dir, YANDEX_TOKEN_FILE);
+	addon_migrate_path(old_path, new_path);
+
+	snprintf(old_path, sizeof(old_path), "%s/.local/yandex-saved.tsv", host->sd_root);
+	snprintf(new_path, sizeof(new_path), "%s/%s", host->dir, YANDEXSAVED_FILE);
+	addon_migrate_path(old_path, new_path);
+
+	snprintf(old_path, sizeof(old_path), "%s/.local/yandex-cache", host->sd_root);
+	snprintf(new_path, sizeof(new_path), "%s/cache", host->dir);
+	addon_migrate_path(old_path, new_path);
+}
 
 static lv_obj_t *yandex_addon_init(const sonix_addon_host_t *host) {
 	yandex_addon_id = host->id;
@@ -61,21 +104,33 @@ static lv_obj_t *yandex_addon_init(const sonix_addon_host_t *host) {
 	// The card first: the settings, the keys and the session are read from it,
 	// and so is everything the cache and the saved index do.
 	yandexconf_init(host->dir);
+
+	// Before any module opens a file, the ones an earlier build left elsewhere
+	// on the card are brought into this folder.
+	yandex_migrate_card_files(host);
+
+	// The cache lives in <addon>/cache, made here. A card that refuses it (a
+	// read-only one, or one that has gone) leaves it NULL: tracks then stream
+	// and are not kept, rather than landing somewhere that is not ours.
+	char cache[512];
+	bool have_cache = addon_cache_dir(host, cache, sizeof(cache));
+	yandexcache_set_addon_dir(have_cache ? cache : NULL);
 	yandexcache_set_root(host->sd_root);
 	yandexdl_set_root(host->sd_root);
+	yandexsaved_set_addon_dir(host->dir);
 	yandexsaved_set_root(host->sd_root);
 	yandex_init();
 
 	// The prepare callback: the player asks before it starts a file in Yandex's
-	// cache, and the answer is "not yet, it is still coming down". No listener
-	// yet -- the page that shows the events is the next stage, and it calls this
-	// again with its own.
+	// cache, and the answer is "not yet, it is still coming down". The page
+	// registers again, with the listener that shows playback's events.
 	yandexplay_init(NULL);
 
-	// The page. It fills in the two interface objects the service table carries
-	// (the mark over the artwork, "show album") when that page exists; for now
-	// it is the keys-and-account screen and the table keeps them NULL.
-	yandexstate_init(host->cfg, host->sd_root, yandex_addon_id);
+	// The page: the home of sections, the lists behind them and the search. It
+	// also fills the two interface objects the service table carries (the mark
+	// over the artwork, "show album"), which is what
+	// yandex_service_attach_gui() is for.
+	yandexstate_init(host->cfg, host->sd_root, host->dir, yandex_addon_id);
 
 	return yandexstate_screen;
 }
@@ -122,7 +177,7 @@ static bool yandex_addon_stop(void) {
 	// One last look at the count: a thread that outlived its own module's wait
 	// is still inside this library, and everything below frees memory it reads.
 	// The log line names it, and its answer is what the player acts on.
-	safe = yandexlive_wait("the addon", YANDEXLIVE_WAIT_MS) && safe;
+	safe = yandexlive_wait_all("the addon", YANDEXLIVE_WAIT_MS) && safe;
 
 	yandex_stop();
 	yandexsaved_stop();

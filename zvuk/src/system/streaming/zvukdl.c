@@ -35,7 +35,8 @@
 #define KEEP_BLOCK_MAX (1024 * 1024)
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-static char root[400];
+static char root[400];		// the card: saved paths are relative to it
+static char addon_dir[400]; // <card>/Addons/zvuk, where the index is
 static unsigned card_epoch;
 
 // ===========================================================================
@@ -69,7 +70,13 @@ static void field(const char *line, int f, char *out, size_t size) {
 	snprintf(out, size, "%.*s", (int)strcspn(p, "\t\n"), p);
 }
 
-static void index_path(char *out, size_t size) { snprintf(out, size, "%s/" ZVUKDL_INDEX, root); }
+static void index_path(char *out, size_t size) {
+	if (!addon_dir[0]) {
+		out[0] = '\0';
+		return;
+	}
+	snprintf(out, size, "%s/" ZVUKDL_INDEX, addon_dir);
+}
 
 // Call with the lock held.
 static void index_add_line(char *line) {
@@ -105,7 +112,7 @@ static void index_add_line(char *line) {
 static void index_prune(void);
 
 static void index_load(void) {
-	if (saved_loaded || !root[0]) {
+	if (saved_loaded || !root[0] || !addon_dir[0]) {
 		return;
 	}
 	saved_loaded = true;
@@ -135,9 +142,13 @@ static void index_load(void) {
 static void index_save(void) {
 	char path[500], tmp[520];
 	index_path(path, sizeof(path));
+	if (!path[0]) {
+		return; // no card, no index: nothing on it can be out of date
+	}
 	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 	FILE *f = fopen(tmp, "w");
 	if (!f) {
+		fprintf(stderr, "zvukdl: cannot rewrite %s: %s -- the index on the card is unchanged\n", path, strerror(errno));
 		return;
 	}
 	for (int i = 0; i < saved_count; i++) {
@@ -182,10 +193,18 @@ static void index_add(const zvuk_track_t *t, const char *album_title, const char
 	index_load();
 	char path[500];
 	index_path(path, sizeof(path));
-	FILE *f = fopen(path, "a");
-	if (f) {
-		fprintf(f, "%s\n", line);
-		fclose(f);
+	if (!path[0]) {
+		fprintf(stderr, "zvukdl: no folder for the index; %s is saved but not listed\n", t->id);
+	} else {
+		FILE *f = fopen(path, "a");
+		if (f) {
+			fprintf(f, "%s\n", line);
+			fclose(f);
+		} else {
+			// A read-only card is the usual reason: the track is on the card,
+			// but this run will not list it as saved.
+			fprintf(stderr, "zvukdl: cannot append to %s: %s -- %s is not in the index\n", path, strerror(errno), t->id);
+		}
 	}
 	char *copy = strdup(line);
 	if (copy) {
@@ -996,6 +1015,9 @@ static bool save_track_pinned(const zvuk_track_t *t, unsigned asked, const char 
 		snprintf(base, sizeof(base), "%s", title);
 	}
 	char folder[1024];
+	// <music>/Zvuk/<album artist>/<album (year)>: the user's library, where the
+	// scanner finds saved music beside their own files -- not this addon's
+	// folder. Only the index of what was saved (above) is the addon's.
 	snprintf(folder, sizeof(folder), "%s/" ZVUKDL_FOLDER "/%s/%s", music, artist_dir, album_dir);
 	static const char *const EXTS[] = {"flac", "mp3"};
 	for (size_t i = 0; i < sizeof(EXTS) / sizeof(EXTS[0]); i++) {
@@ -1329,6 +1351,13 @@ void zvukdl_cancel_all(void) {
 	}
 }
 
+void zvukdl_set_addon_dir(const char *dir) {
+	pthread_mutex_lock(&lock);
+	snprintf(addon_dir, sizeof(addon_dir), "%s", dir ? dir : "");
+	index_forget(); // the next read is this folder's index
+	pthread_mutex_unlock(&lock);
+}
+
 void zvukdl_set_root(const char *sd_root) {
 	pthread_mutex_lock(&lock);
 	bool changed = strcmp(root, sd_root ? sd_root : "") != 0;
@@ -1374,10 +1403,11 @@ bool zvukdl_stop(void) {
 		worker_started = false;
 		stopping = false; // a second init() starts the worker again
 		// The index of saved tracks, and the queue's array: the next init reads
-		// the card again and the root it is given is that card.
+		// the card again and the root and folder it is given are that card's.
 		free(queue);
 		queue = NULL;
 		index_forget();
+		addon_dir[0] = '\0';
 	}
 	pthread_mutex_unlock(&lock);
 

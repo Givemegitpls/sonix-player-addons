@@ -18,9 +18,9 @@
 //     CURLOPT_SSL_VERIFYPEER 0 everywhere, and its rootfs has no CA bundle at
 //     all);
 //   * the original keeps username and password in cleartext in
-//     /data/qobuz_info and logs in again at every boot. Here only the session
-//     token is stored: if it expires the password is asked for once, and at no
-//     point is the password written anywhere.
+//     /data/qobuz_info and logs in again at every boot. Here there is no
+//     password at all: the account's user_auth_token is taken from a file in
+//     the addon's own folder on the card (below), and only that token is kept.
 //
 // The application credentials (app_id, app_secret) are not in here: they are
 // the addon's own, in <card>/Addons/qobuz/settings.ini, see qobuzconf.h.
@@ -109,8 +109,51 @@ typedef struct {
 // Session
 // ---------------------------------------------------------------------------
 
-// Reads the application credentials and the stored token. Once, from the
-// addon's init(), after qobuzconf_init().
+// The account half of the service, as a token file in the addon's own folder on
+// the card: one line, the account's `user_auth_token` as the Qobuz web player
+// has it.
+//
+// There is no username/password form, and none is to be added back: with the
+// application pair this addon derives from the web player, Qobuz's /user/login
+// answers "invalid credentials" for accounts that are perfectly valid, so a
+// form with two fields could only be a button that does not work. Every call
+// after a login carries the token in X-User-Auth-Token anyway, so the token is
+// the whole of what the account half needs.
+#define QOBUZ_TOKEN_FILE "token.txt"
+#define QOBUZ_TOKEN_REL "Addons/qobuz/token.txt"
+
+// What qobuz_sign_in_from_card() answered.
+typedef enum {
+	QOBUZ_CARD_SIGNED_IN = 0, // the token works and is the session now
+	QOBUZ_CARD_NO_TOKEN,	  // no file, or nothing that reads as a token in it
+	QOBUZ_CARD_NO_KEYS,		  // no application pair: a token alone cannot be checked
+	QOBUZ_CARD_REFUSED,		  // Qobuz answered, and not with a session
+} qobuz_card_result_t;
+
+// Blocks. Reads <card>/Addons/qobuz/token.txt, asks Qobuz who the token belongs
+// to (one /user/get, the only call whose business is the account itself) and,
+// when the server accepts it, makes it the session and writes session.ini.
+//
+// `keep_current` is "Read again": a token or a server answer that is no good
+// leaves the session as it was. With it false -- "Sign in from the card", and
+// the check init() starts -- a failure signs out, so no session is kept that the
+// server rejected. Qobuz's own sentence, when it gave one, is in
+// qobuz_last_error(). The token is never logged and never returned.
+qobuz_card_result_t qobuz_sign_in_from_card(bool keep_current);
+
+// True while the token in memory came from the card in this run and Qobuz has
+// not accepted it yet: the page asks on a worker, never on the GUI thread.
+bool qobuz_session_unchecked(void);
+
+// True when the card refused the write of the session (a read-only card): what
+// is signed in works for this run and is gone at the next start.
+bool qobuz_session_not_kept(void);
+
+// Reads the application credentials and the token. Once, from the addon's
+// init(), after qobuzconf_init(). A token file that is there becomes the
+// session immediately, unchecked (see above) -- unless the last thing written
+// was a sign-out, which a restart must not undo. It is also where the commented
+// template for a fresh card is written, once.
 void qobuz_init(void);
 
 // Reads the credentials and the token again, after the card may have been
@@ -129,10 +172,8 @@ bool qobuz_configured(void);
 bool qobuz_logged_in(void);
 const char *qobuz_display_name(void); // empty when not logged in
 
-// Blocks. On success stores the token and returns true.
-bool qobuz_login(const char *username, const char *password);
-
-// Forgets the token, here and in the configuration.
+// Forgets the token, here and in the configuration, and records the sign-out so
+// that a restart does not read the token file straight back in.
 void qobuz_logout(void);
 
 // Why the last call failed, already in a form fit to display. Empty on success.

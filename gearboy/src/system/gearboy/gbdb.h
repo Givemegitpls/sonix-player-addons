@@ -15,9 +15,11 @@
 // ever published, indexed by the ROM's CRC32. That is the name for the list.
 //
 // Computing the CRC32 means reading the whole ROM, and a cartridge reaches
-// 8 MB. It happens once and the result is kept in
-// <sd>/.local/gearboy-cache/index.tsv along with the file's size and mtime. If
-// either changes, that ROM is redone and the others are not.
+// 8 MB. It happens once and the result is kept in `<addon>/cache/index.tsv`
+// along with the file's size and mtime. If either changes, that ROM is redone
+// and the others are not. The file is the addon's own, in the addon's folder on
+// the card, not one in the tree the player shares with everything else: see
+// gbdb_set_cache_dir().
 //
 // "What is on the card" and "what it is called" stay separate on purpose: a ROM
 // the database does not know (a fan translation, a homebrew) still gets listed,
@@ -35,10 +37,18 @@ typedef struct {
 	bool color;   // true when it sits in Games/GBC or ends in .gbc
 } gbrom_t;
 
-// The card root, under which Games/GB, Games/GBC and the cache live. Like
-// everything else that writes to the card it comes from outside: the simulator
-// has no card mounted.
+// The card root, under which Games/GB, Games/GBC, Games/Saves and Games/Bios
+// live. Like everything else that writes to the card it comes from outside: the
+// simulator has no card mounted.
 void gbdb_set_root(const char *sd_root);
+
+// The directory the ROM index goes in: the addon's own `<addon>/cache`
+// (addons/common/addonfs.h), handed over by addon.c at init(). Empty or never
+// called means no index at all -- every scan reads the ROMs through and writes
+// nothing, which is what a card that would not give the addon the directory
+// gets. It is deliberately separate from the root: the games are the user's and
+// stay where the user keeps them, the index is the addon's.
+void gbdb_set_cache_dir(const char *cache_dir);
 
 #include "src/system/core/respath.h"
 

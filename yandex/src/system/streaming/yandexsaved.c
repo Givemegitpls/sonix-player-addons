@@ -27,7 +27,8 @@ enum { F_ID, F_ALBUM_ID, F_DISC, F_TRACK, F_DURATION, F_YEAR, F_ALBUM_TRACKS, F_
 #define CLAIM_MAX 320
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-static char root[400];
+static char root[400];		// the card: what the index's relative paths resolve against
+static char addon_dir[400]; // <card>/Addons/yandex, where the index is
 static bool loaded;
 static entry_t *entries;
 static int entry_count, entry_cap;
@@ -39,7 +40,13 @@ static int claim_count;
 // the file
 // ---------------------------------------------------------------------------
 
-static void index_path(char *out, size_t size) { snprintf(out, size, "%s/%s", root, YANDEXSAVED_FILE); }
+static void index_path(char *out, size_t size) {
+	if (!addon_dir[0]) {
+		out[0] = '\0';
+		return;
+	}
+	snprintf(out, size, "%s/%s", addon_dir, YANDEXSAVED_FILE);
+}
 
 static void absolute(const entry_t *e, char *out, size_t size) { snprintf(out, size, "%s/%s", root, e->rel); }
 
@@ -116,7 +123,7 @@ static int find(const char *id) {
 
 // Read on first use after start-up or a card change. Under the lock.
 static void ensure_loaded(void) {
-	if (loaded || !root[0]) {
+	if (loaded || !root[0] || !addon_dir[0]) {
 		return;
 	}
 	loaded = true;
@@ -151,9 +158,13 @@ static void ensure_loaded(void) {
 static void rewrite(void) {
 	char path[512], tmp[530];
 	index_path(path, sizeof(path));
+	if (!path[0]) {
+		return; // no card, no index: the entry only lives in memory until it goes
+	}
 	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 	FILE *f = fopen(tmp, "w");
 	if (!f) {
+		fprintf(stderr, "yandexsaved: cannot rewrite %s: %s -- the index on the card is unchanged\n", path, strerror(errno));
 		return;
 	}
 	bool ok = fputs(HEADER, f) >= 0;
@@ -184,6 +195,13 @@ static void field(char *out, size_t size, const char *in) {
 	}
 }
 
+void yandexsaved_set_addon_dir(const char *dir) {
+	pthread_mutex_lock(&lock);
+	snprintf(addon_dir, sizeof(addon_dir), "%s", dir ? dir : "");
+	forget_all(); // the next call reads this folder's index
+	pthread_mutex_unlock(&lock);
+}
+
 void yandexsaved_set_root(const char *sd_root) {
 	pthread_mutex_lock(&lock);
 	const char *next = sd_root ? sd_root : "";
@@ -202,6 +220,7 @@ void yandexsaved_stop(void) {
 	pthread_mutex_lock(&lock);
 	forget_all();
 	root[0] = '\0';
+	addon_dir[0] = '\0';
 	claim_count = 0;
 	memset(claims, 0, sizeof(claims));
 	pthread_mutex_unlock(&lock);
@@ -244,15 +263,23 @@ void yandexsaved_add(const yandex_track_t *t, const char *album_artist, int year
 		// Appended: one short write, and the file never half-replaced.
 		char file[512];
 		index_path(file, sizeof(file));
-		struct stat st;
-		bool fresh = stat(file, &st) != 0 || st.st_size == 0;
-		FILE *f = fopen(file, "a");
-		if (f) {
-			if (fresh) {
-				fputs(HEADER, f);
+		if (!file[0]) {
+			fprintf(stderr, "yandexsaved: no folder for the index; %s is saved but not listed\n", t->id);
+		} else {
+			struct stat st;
+			bool fresh = stat(file, &st) != 0 || st.st_size == 0;
+			FILE *f = fopen(file, "a");
+			if (f) {
+				if (fresh) {
+					fputs(HEADER, f);
+				}
+				fputs(buf, f);
+				fclose(f);
+			} else {
+				// A read-only card is the usual reason: the track is on the
+				// card, but this run will not list it as saved.
+				fprintf(stderr, "yandexsaved: cannot append to %s: %s -- %s is not in the index\n", file, strerror(errno), t->id);
 			}
-			fputs(buf, f);
-			fclose(f);
 		}
 	}
 	pthread_mutex_unlock(&lock);

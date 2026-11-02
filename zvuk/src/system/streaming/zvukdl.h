@@ -21,17 +21,18 @@
 // own at low priority, giving way to whatever is being listened to. Nothing
 // runs and nothing is allocated until something is saved.
 //
-// The index, <card>/.local/zvuk-saved.tsv, one line per saved track (its ids,
-// numbers, the names a list shows offline and the file's path relative to the
-// card), is what lets the Zvuk pages play saved tracks from the card with no
-// network -- and with no session: an expired token signs out, the saved
-// tracks play on.
+// The index, <card>/Addons/zvuk/saved.tsv, beside the addon's settings, one line
+// per saved track (its ids, numbers, the names a list shows offline and the
+// file's path relative to the card), is what lets the Zvuk pages play saved
+// tracks from the card with no network -- and with no session: an expired token
+// signs out, the saved tracks play on. (The saved files themselves are the
+// user's library, under <music>/Zvuk; only the index is the addon's.)
 //
 // Thread contract: any thread; one mutex inside. The listener runs on the
 // worker (the receiver bounces it with gui_post()).
 
 #define ZVUKDL_FOLDER "Zvuk"
-#define ZVUKDL_INDEX ".local/zvuk-saved.tsv"
+#define ZVUKDL_INDEX "saved.tsv"
 
 bool zvukdl_track(const zvuk_track_t *track);
 bool zvukdl_album(const char *album_id, const char *title);
@@ -65,6 +66,13 @@ typedef enum {
 void zvukdl_set_listener(void (*listener)(zvukdl_event_t event, int count, const char *text));
 
 void zvukdl_cancel_all(void);
+// The addon's own folder, where the index lives: set by init() before the card
+// root. Without it there is no index -- a read-only card, or one that has just
+// gone -- and the saved lists come back empty rather than guessed at.
+void zvukdl_set_addon_dir(const char *addon_dir);
+// The card, as the provider registry hands it: what the index's relative paths
+// are resolved against, and where the saved files go. A different root forgets
+// the loaded index.
 void zvukdl_set_root(const char *sd_root);
 
 // Stops the module for good: the listener is dropped, the worker leaves, the

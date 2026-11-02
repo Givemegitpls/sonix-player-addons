@@ -7,6 +7,6 @@
   "version": "0.1",
   "icon": "icon.png",
   "service": true,
-  "owns_paths": [".local/yandex-cache/", ".local/yandex-saved.tsv", ".local/listart/"],
-  "cache_path": ".local/yandex-cache/"
+  "owns_paths": ["Addons/yandex/cache/", "Addons/yandex/saved.tsv"],
+  "cache_path": "Addons/yandex/cache/"
 }

@@ -15,11 +15,10 @@
 //     the original XML because json.c already exists and every OpenSubsonic
 //     server answers it;
 //   * token authentication: t = md5(password + salt), s = salt. The salt is
-//     made once at sign-in and kept, with the token, in the addon's own
-//     session.ini on the card -- the password itself is never written anywhere.
-//     A fixed salt is what the servers accept and is also what keeps cover URLs
-//     stable, so the list covers cached by URL (listart.c) are found again
-//     next time;
+//     made once at sign-in and kept, with the token, in that server's own file
+//     on the card -- the password itself is never written anywhere. A fixed
+//     salt is what the servers accept and is also what keeps cover URLs stable,
+//     so the list covers cached by URL (listart.c) are found again next time;
 //   * the old plain-password form (p=enc:<hex>) only when the server refuses
 //     tokens (error 41, e.g. an LDAP-backed account). That password then does
 //     have to be kept -- hex-encoded, which is obfuscation, not protection --
@@ -38,6 +37,13 @@
 #define SUBSONIC_NAME_MAX 128
 #define SUBSONIC_URL_MAX 768
 #define SUBSONIC_SERVER_MAX 256
+
+// Servers: one file each under <dir>/servers/, 16 is more accounts than a
+// player is likely to have, and the list is read whole on every page that
+// needs it.
+#define SUBSONIC_HOSTS_MAX 16
+#define SUBSONIC_SLUG_MAX 32
+#define SUBSONIC_LABEL_MAX 64
 
 typedef struct {
 	char id[SUBSONIC_ID_MAX];
@@ -78,11 +84,29 @@ typedef struct {
 } subsonic_playlist_t;
 
 // ---------------------------------------------------------------------------
-// Session
+// Servers
+//
+// One account per server, one file per account, so a player with two servers in
+// the house (or two names on one) does not have to sign out to change which one
+// it is looking at:
+//
+//     <dir>/servers/<slug>.ini   label, server, user, salt, token, password_hex, quality
+//     <dir>/servers/active       the slug of the one in use, one line of text
+//
+// `slug` is the server's host made into a file name -- "192.168.1.10-4533" for
+// "http://192.168.1.10:4533", with a number appended when two need it -- and it
+// never changes hands: the file this addon has always written, session.ini, is
+// moved to servers/default.ini the first time this version runs.
+//
+// Everything above this section speaks to the *active* server, and the session
+// is reloaded when another is chosen: lists, stream URLs, cover URLs and the
+// star all mean the server the user picked.
 // ---------------------------------------------------------------------------
 
-// Reads the saved server and token out of <dir>/session.ini, the addon's own
-// file on the card. Once, from the addon's init(), with host->dir.
+// Reads the saved servers out of <dir>/servers/ once, from init(), with
+// host->dir, and loads the active one. An older <dir>/session.ini is moved into
+// place first. With no card to write to, the session is kept in memory and
+// subsonic_hosts_note() says so.
 void subsonic_load(const char *dir);
 
 bool subsonic_logged_in(void);
@@ -90,27 +114,65 @@ bool subsonic_logged_in(void);
 // "alice @ music.example.org", for the settings page. Empty when signed out.
 void subsonic_display_name(char *out, size_t size);
 
-// The server's base URL as saved ("https://music.example.org"). Empty when
-// signed out.
+// The active server's base URL as saved ("https://music.example.org"). Empty
+// when there is no server.
 void subsonic_server(char *out, size_t size);
 
 // The user name as saved. Empty when signed out. For the sign-in form, which
 // starts with what is already known so that signing in again is a password.
 void subsonic_user_name(char *out, size_t size);
 
-// Blocks. Checks the server with ping and, on success, keeps server, user, salt
-// and token. `server` may be given without a scheme ("192.168.1.10:4533"),
-// which means http://.
+// The host a server URL points at, without the scheme or the path:
+// "music.example.org", "192.168.1.10:4533". A row's short name for a server.
+void subsonic_server_host(const char *server, char *out, size_t size);
+
+// Rescans <dir>/servers/ and sorts the result by label. A dozen small files,
+// on the GUI thread.
+void subsonic_hosts_refresh(void);
+int subsonic_hosts_count(void);
+
+// One server for the list, by position. False when `index` is past the end.
+bool subsonic_host_at(int index, char *label, size_t label_size, char *server, size_t server_size, char *user,
+					  size_t user_size);
+bool subsonic_host_slug_at(int index, char *out, size_t size);
+
+// The slug of the server in use, false when there is none.
+bool subsonic_host_active_slug(char *out, size_t size);
+
+// Makes `slug` the active server: reloads the session and the quality from its
+// file. False when there is no such server, and the current one is kept.
+bool subsonic_host_select(const char *slug);
+
+// Deletes that server's file. When it was the active one, the first remaining
+// server is activated, or none. False when the file could not be removed.
+bool subsonic_host_forget(const char *slug);
+
+// Blocks. Checks the server with ping and, only when it answers, writes the
+// server, user, salt and token into the file of `slug` -- NULL or "" signs in
+// as a new server, whose file is named after its host. The server becomes the
+// active one. `server` may be given without a scheme ("192.168.1.10:4533"),
+// which means http://. A failed sign-in leaves the saved file as it was.
+bool subsonic_login_host(const char *slug, const char *server, const char *user, const char *password);
+
+// Signs in as a new server: subsonic_login_host(NULL, ...), for a caller that
+// does not choose the file -- the address names it.
 bool subsonic_login(const char *server, const char *user, const char *password);
 
-// Forgets the token, keeps the server and the name (signing back in is mostly
-// typing the password again).
+// Signs out the active server: forgets its token and keeps its server and name,
+// so signing back in is mostly typing the password again. The other servers are
+// untouched.
 void subsonic_logout(void);
 
-// Drops the session and the settings from memory without writing anything, for
-// the addon's stop(): the file on the card stays as it is, so the copy loaded
-// next still finds the session. The session's own lock is re-used, not rebuilt.
+// Drops the session, the servers and the settings from memory without writing
+// anything, for the addon's stop(): the files on the card stay as they are, so
+// the copy loaded next still finds them. The session's own lock is re-used, not
+// rebuilt.
 void subsonic_forget(void);
+
+// The last thing about the servers folder the user should be told when it is
+// not the failure of a request ("signed in, but the card would not keep it").
+// Empty when there is nothing to say.
+void subsonic_hosts_note(char *out, size_t size);
 
 // Why the last call failed, fit to display. Per thread, like http_last_error().
 const char *subsonic_last_error(void);
@@ -127,7 +189,12 @@ typedef enum {
 	SUBSONIC_QUALITY_COUNT,
 } subsonic_quality_t;
 
+// Per server: a player on a slow link wants 192 for the house server and raw
+// for the one it syncs with, and the choice travels with the account.
 int subsonic_get_quality(void);
+
+// Stores the choice in the active server's file. With no file to write to it
+// holds for this run only.
 void subsonic_set_quality(int quality);
 
 // The suffix the file will have at the current quality: the track's own for
@@ -183,6 +250,13 @@ bool subsonic_playlist_create(const char *name, const char *song_id);
 // ---------------------------------------------------------------------------
 // URLs. No network: they are built, not fetched. Empty when signed out.
 // ---------------------------------------------------------------------------
+
+// A file-name-safe name for one song of the active server: FNV-1a over
+// (server, song id), sixteen hex digits. The id itself is kept in the cache's
+// sidecar, because a Subsonic id is the server's own string ("so-45", a UUID)
+// and that is not a name to put on a FAT card -- and because two servers number
+// their songs independently.
+void subsonic_track_key(const char *song_id, char *out, size_t size);
 
 // The audio, at the current quality.
 void subsonic_stream_url(const char *song_id, char *out, size_t size);

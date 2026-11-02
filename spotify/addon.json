@@ -6,5 +6,7 @@
   "order": 9,
   "version": "0.1",
   "icon": "icon.png",
-  "service": true
+  "service": true,
+  "owns_paths": ["Addons/spotify/state/"],
+  "cache_path": "Addons/spotify/state/"
 }

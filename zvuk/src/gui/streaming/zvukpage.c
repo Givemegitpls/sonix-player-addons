@@ -147,7 +147,8 @@ lv_obj_t *zvukpage_screen;
 
 static lv_obj_t *list_screen, *search_screen;
 static gui_config_t *page_cfg;
-static char card_root[400];
+static char card_root[400]; // the card: the covers' shared cache, the saved tracks
+static char addon_dir[400]; // this addon's folder on the card: the token, beside the settings
 
 // The id the host gave this addon, kept because every screen it builds has to
 // be registered with the shell as it is made, and the shell finds the addon by
@@ -1626,14 +1627,14 @@ static void build_search_page(gui_config_t *cfg) {
 // ---------------------------------------------------------------------------
 
 static void token_path(char *out, size_t size) {
-	if (!card_root[0]) {
+	if (!addon_dir[0]) {
 		out[0] = '\0';
 		return;
 	}
-	snprintf(out, size, "%s/%s", card_root, ZVUK_TOKEN_FILE);
+	snprintf(out, size, "%s/%s", addon_dir, ZVUK_TOKEN_FILE);
 }
 
-// The first line of the card's token file that has anything on it. A whole
+// The first line of the token file that has anything on it. A whole
 // profile answer pasted in is one line too, and zvuk_token_clean() takes the
 // token out of it.
 static bool read_token_file(char *out, size_t size) {
@@ -1828,10 +1829,10 @@ static void rebuild_home(void) {
 		// Without a session there is nothing to ask the service: the page says
 		// where the token goes and offers to read the card again.
 		note_label(home_container,
-				   "Put the token from zvuk.com/api/tiny/profile into zvuk_token.txt at the root of the card, "
+				   "Put the token from zvuk.com/api/tiny/profile into Addons/zvuk/token.txt on the card, "
 				   "then tap \"Sign in from the card\".");
 		note_label(home_container, token_file_present() ? "The file is there: sign in from the card."
-													   : "No zvuk_token.txt at the root of the card.");
+													   : "No Addons/zvuk/token.txt on the card.");
 		settingsrow_action(home_container, "Sign in from the card", check_again_cb, NULL);
 		settingsrow_add(home_container, "Saved on the card", NULL, open_saved_cb, NULL);
 	}
@@ -1883,7 +1884,7 @@ static void *sign_in_main(void *arg) {
 	}
 	char token[ZVUK_TOKEN_MAX];
 	if (!read_token_file(token, sizeof(token))) {
-		snprintf(a->message, sizeof(a->message), "No %s at the root of the card.", ZVUK_TOKEN_FILE);
+		snprintf(a->message, sizeof(a->message), "No Addons/%s/token.txt on the card.", addon_id[0] ? addon_id : "zvuk");
 		gui_post(answer_async, a);
 		zvuk_stop_leave(&threads);
 		return NULL;
@@ -2095,10 +2096,11 @@ static void *open_album_for_player(const char *album_id, const char *title) {
 
 void *zvukpage_open_album(const char *album_id, const char *title) { return open_album_for_player(album_id, title); }
 
-void zvukpage_init(gui_config_t *cfg, const char *id, const char *sd_root) {
+void zvukpage_init(gui_config_t *cfg, const char *id, const char *sd_root, const char *dir) {
 	page_cfg = cfg;
 	snprintf(addon_id, sizeof(addon_id), "%s", id ? id : "");
 	snprintf(card_root, sizeof(card_root), "%s", sd_root ? sd_root : "");
+	snprintf(addon_dir, sizeof(addon_dir), "%s", dir ? dir : "");
 	listart_set_root(card_root[0] ? card_root : NULL);
 
 	zvukpage_screen = lv_obj_create(NULL);
@@ -2242,6 +2244,7 @@ bool zvukpage_stop(void) {
 	page_cfg = NULL;
 	addon_id[0] = '\0';
 	card_root[0] = '\0';
+	addon_dir[0] = '\0';
 	list_kind = JOB_NONE;
 	page_asked = -1;
 	page_failed = -1;

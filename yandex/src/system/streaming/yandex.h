@@ -53,6 +53,7 @@ typedef enum {
 typedef struct {
 	char id[YANDEX_ID_MAX];		  // the track id, digits ("12345")
 	char album_id[YANDEX_ID_MAX]; // its first album, digits; empty for a user upload
+	char artist_id[YANDEX_ID_MAX]; // the first of `artist`'s entries, for "Open artist"; empty when unsaid
 	char title[YANDEX_TITLE_MAX];
 	char artist[YANDEX_NAME_MAX];
 	char album[YANDEX_TITLE_MAX];
@@ -69,6 +70,7 @@ typedef struct {
 
 typedef struct {
 	char id[YANDEX_ID_MAX];
+	char artist_id[YANDEX_ID_MAX]; // as yandex_track_t's: the first of `artist`
 	char title[YANDEX_TITLE_MAX];
 	char artist[YANDEX_NAME_MAX];
 	char cover[YANDEX_URL_MAX];
@@ -141,11 +143,12 @@ typedef enum {
 bool yandex_login_begin(yandex_login_t *out);
 yandex_login_state_t yandex_login_poll(const yandex_login_t *login);
 
-// The way in this stage has: a token copied out of the web player into
-// <card>/yandex_token.txt, which the state screen reads and hands here. One
-// /account/status request decides; on success the session is saved in the
-// addon's folder on the card, on failure nothing is kept. Worker thread.
-#define YANDEX_TOKEN_FILE "yandex_token.txt"
+// The way in this stage has: a token copied out of the web player into a file
+// in the addon's own folder on the card, <card>/Addons/yandex/token.txt, which
+// the state screen reads and hands here. One /account/status request decides;
+// on success the session is saved in the same folder, on failure nothing is
+// kept. Worker thread.
+#define YANDEX_TOKEN_FILE "token.txt"
 bool yandex_import_token(const char *token, char *message, size_t message_size);
 // What the file may hold: spaces, quotes, a BOM, "token=" or a whole
 // "Authorization: OAuth ..." line, of which the token is taken.
@@ -182,6 +185,7 @@ typedef struct {
 	char id[YANDEX_ID_MAX];
 	char title[YANDEX_TITLE_MAX];
 	char artist[YANDEX_NAME_MAX]; // the album's artists, or "Various Artists"
+	char artist_id[YANDEX_ID_MAX]; // the first of those, for "Open artist"; empty when unsaid
 	char genre[48];				  // as the service names it ("rusrock"), may be empty
 	char cover[YANDEX_URL_MAX];	  // full https:// URL, large
 	int year;					  // 0 when not said

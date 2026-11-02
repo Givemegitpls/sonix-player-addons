@@ -14,31 +14,43 @@
 // Why an index of its own rather than the library's database: the database
 // knows files and tags, not Yandex ids, and asking it would mean a query per
 // row on every list; the library can also be switched off, rebuilt or limited
-// to other folders. The index is one small text file on the card,
+// to other folders. The index is one small text file in the addon's own
+// folder on the card,
 //
-//   <card>/.local/yandex-saved.tsv
+//   <card>/Addons/yandex/saved.tsv
 //
 // one line per saved track: its id, its album's id, the numbers, the names a
 // list shows offline, and the file's path relative to the card -- the card
-// may be mounted elsewhere next time. A line is appended when a save
-// completes, or when a save finds the file already there (which is also how
-// files saved by 1.2.4, before there was an index, get into it: "Save" again
-// costs no download). Everything else is lazy: the file is read on first use
-// and kept in memory (a few hundred bytes a track); a path is checked only
-// when it is about to be played or listed, and an entry whose file has gone
-// (deleted on a computer, say) is dropped then and the track streams as
-// before. A torn last line -- power lost mid-append -- is skipped on reading.
+// may be mounted elsewhere next time. (The saved files themselves are the
+// user's library, under <music>/Yandex Music; only the index is the addon's.)
+// A line is appended when a save completes, or when a save finds the file
+// already there (which is also how files saved by 1.2.4, before there was an
+// index, get into it: "Save" again costs no download). Everything else is
+// lazy: the file is read on first use and kept in memory (a few hundred bytes a
+// track); a path is checked only when it is about to be played or listed, and an
+// entry whose file has gone (deleted on a computer, say) is dropped then and the
+// track streams as before. A torn last line -- power lost mid-append -- is
+// skipped on reading.
 //
 // Thread contract: every call may be made from any thread; one mutex inside,
 // held for memory work and the small file writes only. Nothing here touches
 // the network.
 
-#define YANDEXSAVED_FILE ".local/yandex-saved.tsv"
-// The folder in the music library the saves go into (yandexdl.h).
+#define YANDEXSAVED_FILE "saved.tsv"
+// The folder in the music library the saves go into (yandexdl.h). The saved
+// files stay there: they are the user's library, not something this addon
+// keeps for itself.
 #define YANDEXSAVED_FOLDER "Yandex Music"
 
-// The card, as the provider registry hands it. A different root forgets the
-// loaded index (the next call reads the new card's).
+// The addon's own folder, where the index lives: set by init() before the card
+// root. Without it there is no index -- a read-only card, or one that has just
+// gone -- and every call below answers "nothing saved" rather than guessing at
+// a path.
+void yandexsaved_set_addon_dir(const char *addon_dir);
+
+// The card, as the provider registry hands it: what the index's relative paths
+// are resolved against. A different root forgets the loaded index (the next
+// call reads the new card's).
 void yandexsaved_set_root(const char *sd_root);
 
 // The addon being unloaded: the index in memory and the queue's claims go; the
