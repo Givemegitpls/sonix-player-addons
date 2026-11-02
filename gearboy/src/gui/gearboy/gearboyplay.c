@@ -11,6 +11,7 @@
 
 #include "src/gb/gbcore.h"
 #include "src/gui/fonts/fonts.h"
+#include "src/gui/gearboy/gearboyscreens.h"
 #include "src/gui/gearboy/gearboysettings.h"
 #include "src/gui/shell/icons_select.h"
 #include "src/gui/shell/switcher.h"
@@ -20,6 +21,7 @@
 #include "src/system/gearboy/gbinput.h"
 #include "src/system/gearboy/gearboy.h"
 #include "src/system/core/lang.h"
+#include "src/system/device/power.h"
 
 lv_obj_t *gearboyplay_screen;
 
@@ -198,6 +200,14 @@ static uint16_t fallback_keys;
 // emulator running behind a page still animating into view.
 static char pending_rom[512];
 static char pending_title[GEARBOY_TITLE_MAX];
+
+// True between gearboyplay_init() and gearboyplay_stop(): everything below
+// points into widgets that only exist in between.
+static bool page_live;
+
+// True while this page is the one that hid the status bar, the back chevron and
+// the player's own volume pill. Leaving restores the three only when it did.
+static bool page_owns_chrome;
 
 static void menu_open(void);
 static void menu_close_and_resume(void);
@@ -522,7 +532,7 @@ static void menu_settings_cb(lv_event_t *e) {
 	// (screen_loaded_cb), which the settings page's back button or back swipe
 	// reaches on their own.
 	visiting_settings = true;
-	switch_screen(gearboysettings_screen);
+	gearboysettings_open();
 }
 
 static lv_obj_t *menu_row(lv_obj_t *parent, const char *text, lv_event_cb_t cb) {
@@ -623,6 +633,12 @@ static veil_state_t veil_state;
 
 static void set_veil(veil_state_t want) {
 	if (veil_state == want) {
+		return;
+	}
+	// Nothing to paint on: the page has been taken down (gearboyplay_stop()),
+	// and an event still in flight walked in here.
+	if (!pause_veil || !game_image || !veil_label) {
+		veil_state = want;
 		return;
 	}
 	veil_state = want;
@@ -729,6 +745,10 @@ static void poll_cb(lv_timer_t *timer) {
 static void screen_loaded_cb(lv_event_t *e) {
 	(void)e;
 
+	// The page now owns the three player-wide states below; leaving (or being
+	// unloaded) puts them back only if it was this page that took them.
+	page_owns_chrome = true;
+
 	// The status bar goes: a Game Boy has no clock and battery above it, and
 	// those 44 rows are exactly the ones the picture needs.
 	topbar_set_hidden(true);
@@ -769,9 +789,12 @@ static void screen_loaded_cb(lv_event_t *e) {
 	refresh_period_set(GAME_REFRESH_MS);
 }
 
-static void screen_unloaded_cb(lv_event_t *e) {
-	(void)e;
-
+// Everything this page stops when it leaves the display, run from
+// SCREEN_UNLOADED and again from gearboyplay_stop(). `stopping` is what makes
+// the two differ: on the way to the settings page the emulator is deliberately
+// left paused with the ROM loaded (visiting_settings), and an unload for good
+// must not honour that.
+static void leave_screen(bool stopping) {
 	lv_timer_pause(poll_timer);
 
 	if (menu_layer) {
@@ -791,8 +814,12 @@ static void screen_unloaded_cb(lv_event_t *e) {
 	// The image stops pointing at the frame buffer BEFORE gearboy_stop() frees
 	// it. LVGL redraws whenever it likes, and a descriptor pointing at freed
 	// memory is a SIGSEGV that lands half a second later somewhere else
-	// entirely.
-	lv_image_set_src(game_image, NULL);
+	// entirely. (NULL when this runs a second time: the page was taken down
+	// after the screen had already been left, and LVGL may still send this one
+	// an unload it did not get the first time.)
+	if (game_image) {
+		lv_image_set_src(game_image, NULL);
+	}
 	game_dsc.data = NULL;
 	veil_state = VEIL_GONE; // force set_veil() to do the work again
 	set_veil(VEIL_STARTING);
@@ -801,15 +828,26 @@ static void screen_unloaded_cb(lv_event_t *e) {
 	// core alive and the ROM loaded, and returning to this page resumes it.
 	// The image was detached from the buffer above regardless; it reattaches
 	// itself on the first frame after the return.
-	if (!visiting_settings) {
+	if (stopping || !visiting_settings) {
 		gearboy_stop();
 	}
 
 	refresh_period_restore();
 
-	volume_overlay_allow_outside_player(false);
-	back_btn_force_hidden(false);
-	topbar_set_hidden(false);
+	// Only if this page is the one that hid them. An unload can happen while
+	// another page -- the player sheet, the end of a book -- has the bar down for
+	// itself, and putting it back here would undo that page's own state.
+	if (page_owns_chrome) {
+		page_owns_chrome = false;
+		volume_overlay_allow_outside_player(false);
+		back_btn_force_hidden(false);
+		topbar_set_hidden(false);
+	}
+}
+
+static void screen_unloaded_cb(lv_event_t *e) {
+	(void)e;
+	leave_screen(false);
 }
 
 void gearboyplay_open(const char *rom_path, const char *title) {
@@ -818,6 +856,12 @@ void gearboyplay_open(const char *rom_path, const char *title) {
 	}
 	snprintf(pending_rom, sizeof(pending_rom), "%s", rom_path);
 	snprintf(pending_title, sizeof(pending_title), "%s", title ? title : "");
+
+	// Reported before it is shown: this screen is not the one init() returned,
+	// so the loader knows it only if it is told, and an unload while it is up has
+	// to be able to take the display off it (gearboyscreens.h).
+	gearboyscreens_own(gearboyplay_screen);
+
 	switch_screen(gearboyplay_screen);
 }
 
@@ -829,6 +873,7 @@ static void refresh_theme(void) {
 }
 
 void gearboyplay_init(gui_config_t *cfg) {
+	page_live = true;
 	panel_h = (int)cfg->screen_height;
 	pill_row = panel_h >= PILL_ROW_NEEDS;
 	pill_y = panel_h - PILL_BOTTOM_GAP - PILL_H;
@@ -944,4 +989,80 @@ void gearboyplay_init(gui_config_t *cfg) {
 	// No back swipe: while playing, a finger moving right means "run right",
 	// not "leave". The way out is the menu, opened by pressing the middle of
 	// the picture.
+}
+
+// ---------------------------------------------------------------------------
+// unloading
+// ---------------------------------------------------------------------------
+
+// The addon's library is about to be unmapped. What has to be undone is what
+// outlives the screen:
+//
+//   * the emulator thread: leave_screen() stops it, and gearboy_stop() waits
+//     for it and frees the frame buffers it wrote (the join is the whole reason
+//     this is not left to the screen's deletion);
+//   * the touch reader, which leave_screen() hands back to LVGL through
+//     gbinput_stop() -- the same join, for a thread reading an evdev node this
+//     library opened;
+//   * the two timers. A paused timer is still a timer: it is in LVGL's list and
+//     its callback is code in the library, so both are deleted, not paused.
+//     power_forget_timer() costs nothing when the timer was never registered
+//     with power_pause_in_standby() and is what keeps the power manager from
+//     touching freed LVGL memory if one ever is;
+//   * the theme hook, whose callback is this library's code too;
+//   * every pointer into the screen, and the per-visit state, so that a second
+//     init() -- of this copy or of a reloaded one -- builds the page from
+//     nothing.
+//
+// The screen itself is the addon's (see addon.c): the shell only deletes the
+// one init() returned.
+//
+// True when this returns: both waits below are pthread_join()s on threads that
+// stop_flag makes leave, so they are gone. The answer is a bool because the
+// loader asks it of the whole addon (addon.h) -- a bounded wait added here later
+// has to be able to say "not yet".
+bool gearboyplay_stop(void) {
+	if (!page_live) {
+		return true;
+	}
+
+	// `true`: an unload is not the trip to the settings page, so the emulator is
+	// stopped even when the settings page was the way in and left it paused.
+	leave_screen(true);
+
+	if (poll_timer) {
+		power_forget_timer(poll_timer);
+		lv_timer_delete(poll_timer);
+		poll_timer = NULL;
+	}
+	if (badge_timer) {
+		power_forget_timer(badge_timer);
+		lv_timer_delete(badge_timer);
+		badge_timer = NULL;
+	}
+
+	theme_unregister_refresh(refresh_theme);
+
+	game_image = NULL;
+	pause_veil = NULL;
+	veil_label = NULL;
+	controls_bg = NULL;
+	menu_layer = NULL;
+	badge = NULL;
+	badge_icon = NULL;
+	memset(&game_dsc, 0, sizeof(game_dsc));
+
+	last_frame = 0;
+	menu_opened_ms = 0;
+	waiting_for_state = false;
+	fallback_keys = 0;
+	visiting_settings = false;
+	page_owns_chrome = false;
+	veil_state = VEIL_GONE; // so a new screen's first set_veil() does the work
+	saved_refresh_ms = 0;
+	pending_rom[0] = '\0';
+	pending_title[0] = '\0';
+
+	page_live = false;
+	return true;
 }

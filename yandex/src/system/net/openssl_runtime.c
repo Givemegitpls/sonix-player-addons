@@ -58,3 +58,17 @@ bool openssl_runtime_get(void **ssl, void **crypto) {
 	pthread_mutex_unlock(&lock);
 	return ok;
 }
+
+void openssl_runtime_close(void) {
+	pthread_mutex_lock(&lock);
+	if (shared_ssl) {
+		dlclose(shared_ssl);
+		shared_ssl = NULL;
+	}
+	if (shared_crypto) {
+		dlclose(shared_crypto);
+		shared_crypto = NULL;
+	}
+	attempted = false;
+	pthread_mutex_unlock(&lock);
+}

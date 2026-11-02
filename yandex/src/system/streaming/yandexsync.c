@@ -7,6 +7,7 @@
 
 #include "src/system/core/utils.h"
 #include "src/system/streaming/yandex.h"
+#include "src/system/streaming/yandexlive.h"
 
 // See yandexsync.h.
 
@@ -51,11 +52,20 @@ static bool load_queued; // the star asks on every redraw: one load in the queue
 // (no network, the rate limit) would otherwise be asked for on every one.
 static long load_retry_after;
 #define LOAD_RETRY_SECS 60
+// yandexsync_stop()'s way out of the worker; also what refuses new work once
+// the library is on its way out of the process.
+static bool stopping;
 
 static void *worker_main(void *arg);
 
 static void submit(const job_t *job) {
 	pthread_mutex_lock(&lock);
+	if (stopping) {
+		// The library is leaving: no thread is started for this, and the queue
+		// it would join is dropped by yandexsync_stop().
+		pthread_mutex_unlock(&lock);
+		return;
+	}
 	if (!worker_started) {
 		pthread_t thread;
 		pthread_attr_t attr;
@@ -134,6 +144,7 @@ static void run_job(const job_t *job) {
 
 static void *worker_main(void *arg) {
 	(void)arg;
+	yandexlive_enter();
 	// Nice ten, not SCHED_IDLE (which the other services' sync threads use).
 	// The likes are the one thing here, and a like is a tap waiting for its
 	// answer. With Bluetooth LDAC encoding and a track decoding, the device
@@ -147,8 +158,15 @@ static void *worker_main(void *arg) {
 	thread_be_low_priority("yandex sync");
 	for (;;) {
 		pthread_mutex_lock(&lock);
-		while (queue_len == 0) {
+		while (!stopping && queue_len == 0) {
 			pthread_cond_wait(&ready, &lock);
+		}
+		if (stopping) {
+			// A like still queued is dropped: its answer would be a callback
+			// into a library the player is unmapping, and the write itself is
+			// one the user can repeat.
+			pthread_mutex_unlock(&lock);
+			break;
 		}
 		job_t job = queue[queue_head];
 		queue_head = (queue_head + 1) % QUEUE_MAX;
@@ -159,6 +177,7 @@ static void *worker_main(void *arg) {
 		pthread_mutex_unlock(&lock);
 		run_job(&job);
 	}
+	yandexlive_leave();
 	return NULL;
 }
 
@@ -191,6 +210,26 @@ void yandexsync_likes_refresh(void (*done)(void)) {
 	}
 	job_t job = {.kind = JOB_LOAD, .changed = done};
 	submit(&job);
+}
+
+// The addon being unloaded: the worker ends, the queue is dropped, and the
+// mirror of liked ids it fills goes with yandex.c (yandex_stop()).
+bool yandexsync_stop(void) {
+	pthread_mutex_lock(&lock);
+	stopping = true;
+	queue_len = 0;
+	queue_head = 0;
+	load_queued = false;
+	pthread_cond_broadcast(&ready);
+	pthread_mutex_unlock(&lock);
+	bool safe = yandexlive_wait("the sync worker", YANDEXLIVE_WAIT_MS);
+
+	pthread_mutex_lock(&lock);
+	memset(queue, 0, sizeof(queue));
+	load_retry_after = 0;
+	worker_started = false;
+	pthread_mutex_unlock(&lock);
+	return safe;
 }
 
 // ---------------------------------------------------------------------------

@@ -157,4 +157,14 @@ void tidalcache_clear_on_exit(void);
 long tidalcache_bytes(void);
 void tidalcache_clear(void);
 
+// The addon's stop hook, for this module: no download of this cache may still
+// be running when the library is unmapped. Abandons the one in flight (the same
+// generation bump a track change uses), waits for its thread to fall out of the
+// loop (bounded, tidalworkers.h), and drops the callbacks and flags the page and
+// the power manager had come to rely on. Call after the page has stopped -- the
+// page's prefetch worker starts downloads.
+//
+// False: the download thread is still inside the library.
+bool tidalcache_stop(void);
+
 #endif /* TIDALCACHE_H */

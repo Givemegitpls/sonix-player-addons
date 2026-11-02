@@ -25,6 +25,7 @@
 #include "src/system/streaming/podcastdl.h"
 #include "src/system/streaming/yandexcache.h"
 #include "src/system/streaming/yandexcompat.h"
+#include "src/system/streaming/yandexlive.h"
 #include "src/system/streaming/yandexsaved.h"
 
 // See yandexdl.h.
@@ -52,6 +53,9 @@ static entry_t *queue; // allocated with the first entry, freed when it empties
 static int queue_len;
 static bool worker_started;
 static bool running; // an entry is being worked on
+// yandexdl_stop()'s way out of the worker, and the refusal that keeps a late
+// enqueue from starting it again while the library is being unmapped.
+static bool stopping;
 static char root[400];
 static unsigned card_epoch; // only a card/root change, unlike user cancellation
 static unsigned generation; // raised by every cancel: work from before it stops
@@ -1212,6 +1216,7 @@ static void library_look(void *user) {
 
 static void *worker_main(void *arg) {
 	(void)arg;
+	yandexlive_enter();
 	// Nice ten: a saved album is not urgent, but SCHED_IDLE would starve it
 	// for as long as anything plays (see thread_be_low_priority).
 	thread_be_low_priority("yandex save");
@@ -1219,9 +1224,17 @@ static void *worker_main(void *arg) {
 	unsigned batch_generation = 0;
 	for (;;) {
 		pthread_mutex_lock(&lock);
-		while (queue_len == 0) {
+		while (!stopping && queue_len == 0) {
 			running = false;
 			pthread_cond_wait(&ready, &lock);
+		}
+		if (stopping) {
+			// The queue has been cancelled on the way in; nothing left here is
+			// worth a request whose answer has nowhere to land.
+			running = false;
+			status.active = false;
+			pthread_mutex_unlock(&lock);
+			break;
 		}
 		entry_t e = queue[0];
 		memmove(queue, queue + 1, (size_t)(--queue_len) * sizeof(*queue));
@@ -1328,12 +1341,13 @@ static void *worker_main(void *arg) {
 			music_dirty = false;
 		}
 	}
+	yandexlive_leave();
 	return NULL;
 }
 
 static bool enqueue(const entry_t *e) {
 	pthread_mutex_lock(&lock);
-	if (!card_usable()) {
+	if (stopping || !card_usable()) {
 		pthread_mutex_unlock(&lock);
 		return false;
 	}
@@ -1447,6 +1461,39 @@ void yandexdl_cancel_all(void) {
 		printf("yandexdl: queue dropped\n");
 		tell(YANDEXDL_STOPPED, 0, tr("download_cancelled"));
 	}
+}
+
+// The addon being unloaded: the queue and the file in progress are cancelled,
+// the worker is told to end and waited for, and the status the player reads is
+// cleared.
+//
+// The cancellation is not a courtesy: the worker spends most of its life inside
+// a download, and yandexcache_fetch_cancel() is what breaks it out of its
+// socket. Without it, this would be a wait for a whole track.
+bool yandexdl_stop(void) {
+	yandexdl_cancel_all();
+
+	pthread_mutex_lock(&lock);
+	stopping = true;
+	status.queued = 0;
+	pthread_cond_broadcast(&ready);
+	pthread_mutex_unlock(&lock);
+	bool safe = yandexlive_wait("the save worker", YANDEXLIVE_WAIT_MS);
+
+	// Whatever it was doing has returned by now. What is left is memory and the
+	// status of a queue that no longer exists.
+	pthread_mutex_lock(&lock);
+	free(queue);
+	queue = NULL;
+	queue_len = 0;
+	status = (yandexdl_status_t){0};
+	status.percent = -1;
+	listener = NULL;
+	running = false;
+	root[0] = '\0';			// the next init() points it at the card again
+	worker_started = false; // it has returned: the next init() starts a fresh one
+	pthread_mutex_unlock(&lock);
+	return safe;
 }
 
 void yandexdl_set_root(const char *sd_root) {

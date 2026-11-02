@@ -83,6 +83,11 @@ void yandexdl_set_listener(void (*listener)(yandexdl_event_t event, int count, c
 // Drops the queue and the file in progress (its .part goes).
 void yandexdl_cancel_all(void);
 
+// The addon being unloaded: the queue is cancelled, the worker ends (waited
+// for), the status is cleared and the card's root forgotten. GUI thread, from
+// the addon's stop hook.
+bool yandexdl_stop(void);
+
 // The card, as the provider registry hands it (start-up, card change). A
 // different root, or none, drops everything queued for the old one.
 void yandexdl_set_root(const char *sd_root);

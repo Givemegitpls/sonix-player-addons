@@ -39,6 +39,10 @@ typedef void (*yandexplay_listener_t)(yandexplay_event_t event, const char *text
 // Registers the prepare callback with device_state. Once, at startup.
 void yandexplay_init(yandexplay_listener_t listener);
 
+// Undoes it: the prepare callback comes off device_state, the worker ends and
+// the queue is dropped. Called from the addon's stop hook on the GUI thread.
+bool yandexplay_stop(void);
+
 // Plays `list` (a copy is taken) from entry `start`: the queue becomes all of
 // it. The tapped track is fetched first unless it is on the card; the rest
 // when playback nears them. `wave`: the list is My Wave's first batch, and

@@ -184,4 +184,20 @@ void qobuzcache_clear_on_exit(void);
 long qobuzcache_bytes(void);
 void qobuzcache_clear(void);
 
+// Ends the downloads and forgets the cache: the addon is being unloaded.
+//
+// Unregisters the abandon hook from the shared download turn (a function of
+// this library, which is about to be unmapped), abandons what is in flight (the
+// socket is shut down under the blocked read), refuses the transfers that would
+// start afterwards, waits a bounded while for the download threads to unwind,
+// and drops the in-memory state that belonged to the run -- including the
+// slow-start callback.
+//
+// True when no download thread outlasted the wait; false is what makes the
+// shell keep the mapping rather than dlclose() code a thread is still running.
+//
+// **Needs the page to have stopped submitting first**: this is the half that
+// makes the prefetch thread's wait in the download turn return.
+bool qobuzcache_stop(void);
+
 #endif /* QOBUZCACHE_H */

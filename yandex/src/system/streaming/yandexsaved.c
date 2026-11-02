@@ -195,6 +195,18 @@ void yandexsaved_set_root(const char *sd_root) {
 	pthread_mutex_unlock(&lock);
 }
 
+// The addon being unloaded: the index in memory and the queue's claims go. The
+// file on the card stays -- it is the record of what was saved, and the next
+// init() reads it again -- so nothing is rewritten here.
+void yandexsaved_stop(void) {
+	pthread_mutex_lock(&lock);
+	forget_all();
+	root[0] = '\0';
+	claim_count = 0;
+	memset(claims, 0, sizeof(claims));
+	pthread_mutex_unlock(&lock);
+}
+
 void yandexsaved_add(const yandex_track_t *t, const char *album_artist, int year, int album_tracks, const char *path) {
 	if (!t || !t->id[0] || !path) {
 		return;

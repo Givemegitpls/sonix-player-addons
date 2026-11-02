@@ -20,4 +20,14 @@ void gearboyplay_init(gui_config_t *cfg);
 // Starts a game and opens the screen. The title comes from the database.
 void gearboyplay_open(const char *rom_path, const char *title);
 
+// The library is being unmapped: the emulator thread joined, the touch reader
+// handed back to LVGL, both timers deleted, the theme hook withdrawn, every
+// pointer into the screen dropped. Does not touch gearboyplay_screen, which the
+// addon deletes (see addon.c). Safe to call on a page that was never shown.
+//
+// True when both threads are out. False is the answer for a worker still inside
+// something the player cannot interrupt, and the loader then keeps the mapping
+// (addon.h).
+bool gearboyplay_stop(void);
+
 #endif /* GUI_GEARBOYPLAY_H */

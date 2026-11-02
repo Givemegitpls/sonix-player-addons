@@ -61,4 +61,11 @@ void tidalsync_playlists_refresh(void (*done)(void));
 int tidalsync_playlists(tidal_playlist_t *out, int max);
 bool tidalsync_playlists_known(void);
 
+// The addon's stop hook: the worker told to leave and waited for, the job in the
+// slot dropped, the mirror forgotten. On the GUI thread, like the rest of the
+// stop contract (addon.h); the library may be dlclose()d when it returns. False
+// when the worker is still inside it, which the shell answers by keeping the
+// mapping.
+bool tidalsync_stop(void);
+
 #endif /* TIDALSYNC_H */

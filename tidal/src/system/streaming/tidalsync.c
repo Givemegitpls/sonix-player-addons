@@ -6,6 +6,7 @@
 
 #include "src/system/core/utils.h"
 #include "src/system/core/lang.h"
+#include "tidalworkers.h"
 
 // How many favourites fit in the local mirror. Beyond this the oldest show an
 // empty star until touched: the price of not asking Tidal whether each track is
@@ -118,6 +119,12 @@ static job_t pending;
 static bool have_pending;
 static bool worker_started;
 
+// The addon is being unloaded: the worker leaves at its next look and no new
+// one is started. Under job_lock, like the rest of the loop's state.
+static bool worker_quit;
+
+static tidalworkers_t sync_workers = TIDALWORKERS_INIT;
+
 static void do_favorites_load(const job_t *job) {
 	long ids[FAVORITES_MAX];
 	int count = tidal_favorite_track_ids(ids, FAVORITES_MAX);
@@ -222,8 +229,15 @@ static void *worker_main(void *arg) {
 
 	for (;;) {
 		pthread_mutex_lock(&job_lock);
-		while (!have_pending) {
+		while (!have_pending && !worker_quit) {
 			pthread_cond_wait(&job_ready, &job_lock);
+		}
+		// Unloading. The job in the slot is dropped rather than run: it is a
+		// request to write to the account, and its `done` is a callback into a
+		// library that is leaving.
+		if (worker_quit) {
+			pthread_mutex_unlock(&job_lock);
+			break;
 		}
 		job_t job = pending;
 		have_pending = false;
@@ -255,17 +269,30 @@ static void *worker_main(void *arg) {
 			break;
 		}
 	}
+	tidalworkers_done(&sync_workers);
 	return NULL;
 }
 
 static void submit(const job_t *job) {
 	pthread_mutex_lock(&job_lock);
+	// Unloading: the answer is the same one a failed start gives, and the
+	// caller is still there to hear it (submit() is called from the GUI thread
+	// and its own workers, and stop() runs on the GUI thread).
+	if (worker_quit) {
+		pthread_mutex_unlock(&job_lock);
+		if (job->done) {
+			job->done(false, tr("cannot_start_the_request"), job->user);
+		}
+		return;
+	}
 	if (!worker_started) {
+		tidalworkers_add(&sync_workers);
 		pthread_t thread;
 		if (pthread_create(&thread, NULL, worker_main, NULL) == 0) {
 			pthread_detach(thread);
 			worker_started = true;
 		} else {
+			tidalworkers_done(&sync_workers);
 			pthread_mutex_unlock(&job_lock);
 			if (job->done) {
 				job->done(false, tr("cannot_start_the_request"), job->user);
@@ -373,4 +400,51 @@ int tidalsync_playlists(tidal_playlist_t *out, int max) {
 	memcpy(out, playlists, sizeof(tidal_playlist_t) * (size_t)count);
 	pthread_mutex_unlock(&lock);
 	return count;
+}
+
+// ---------------------------------------------------------------------------
+// stopping
+// ---------------------------------------------------------------------------
+
+// Nothing of this module is left running in the process.
+//
+// The worker is told to leave and waited for. A job still waiting in the slot is
+// dropped rather than run: it carries the caller's `done`, a callback into a
+// library that is about to be unmapped, and finishing it after the unload is a
+// write into the account from code that no longer exists. A job the worker had
+// already taken finishes -- it is one request, and the worker is the only thing
+// reading the slot by then.
+//
+// False: the worker is still inside the library, and the caller keeps the
+// mapping (addon.h).
+bool tidalsync_stop(void) {
+	pthread_mutex_lock(&job_lock);
+	worker_quit = true;
+	have_pending = false;
+	pthread_cond_broadcast(&job_ready);
+	pthread_mutex_unlock(&job_lock);
+
+	bool gone = tidalworkers_wait(&sync_workers, "the sync worker");
+
+	pthread_mutex_lock(&job_lock);
+	memset(&pending, 0, sizeof(pending));
+	worker_started = false;
+	// Cleared for the same reason as the page's flags: the one way init() runs
+	// again in this process is the one that leaves the library mapped, and a
+	// star that could no longer be pressed would be a dead page. Only when the
+	// worker is really out -- one still inside must keep seeing this until it
+	// has left. Nothing can submit between here and the unload: both are this
+	// thread's.
+	if (gone) {
+		worker_quit = false;
+	}
+	pthread_mutex_unlock(&job_lock);
+
+	// The mirror and the playlists are one account's, and this library's
+	// memory: a second init() -- a dlclose() that failed and the next tap
+	// running init() again -- must not answer the star from a session that has
+	// been read once already.
+	tidalsync_forget();
+
+	return gone;
 }

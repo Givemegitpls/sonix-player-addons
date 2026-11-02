@@ -84,4 +84,11 @@ void zvukcache_set_protected(const char *const *paths, int count);
 void zvukcache_clear(void);
 void zvukcache_clear_on_exit(void);
 
+// Stops the module for good: the abandon hook is taken back out of the player's
+// table, the download in flight is abandoned, the thread that was running it is
+// waited for, and the card and the paths held are forgotten. False when that
+// wait ran out -- a thread is still inside the library. src/addon/addon.h, "the
+// stop half"; init() afterwards is a fresh start.
+bool zvukcache_stop(void);
+
 #endif /* ZVUKCACHE_H */

@@ -1,5 +1,6 @@
 #include "tidalpage.h"
 
+#include "src/addon/addon.h"
 #include "src/gui/streaming/listart.h"
 #include "src/system/device/power.h"
 
@@ -11,6 +12,7 @@
 #include <sys/time.h>
 #include <malloc.h>
 
+#include "common/listrow.h"
 #include "src/gui/shell/confirm.h"
 #include "src/gui/fonts/fonts.h"
 #include "src/gui/shell/icons_select.h"
@@ -33,6 +35,7 @@
 #include "src/system/streaming/tidalservice.h"
 #include "src/system/streaming/streamturn.h"
 #include "src/system/streaming/tidalsync.h"
+#include "src/system/streaming/tidalworkers.h"
 #include "src/system/core/utils.h"
 #include "src/system/net/wifi.h"
 #include "src/system/net/wifitransfer.h"
@@ -65,6 +68,20 @@ static lv_obj_t *login_screen;
 lv_obj_t *tidal_list_screen;
 #define list_screen tidal_list_screen
 static lv_obj_t *search_screen;
+
+// The host's name for this addon, cached by tidalpage_init(). Every screen this
+// file builds is handed to the shell with it as it is made
+// (sonix_addon_own_screen): that list is what addon_unload() walks to move the
+// display off whichever page is up and to delete them all once stop() has
+// returned. A screen missing from it is a page left standing with widget
+// callbacks pointing into a library that is about to be unmapped.
+static char self_id[ADDON_ID_MAX];
+
+// What the player remembers of this page rather than the page of itself: the
+// three theme refreshes, the device_state prepare callback and the cache's
+// slow-start notice. Set once init() has registered all of them, cleared by
+// tidalpage_stop() when it withdraws them.
+static bool page_hooks_installed;
 
 // Global rather than behind a function: the Streaming grid wants the address
 // of the variable (grid_entry_t.target), as for every other page.
@@ -109,6 +126,15 @@ static pthread_cond_t job_ready = PTHREAD_COND_INITIALIZER;
 static job_t pending;
 static bool have_pending;
 static bool worker_started;
+
+// The page is being unloaded. The worker leaves at its next look, and submit()
+// starts no new one -- code in a library nobody is going to load again must not
+// begin running. Guarded by job_lock, like everything else the loop waits on.
+static bool worker_quit;
+
+// The two workers of this page -- this one and the prefetch -- as the stop()
+// hook has to see them: counted, and waited for (tidalworkers.h).
+static tidalworkers_t page_workers = TIDALWORKERS_INIT;
 
 // Job generation: when it changes, a late result belongs to a request nobody
 // cares about any more and is discarded.
@@ -1157,6 +1183,10 @@ static pthread_cond_t prefetch_ready = PTHREAD_COND_INITIALIZER;
 static long prefetch_want_id;
 static bool prefetch_started;
 
+// The same one-way signal as worker_quit, for the other thread: read and
+// written under prefetch_lock, which is what the loop is parked on anyway.
+static bool prefetch_quit;
+
 // The last track that failed to download and when it was tried: wait a moment
 // before going at the same id again.
 static long prefetch_failed_id;
@@ -1173,11 +1203,20 @@ static void prefetch_submit(int index) {
 	(void)index;
 	pthread_mutex_lock(&prefetch_lock);
 
+	// Called from the worker too (do_play), so the flag is always read under
+	// the lock the stop() hook writes it with.
+	if (prefetch_quit) {
+		pthread_mutex_unlock(&prefetch_lock);
+		return;
+	}
 	if (!prefetch_started) {
+		tidalworkers_add(&page_workers);
 		pthread_t thread;
 		if (pthread_create(&thread, NULL, prefetch_main, NULL) == 0) {
 			pthread_detach(thread);
 			prefetch_started = true;
+		} else {
+			tidalworkers_done(&page_workers);
 		}
 	}
 	pthread_cond_broadcast(&prefetch_ready);
@@ -1417,6 +1456,11 @@ static void do_play(int index) {
 
 // ---------------------------------------------------------------------------
 
+// The queue watchdog's timer. Stored rather than created and forgotten: the
+// power manager keeps its own record of it (power_slow_in_standby), and an
+// unload has to take it out of that record before deleting it.
+static lv_timer_t *queue_timer;
+
 // The queue watchdog, once a second on the GUI thread.
 //
 // It does two things, both of which need to know where playback is -- which
@@ -1519,14 +1563,28 @@ static void queue_watch_cb(lv_timer_t *timer) {
 	tidalcache_set_network_wanted(want_id != 0 || waiting_for_track);
 }
 
+// "Is this thread still wanted?" -- asked between the steps of the loop, which
+// are seconds apart, so that an unload does not wait for a whole track's
+// manifest fetch before it can report the thread gone.
+static bool prefetch_stopping(void) {
+	pthread_mutex_lock(&prefetch_lock);
+	bool stopping = prefetch_quit;
+	pthread_mutex_unlock(&prefetch_lock);
+	return stopping;
+}
+
 static void *prefetch_main(void *arg) {
 	(void)arg;
 	thread_be_background("tidal prefetch");
 
 	for (;;) {
 		pthread_mutex_lock(&prefetch_lock);
-		while (prefetch_want_id == 0) {
+		while (prefetch_want_id == 0 && !prefetch_quit) {
 			pthread_cond_wait(&prefetch_ready, &prefetch_lock);
+		}
+		if (prefetch_quit) {
+			pthread_mutex_unlock(&prefetch_lock);
+			break;
 		}
 		long id = prefetch_want_id;
 		pthread_mutex_unlock(&prefetch_lock);
@@ -1564,6 +1622,13 @@ static void *prefetch_main(void *arg) {
 
 		tidal_track_t track = queued_tracks[index];
 		tidalcache_wait_idle();
+
+		// The turn can be minutes away (see the top of this section), and an
+		// unload that happened while waiting for it must not be followed by a
+		// download started into a library on its way out.
+		if (prefetch_stopping()) {
+			break;
+		}
 
 		// The request may have changed while waiting for a turn: prev is
 		// pressed and another track is needed. Without this check the one
@@ -1614,6 +1679,7 @@ static void *prefetch_main(void *arg) {
 			gui_post(resume_if_waiting_async, NULL);
 		}
 	}
+	tidalworkers_done(&page_workers);
 	return NULL;
 }
 
@@ -1632,8 +1698,14 @@ static void *worker_main(void *arg) {
 
 	for (;;) {
 		pthread_mutex_lock(&job_lock);
-		while (!have_pending) {
+		while (!have_pending && !worker_quit) {
 			pthread_cond_wait(&job_ready, &job_lock);
+		}
+		// The page is going away: nothing in the slot is worth answering, and
+		// answering it would draw into screens that are about to be deleted.
+		if (worker_quit) {
+			pthread_mutex_unlock(&job_lock);
+			break;
 		}
 
 		// The previous result must have been taken, or it would be overwritten.
@@ -1645,11 +1717,17 @@ static void *worker_main(void *arg) {
 			gettimeofday(&now, NULL);
 			until.tv_sec = now.tv_sec + 2;
 			until.tv_nsec = now.tv_usec * 1000;
-			while (result_pending) {
+			while (result_pending && !worker_quit) {
 				if (pthread_cond_timedwait(&result_taken, &job_lock, &until) == ETIMEDOUT) {
 					break;
 				}
 			}
+		}
+		// An unload broadcast result_taken as well, so this is where a stop
+		// that happened while the worker was parked on it is seen.
+		if (worker_quit) {
+			pthread_mutex_unlock(&job_lock);
+			break;
 		}
 
 		job_t job = pending;
@@ -1799,17 +1877,26 @@ static void *worker_main(void *arg) {
 		pthread_mutex_unlock(&job_lock);
 		gui_post(job_done_cb, NULL);
 	}
+
+	// The library may be unmapped the moment stop() returns; this is what
+	// tells it that it can.
+	tidalworkers_done(&page_workers);
 	return NULL;
 }
 
 static void start_worker(void) {
-	if (worker_started) {
+	// No new thread once the page is being unloaded: it would be one nobody
+	// waits for, running code that is about to disappear under it.
+	if (worker_started || worker_quit) {
 		return;
 	}
+	tidalworkers_add(&page_workers);
 	pthread_t thread;
 	if (pthread_create(&thread, NULL, worker_main, NULL) == 0) {
 		pthread_detach(thread);
 		worker_started = true;
+	} else {
+		tidalworkers_done(&page_workers);
 	}
 }
 
@@ -2097,6 +2184,7 @@ static void open_search_cb(lv_event_t *e) {
 
 static void build_search_page(gui_config_t *cfg) {
 	search_screen = lv_obj_create(NULL);
+	sonix_addon_own_screen(self_id, search_screen);
 	lv_obj_add_style(search_screen, &theme_style_screen, 0);
 
 	settingsrow_title(search_screen, cfg, "tidal_search_tidal");
@@ -2421,6 +2509,7 @@ static void paint_login(void) {
 
 static void build_login_page(gui_config_t *cfg) {
 	login_screen = lv_obj_create(NULL);
+	sonix_addon_own_screen(self_id, login_screen);
 	lv_obj_add_style(login_screen, &theme_style_screen, 0);
 
 	settingsrow_title(login_screen, cfg, "tidal_sign_in_to_tidal");
@@ -2670,6 +2759,7 @@ static void open_settings_cb(lv_event_t *e) {
 
 static void build_settings_page(gui_config_t *cfg) {
 	tsettings_screen = lv_obj_create(NULL);
+	sonix_addon_own_screen(self_id, tsettings_screen);
 	lv_obj_t *container = settingsrow_page(tsettings_screen, cfg, "tidal_settings");
 
 	// Quality: a card with the name on top and the four pills below, exactly
@@ -2890,6 +2980,7 @@ static void home_loaded_cb(lv_event_t *e) {
 
 static void build_list_page(gui_config_t *cfg) {
 	list_screen = lv_obj_create(NULL);
+	sonix_addon_own_screen(self_id, list_screen);
 	lv_obj_add_event_cb(list_screen, list_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 	lv_obj_add_event_cb(list_screen, list_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
 	list_container = settingsrow_page(list_screen, cfg, "tidal");
@@ -2913,8 +3004,14 @@ static void build_list_page(gui_config_t *cfg) {
 	player_sheet_attach_drag(list_container, true);
 }
 
-void tidalpage_init(gui_config_t *cfg) {
+void tidalpage_init(gui_config_t *cfg, const char *id) {
+	// The name the shell knows this addon by, before the first screen asks for
+	// it: it is the key of the screen list, and a pointer alone would not say
+	// whose page it is.
+	lv_snprintf(self_id, sizeof(self_id), "%s", id ? id : "");
+
 	tidal_screen = lv_obj_create(NULL);
+	sonix_addon_own_screen(self_id, tidal_screen);
 	home_container = settingsrow_page(tidal_screen, cfg, "tidal");
 
 	// Two buttons top right, like the Music page gear. The title has to be
@@ -2936,9 +3033,18 @@ void tidalpage_init(gui_config_t *cfg) {
 	// a Tidal one returns true immediately.
 	device_state_add_prepare_cb(tidalpage_prepare_track);
 
+	// Everything above that is in the player's hands rather than the page's:
+	// the three theme hooks the builders registered, the prepare callback, and
+	// the cache's slow-start notice. tidalpage_stop() withdraws them, and this
+	// flag is what tells it there is something to withdraw -- the theme hooks
+	// are registered deep inside the builders, where a "did we register" test
+	// of their own would be four copies of the same bool.
+	page_hooks_installed = true;
+
 	// The queue watchdog: tells the prefetch thread how far the ready tracks
 	// reach. One second is enough -- these are tracks, not frames.
-	power_slow_in_standby(lv_timer_create(queue_watch_cb, 1000, NULL), 5000); // see qobuzpage.c
+	queue_timer = lv_timer_create(queue_watch_cb, 1000, NULL);
+	power_slow_in_standby(queue_timer, 5000); // see qobuzpage.c
 	// Created paused: the first cover request resumes it.
 	art_timer = lv_timer_create(art_poll_cb, 120, NULL);
 	lv_timer_pause(art_timer);
@@ -2957,4 +3063,206 @@ void tidalpage_init(gui_config_t *cfg) {
 	// The mark over the artwork and "show album" belong to the service
 	// table, which the page is the only part of the player able to fill.
 	tidal_service_attach_gui(&icon_tidal_badge, (void *)tidalpage_open_album);
+}
+
+// ---------------------------------------------------------------------------
+// stopping
+// ---------------------------------------------------------------------------
+//
+// The page going away: the card was pulled, a rescan found the .so changed, or
+// an update is about to be written over the file the library is mapped from.
+// This runs on the GUI thread, and the loader dlclose()s the library after it
+// returns, so all of it is about leaving nothing in the process that names code
+// which is about to be unmapped: a thread, a timer, a hook, a widget callback,
+// a pointer into this library's data.
+//
+// The screens are not touched here. Each was registered with the shell as it
+// was built (sonix_addon_own_screen), and the loader moves the display off
+// whichever one is up, forgets them in the back-stack and the player sheet, and
+// deletes them after this returns -- screens it deletes, not this file.
+//
+// False means a worker is still inside the library: the shell keeps the mapping
+// rather than unmapping code something is executing (addon.h).
+bool tidalpage_stop(void) {
+	// 1. Our callbacks inside player overlays, and the busy veil. A confirm
+	// dialog remembers the action it is going to run, a popover remembers the
+	// menu items, and neither is visible to the loader's scan of the GUI queue
+	// (addon.c drops posted calls, not LVGL callbacks). The veil is ours and is
+	// deleted rather than hidden: it lives on the system layer, which no screen
+	// owns, so nothing else will ever take it away.
+	popover_close();
+	confirm_close();
+	if (busy_layer) {
+		lv_obj_delete(busy_layer);
+		busy_layer = NULL;
+	}
+
+	// The login poll, which is a timer of the page and belongs to the login
+	// page's own way of ending.
+	login_stop();
+
+	// 2. Timers. All of them were created on this thread, so none is running
+	// right now. The watchdog also sits in the power manager's standby record,
+	// and that record is a list of pointers walked when the panel goes dark:
+	// deleting the timer without handing the record back would leave it naming
+	// freed memory.
+	if (queue_timer) {
+		power_forget_timer(queue_timer);
+		lv_timer_delete(queue_timer);
+		queue_timer = NULL;
+	}
+	if (art_timer) {
+		lv_timer_delete(art_timer);
+		art_timer = NULL;
+	}
+	if (art_drop_timer) {
+		lv_timer_delete(art_drop_timer);
+		art_drop_timer = NULL;
+	}
+
+	// 3. The hooks into the player, each called from one of its threads: a
+	// theme change, the queue asking "can this play", the cache reporting a
+	// slow prebuffer.
+	if (page_hooks_installed) {
+		theme_unregister_refresh(paint_search_pills);
+		theme_unregister_refresh(paint_login);
+		theme_unregister_refresh(quality_refresh);
+		device_state_remove_prepare_cb(tidalpage_prepare_track);
+		tidalcache_set_slow_start_cb(NULL);
+		page_hooks_installed = false;
+	}
+
+	// 4. The two workers, told to leave and then waited for. The flag and the
+	// broadcast are one step under the lock the loop is parked on: a flag set
+	// without the broadcast leaves the thread asleep until its own timeout,
+	// which for the prefetch is no timeout at all. The worker waiting for the
+	// GUI to take a result is parked on the other condition, which is why that
+	// one is broadcast as well.
+	pthread_mutex_lock(&job_lock);
+	worker_quit = true;
+	have_pending = false;
+	pthread_cond_broadcast(&job_ready);
+	pthread_cond_broadcast(&result_taken);
+	pthread_mutex_unlock(&job_lock);
+
+	pthread_mutex_lock(&prefetch_lock);
+	prefetch_quit = true;
+	prefetch_want_id = 0;
+	pthread_cond_broadcast(&prefetch_ready);
+	pthread_mutex_unlock(&prefetch_lock);
+
+	// Both are counted together, so this is one bound for the pair and not two
+	// bounds in a row (tidalworkers.h says why the bound exists at all).
+	//
+	// The abandon before the wait: the prefetch worker may be parked in the
+	// shared download turn (streamturn.h), and the only thing that lets it out
+	// is the download it is waiting for being cancelled. The generation bump is
+	// also what wakes the socket, so what would otherwise be a read that lasts
+	// the twenty-second timeout is over at the next chunk.
+	tidalcache_abandon_all();
+
+	// The flags are cleared again once everyone is out, and only then: the one
+	// way init() runs a second time in this process is the one that leaves the
+	// library mapped -- dlclose() having failed, which is what a thread that
+	// did not stop causes -- and a page that then refused every job would be a
+	// page that does nothing. Nothing can submit in between: the loader's next
+	// steps all run on this thread.
+	bool workers_gone = tidalworkers_wait(&page_workers, "a page worker");
+	if (workers_gone) {
+		pthread_mutex_lock(&job_lock);
+		worker_quit = false;
+		pthread_mutex_unlock(&job_lock);
+		pthread_mutex_lock(&prefetch_lock);
+		prefetch_quit = false;
+		pthread_mutex_unlock(&prefetch_lock);
+	}
+
+	// 5. The covers. The twelve slots belong to the player's loader and are
+	// given back before the rows that point at them go; the decoded pictures
+	// are this library's memory. Nothing here touches a widget: the rows
+	// themselves are the screens' and are deleted with them by the loader.
+	art_forget_rows();
+
+	// And the list-row layer's poll timer. Tidal draws its own rows
+	// (tidalpage.c keeps the bookkeeping listart wants, for the history and the
+	// cover drop), so nothing is bound here and the call is a no-op today -- it
+	// stays because a paused timer is not a child of any widget: if this page
+	// ever binds a row, that timer would outlive the screens and fire into a
+	// library that has been unmapped (common/listrow.h).
+	listrow_stop();
+
+	// 6. State, so that a second init() in the same process -- what a failed
+	// dlclose() leads to, the library staying mapped and the next tap building
+	// the page again -- starts from what a fresh library would have.
+	worker_started = false;
+	job_serial = 0;
+	memset(&pending, 0, sizeof(pending));
+	have_pending = false;
+	result_pending = false;
+	result_kind = JOB_NONE;
+	result_count = 0;
+	result_from = 0;
+	result_featured_gone = -1;
+	result_title[0] = '\0';
+	result_error[0] = '\0';
+	list_kind = JOB_NONE;
+	page_more = false;
+	page_loading = false;
+
+	list_history_len = 0;
+	have_current_list = false;
+	inflight_valid = false;
+	memset(&inflight_job, 0, sizeof(inflight_job));
+	memset(&current_list_job, 0, sizeof(current_list_job));
+
+	menu_index = -1;
+	sync_message[0] = '\0';
+
+	search_kind_index = 0;
+	prefetch_started = false;
+	prefetch_want_id = 0;
+	prefetch_failed_id = 0;
+	prefetch_failed_ms = 0;
+	queued_count = 0;
+	waiting_for_track = false;
+
+	memset(&login, 0, sizeof(login));
+	memset(&login_result, 0, sizeof(login_result));
+	login_elapsed = 0;
+	featured_reset();
+
+	// 7. And no static naming any of it. The screens themselves are the
+	// loader's now: it holds the list this file filled through
+	// sonix_addon_own_screen() and deletes them once this has returned.
+	tidal_screen = NULL;
+	tidal_list_screen = NULL;
+	search_screen = NULL;
+	tsettings_screen = NULL;
+	login_screen = NULL;
+	home_container = NULL;
+	settings_btn = NULL;
+	search_btn = NULL;
+	list_container = NULL;
+	list_title = NULL;
+	list_empty = NULL;
+	search_field = NULL;
+	search_clear_btn = NULL;
+	search_keyboard = NULL;
+	for (int i = 0; i < 3; i++) {
+		search_pills[i] = NULL;
+	}
+	login_hint = NULL;
+	login_qr = NULL;
+	login_url = NULL;
+	login_code = NULL;
+	login_spin = NULL;
+	login_message = NULL;
+	login_retry = NULL;
+	for (int i = 0; i < 4; i++) {
+		quality_pills[i] = NULL;
+	}
+
+	// The one answer this hook has: are the workers really out. Everything
+	// else here either happened or is the loader's to finish.
+	return workers_gone;
 }

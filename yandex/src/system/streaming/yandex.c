@@ -261,15 +261,11 @@ bool yandex_logged_in(void) { return access_token[0] != '\0'; }
 
 const char *yandex_display_name(void) { return display_name; }
 
-void yandex_logout(void) {
-	pthread_mutex_lock(&session_lock);
-	access_token[0] = refresh_token[0] = user_uid[0] = display_name[0] = '\0';
-	token_expires_at = 0;
-	save_session();
-	pthread_mutex_unlock(&session_lock);
-	pthread_mutex_lock(&wave_lock);
-	wave_session[0] = wave_batch[0] = '\0';
-	pthread_mutex_unlock(&wave_lock);
+// The mirror of liked ids and the two sets built from them, dropped without
+// touching the card. Signing out writes the session and this; unloading (see
+// yandex_stop) must not write anything, so the two cannot share the whole of
+// their bodies but they share this.
+static void liked_forget(void) {
 	pthread_mutex_lock(&liked_lock);
 	free(liked_nums);
 	free(liked_other);
@@ -280,6 +276,18 @@ void yandex_logout(void) {
 	liked_artists.count = liked_albums.count = 0;
 	liked_artists.known = liked_albums.known = false;
 	pthread_mutex_unlock(&liked_lock);
+}
+
+void yandex_logout(void) {
+	pthread_mutex_lock(&session_lock);
+	access_token[0] = refresh_token[0] = user_uid[0] = display_name[0] = '\0';
+	token_expires_at = 0;
+	save_session();
+	pthread_mutex_unlock(&session_lock);
+	pthread_mutex_lock(&wave_lock);
+	wave_session[0] = wave_batch[0] = '\0';
+	pthread_mutex_unlock(&wave_lock);
+	liked_forget();
 }
 
 // ---------------------------------------------------------------------------
@@ -340,10 +348,30 @@ static void pace_ok(void) {
 static bool is_refusal(int status, const char *body) { return status == 429 || (body && (strstr(body, "showcaptcha") || strstr(body, "SmartCaptcha"))); }
 
 // ---------------------------------------------------------------------------
+// requests during unloading
+//
+// The workers of this addon are detached and have no flag of their own for the
+// network calls they are in the middle of -- http.h can wake a stream reader
+// and nothing else. What can be done is to stop the *next* request of a loop:
+// reading the liked ids is a page a request, a third of a second apart, and on
+// an account with thousands of likes that is the longest thing any of these
+// threads does. stop() has a couple of seconds for it, so this turns "the next
+// page" into "return now".
+//
+// One way: set here and never cleared (the player dlclose()s the library and a
+// reload maps a fresh copy, so there is nothing to re-arm).
+static volatile bool halted;
+
+void yandex_halt_requests(void) { halted = true; }
+
+// ---------------------------------------------------------------------------
 // OAuth
 // ---------------------------------------------------------------------------
 
 static bool auth_post(const char *path, const char *form, char **body, json_doc_t *doc, int *status) {
+	if (halted) {
+		return false;
+	}
 	if (!pace_allows()) {
 		return false;
 	}
@@ -523,6 +551,13 @@ static bool api(const char *method, const char *url, const char *form, const cha
 	last_status = 0;
 	last_body[0] = '\0';
 	*body = NULL;
+	if (halted) {
+		// See yandex_halt_requests(): the addon is being unloaded, and the loop
+		// that called us (a list of pages) has to end now rather than at its
+		// next page.
+		set_error("%s", "the addon is being unloaded");
+		return false;
+	}
 	if (!yandex_configured()) {
 		set_error("%s", tr("api_keys_unavailable"));
 		return false;
@@ -2468,4 +2503,57 @@ bool yandex_file_info(const char *track_id, yandex_file_t *out) {
 		check_plus();
 	}
 	return true;
+}
+
+// ---------------------------------------------------------------------------
+// unloading
+// ---------------------------------------------------------------------------
+
+// The addon being unloaded: everything this module holds in memory goes, and
+// nothing is written back.
+//
+// This is not yandex_logout(): the session on the card is the user's, they are
+// still signed in after the card is put back, and a save here would sign them
+// out by pulling a card. What goes is the copy in RAM -- which is also what
+// makes the second init() of the same .so read the card again rather than
+// answer from a state its own stop() half-cleared.
+void yandex_stop(void) {
+	halted = true;
+
+	pthread_mutex_lock(&session_lock);
+	access_token[0] = refresh_token[0] = user_uid[0] = display_name[0] = '\0';
+	token_expires_at = 0;
+	pthread_mutex_unlock(&session_lock);
+
+	pthread_mutex_lock(&wave_lock);
+	wave_session[0] = wave_batch[0] = '\0';
+	memset(wave_batches, 0, sizeof(wave_batches));
+	wave_batches_next = 0;
+	pthread_mutex_unlock(&wave_lock);
+
+	liked_forget();
+
+	// The keys and the two addresses: read from the card at init, and a reload
+	// after a card change reads them again. A key left in memory is a key that
+	// would be signed against the wrong card's settings.
+	memset(key_client_id, 0, sizeof(key_client_id));
+	memset(key_client_secret, 0, sizeof(key_client_secret));
+	memset(key_sign, 0, sizeof(key_sign));
+	memset(key_header, 0, sizeof(key_header));
+	memset(api_url, 0, sizeof(api_url));
+	memset(auth_url, 0, sizeof(auth_url));
+
+	// The pacing and what the service last said about the account: a back-off
+	// belongs to a card and an account that are not this one any more.
+	pthread_mutex_lock(&pace_lock);
+	last_request = (struct timespec){0};
+	blocked_until = 0;
+	strikes = 0;
+	pthread_mutex_unlock(&pace_lock);
+	plus_state = -1;
+	encraw_strikes = 0;
+
+	pthread_mutex_lock(&format_lock);
+	last_format[0] = '\0';
+	pthread_mutex_unlock(&format_lock);
 }

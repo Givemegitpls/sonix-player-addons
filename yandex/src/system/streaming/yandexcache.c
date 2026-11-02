@@ -21,6 +21,7 @@
 #include "src/system/streaming/streamturn.h"
 #include "src/system/streaming/streamcover.h"
 #include "src/system/streaming/yandexcompat.h"
+#include "src/system/streaming/yandexlive.h"
 #include "src/system/device/system.h"
 
 // See yandexcache.h.
@@ -638,6 +639,10 @@ static bool unwrap_mp4(download_t *d) {
 
 static void *download_main(void *arg) {
 	download_t *d = arg;
+	// Counted in yandexlive for the whole of it: stop() waits for this count
+	// before it forgets the card and closes libcrypto, and this thread is the
+	// one that reads both.
+	yandexlive_enter();
 	// Below the interface and the audio threads, so the TLS and the card
 	// writes of a download give way to them on this single core; but not idle
 	// class like a sync thread, because playback is reading this file as it
@@ -683,6 +688,7 @@ static void *download_main(void *arg) {
 	}
 	pthread_mutex_unlock(&lock);
 	free(d);
+	yandexlive_leave();
 	return NULL;
 }
 
@@ -749,7 +755,12 @@ void yandexcache_fetch_cancel(void) {
 	pthread_mutex_unlock(&lock);
 }
 
+// The turn's abandon table: an entry in it is a function pointer into this
+// library, so it is registered when the first download needs it and taken back
+// by yandexcache_stop() -- the player unmaps the library, and the next abandon
+// from another service would otherwise be a call into unmapped code.
 static void streamturn_hook(void) { yandexcache_abandon_all(); }
+static bool abandon_registered;
 
 static void prune(long room); // below, with the rest of the cache's bounds
 
@@ -758,9 +769,11 @@ bool yandexcache_start(const yandex_track_t *track, const yandex_file_t *file, c
 	if (out && size) {
 		out[0] = '\0';
 	}
-	static bool registered;
-	if (!registered) {
-		registered = true;
+	if (!abandon_registered) {
+		// Two callers can reach this at once (the play worker and the save
+		// worker); streamturn_register_abandon() ignores a second copy of the
+		// same function, so the worst a race costs is a redundant call.
+		abandon_registered = true;
 		streamturn_register_abandon(streamturn_hook);
 	}
 	if (!yandexcache_ready()) {
@@ -1089,6 +1102,45 @@ void yandexcache_clear_on_exit(void) {
 	printf("yandexcache: shutting down, clearing the cache\n");
 	yandexcache_abandon_all();
 	clear_files(NULL);
+}
+
+// The addon being unloaded: every download gives up, the thread of
+// download_main is waited for, the streamturn hook is taken back, and the module
+// forgets the card.
+//
+// The files stay -- what is on the card is the user's, and a cache is re-read
+// by the next run -- but the state that names them goes, so that a reload does
+// not believe a directory it has not opened yet. A fetch running on somebody
+// else's thread (yandexdl's worker, given a FILE of its own) is stopped with
+// that module: nothing here owns it.
+bool yandexcache_stop(void) {
+	yandexcache_abandon_all();
+	bool safe = yandexlive_wait("the cache", YANDEXLIVE_WAIT_MS);
+
+	// After the wait, and never before: abandon_all is reached from other
+	// services' workers, and the pointer must stay valid for as long as any of
+	// this addon's downloads can still be abandoned by it.
+	if (abandon_registered) {
+		streamturn_unregister_abandon(streamturn_hook);
+		abandon_registered = false;
+	}
+
+	pthread_mutex_lock(&lock);
+	cache_dir[0] = '\0';
+	current = NULL;	 // its thread has returned and freed it
+	detached = NULL;
+	sidecar_generation++; // answers already on their way belong to the old card
+	pthread_mutex_unlock(&lock);
+
+	network_wanted = false;
+	pthread_mutex_lock(&keep_lock);
+	protected_count = 0;
+	memset(protected_paths, 0, sizeof(protected_paths));
+	memset(recent_paths, 0, sizeof(recent_paths));
+	recent_next = 0;
+	played_since_clear = 0;
+	pthread_mutex_unlock(&keep_lock);
+	return safe;
 }
 
 // ---------------------------------------------------------------------------

@@ -62,4 +62,10 @@ bool crypto_aes_ctr_available(size_t key_len);
 // unavailable AES.
 bool crypto_aes128_cbc_decrypt(const uint8_t key[CRYPTO_AES128_KEY_SIZE], const uint8_t iv[CRYPTO_AES_BLOCK_SIZE], const uint8_t *in, uint8_t *out, size_t len, bool strip_padding, size_t *out_len);
 
+// The addon being unloaded (addon.h's stop): the resolved functions and the
+// handle they came from are forgotten, so a reload resolves them again instead
+// of calling through a library that has been closed. Called after the last
+// download has returned and before openssl_runtime_close().
+void crypto_forget(void);
+
 #endif /* CRYPTO_H */

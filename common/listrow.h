@@ -86,4 +86,11 @@ void listrow_reset(void *owner);
 // pages that recycle widgets or want the slot back before the object dies.
 void listrow_forget(lv_obj_t *row);
 
+// The whole addon is being unloaded: delete the poll timer and forget every row
+// and every owner. The timer is not a child of any widget, so deleting the page
+// does not take it with it, and it is paused rather than stopped when idle --
+// a paused timer whose callback is in a dlclose()d library is a crash on the
+// next tick. Call from the addon's stop(), after listrow_reset().
+void listrow_stop(void);
+
 #endif /* ADDON_LISTROW_H */

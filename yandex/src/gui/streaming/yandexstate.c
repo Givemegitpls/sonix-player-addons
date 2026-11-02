@@ -5,11 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "src/addon/addon.h"
 #include "src/gui/shell/gui.h"
 #include "src/gui/shell/settingsrow.h"
 
 #include "src/system/streaming/yandex.h"
 #include "src/system/streaming/yandexconf.h"
+#include "src/system/streaming/yandexlive.h"
 #include "src/system/streaming/yandexplay.h"
 #include "src/system/streaming/yandexwave.h"
 
@@ -24,6 +26,15 @@
 // card with no keys and no token still opens it and says why the service is off.
 
 lv_obj_t *yandexstate_screen;
+
+// The id the host gave this library: sonix_addon_own_screen() takes it with
+// every screen, and it is how the shell knows which addon's page it is looking
+// at when it unloads. The pointer is the manifest's and outlives the library
+// (addon.h), so it is kept rather than copied. Defined here rather than reached
+// from addon.c because the page is what creates the screen, and a screen that
+// nobody registered is one the shell leaves on the display with callbacks into
+// a library it is about to unmap.
+static const char *own_id;
 
 static char card_root[400];
 
@@ -153,13 +164,41 @@ static void *sign_in_main(void *arg) {
 	return NULL;
 }
 
+// One request runs to its end on a thread of its own: a sign-in, a code, a
+// poll, a list being built. They are detached and take no argument, so the
+// wrapper here exists for one reason only -- to count the thread in
+// yandexlive, between its first and its last instruction inside the library.
+// stop() waits on that count: the player unmaps the .so as soon as stop()
+// returns, and a thread of it still talking to the network would go on to
+// execute unmapped pages.
+typedef struct {
+	void *(*main_fn)(void *);
+} page_worker_t;
+
+static void *page_worker(void *arg) {
+	page_worker_t *w = arg;
+	void *(*main_fn)(void *) = w->main_fn;
+	free(w);
+	yandexlive_enter();
+	main_fn(NULL);
+	yandexlive_leave();
+	return NULL;
+}
+
 static void start_worker(void *(*main_fn)(void *)) {
+	page_worker_t *w = malloc(sizeof(*w));
+	if (!w) {
+		gui_notify_popup("could not start a worker");
+		return;
+	}
+	w->main_fn = main_fn;
 	pthread_t th;
 	pthread_attr_t attr;
 	pthread_attr_init(&attr);
 	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 	pthread_attr_setstacksize(&attr, 256 * 1024); // TLS: as the other workers
-	if (pthread_create(&th, &attr, main_fn, NULL) != 0) {
+	if (pthread_create(&th, &attr, page_worker, w) != 0) {
+		free(w);
 		gui_notify_popup("could not start a worker");
 	}
 	pthread_attr_destroy(&attr);
@@ -375,8 +414,8 @@ static void poll_async(void *user) {
 //
 // yandexplay_watch() runs on a one-second GUI timer: it fetches ahead, keeps the
 // queued files from the cache's sweep and tells My Wave what is playing. The
-// timer is created with the page and never deleted with it -- leaving the screen
-// does not stop the music, and the wave would run dry without it.
+// timer is created with the page and survives leaving it -- the music outlives
+// the screen that started it -- but not stop(): see yandexstate_stop().
 // ---------------------------------------------------------------------------
 
 static lv_timer_t *play_timer;
@@ -594,9 +633,15 @@ static void unloaded_cb(lv_event_t *e) {
 	login_clear();
 }
 
-void yandexstate_init(gui_config_t *cfg, const char *sd_root) {
+void yandexstate_init(gui_config_t *cfg, const char *sd_root, const char *id) {
 	snprintf(card_root, sizeof(card_root), "%s", sd_root ? sd_root : "");
+	own_id = id;
 	yandexstate_screen = lv_obj_create(NULL);
+	// Registered as it is created (addon.h): the shell switches off and deletes
+	// every screen an addon owns when the library is unloaded, and it cannot
+	// know about this one otherwise -- init()'s return value is the only screen
+	// it would have.
+	sonix_addon_own_screen(own_id, yandexstate_screen);
 	lv_obj_t *container = settingsrow_page(yandexstate_screen, cfg, "Yandex Music");
 
 	settingsrow_add(container, "Keys", &keys_value, NULL, NULL);
@@ -621,10 +666,60 @@ void yandexstate_init(gui_config_t *cfg, const char *sd_root) {
 	refresh();
 
 	// The playback watch: fetching ahead, the cache's ceiling, My Wave's next
-	// batch. One second, for the life of the program, whether the page is up or
-	// not -- the music outlives the screen that started it.
+	// batch. One second, for as long as the library is loaded -- whether the
+	// page is up or not: the music outlives the screen that started it, and
+	// only stop() (the card leaving, or the addon being replaced) ends it.
 	play_timer = lv_timer_create(play_tick_cb, 1000, NULL);
 
 	lv_obj_add_event_cb(yandexstate_screen, loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 	lv_obj_add_event_cb(yandexstate_screen, unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
+}
+
+// The addon being unloaded: the page and everything it created inside the
+// library go, and every pointer into the screen the shell is about to delete
+// goes with them.
+//
+// Runs first in the addon's stop(), before the service modules: the two timers
+// are what would otherwise keep calling into them (and into LVGL) after the
+// library has been unmapped, and the workers of the page are the ones that read
+// the state those modules are about to free.
+bool yandexstate_stop(void) {
+	// The clocks. A deleted timer cannot fire again, and a sign-in nobody is
+	// looking at must not poll a code on the way out.
+	login_stop();
+	if (play_timer) {
+		lv_timer_delete(play_timer);
+		play_timer = NULL;
+	}
+
+	// The page's own workers -- a sign-in, a code, a poll, a list being built
+	// -- are one request each and have no flag to be asked to stop: they are
+	// waited for instead. A poll in flight is a poll the player is already
+	// paying for (http.h cannot be woken out of http_request), so the wait is
+	// bounded, and the answer travels up to the player: a false here is a thread
+	// still inside the library, and addon_unload() keeps the mapping when it
+	// hears one.
+	bool safe = yandexlive_wait("the page", YANDEXLIVE_WAIT_MS);
+
+	// A late gui_post() of theirs is dropped by the player, not by us (its
+	// callback lives in this library). What is left is the state they read:
+	// the login flow is forgotten, and the screen's labels are dropped before
+	// the shell deletes the screen.
+	memset(&login, 0, sizeof(login));
+	login_active = false;
+	login_polling = false;
+	login_elapsed = 0;
+	play_busy = false;
+
+	keys_value = NULL;
+	account_value = NULL;
+	token_value = NULL;
+	quality_value = NULL;
+	code_value = NULL;
+	where_value = NULL;
+	wait_value = NULL;
+	card_root[0] = '\0';
+	own_id = NULL;			   // the manifest's pointer, still valid; this copy is not
+	yandexstate_screen = NULL; // the shell deletes it after stop() returns
+	return safe;
 }

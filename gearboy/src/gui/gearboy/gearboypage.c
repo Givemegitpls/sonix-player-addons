@@ -1,14 +1,17 @@
 #include "gearboypage.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "lvgl/lvgl.h"
 
 #include "src/gui/fonts/fonts.h"
 #include "src/gui/gearboy/gearboyplay.h"
+#include "src/gui/gearboy/gearboyscreens.h"
 #include "src/gui/gearboy/gearboysettings.h"
 #include "src/gui/shell/icons_select.h"
 #include "src/gui/nowplaying/player.h"
@@ -40,6 +43,21 @@ static int rom_count;
 // result is stale and gets dropped instead of overwriting the newer one.
 static uint32_t scan_generation;
 static bool scanning;
+
+// The scan thread is detached -- nobody waits for it on the way out of the page
+// -- so it counts itself here instead. gearboypage_stop() has to know when the
+// last one has left its code behind, because the library those instructions
+// live in is unmapped as soon as it returns.
+static pthread_mutex_t scan_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t scan_done = PTHREAD_COND_INITIALIZER;
+static int scan_live;
+static bool scan_abandoned;
+
+// How long stop() waits for a scan that is reading the card. Shorter than
+// addon_card_gone()'s own wait for the GUI thread (4 s, addon.c): a scan parked
+// in a card that has just been pulled must not make that wait end with the GUI
+// thread still inside this library.
+#define SCAN_STOP_WAIT_MS 2000
 
 typedef struct {
 	uint32_t generation;
@@ -173,16 +191,28 @@ static void *scan_thread(void *arg) {
 		count = 0;
 	}
 
-	scan_result_t *res = malloc(sizeof(*res));
-	if (!res) {
+	// The page may have been torn down while the card was being read. Then the
+	// catalogue belongs to nobody, and the callback that would have taken it is
+	// code in a library about to be unmapped: the list is freed here instead of
+	// posted. Under the lock, so that stop() either sees this thread counted in
+	// and waits, or has already set the flag that is read here.
+	pthread_mutex_lock(&scan_lock);
+	if (scan_abandoned) {
 		free(list);
-		return NULL;
+	} else {
+		scan_result_t *res = malloc(sizeof(*res));
+		if (res) {
+			res->generation = generation;
+			res->list = list;
+			res->count = count;
+			gui_post(scan_done_cb, res);
+		} else {
+			free(list);
+		}
 	}
-	res->generation = generation;
-	res->list = list;
-	res->count = count;
-
-	gui_post(scan_done_cb, res);
+	scan_live--;
+	pthread_cond_broadcast(&scan_done);
+	pthread_mutex_unlock(&scan_lock);
 	return NULL;
 }
 
@@ -196,8 +226,17 @@ static void start_scan(void) {
 	lv_label_set_text(status_label, tr("gearboy_looking_for_games"));
 	lv_obj_set_hidden(status_label, false);
 
+	pthread_mutex_lock(&scan_lock);
+	scan_live++;
+	pthread_mutex_unlock(&scan_lock);
+
 	pthread_t t;
 	if (pthread_create(&t, NULL, scan_thread, (void *)(uintptr_t)scan_generation) != 0) {
+		pthread_mutex_lock(&scan_lock);
+		scan_live--;
+		pthread_cond_broadcast(&scan_done);
+		pthread_mutex_unlock(&scan_lock);
+
 		scanning = false;
 		lv_label_set_text(status_label, tr("gearboy_search_failed"));
 		return;
@@ -207,6 +246,10 @@ static void start_scan(void) {
 
 static void screen_loaded_cb(lv_event_t *e) {
 	(void)e;
+	// The loader knows this one from init()'s return value; said from this side
+	// too, so the addon's own list of its screens is complete and nothing it put
+	// up is left out of the unload (gearboyscreens.h).
+	gearboyscreens_own(gearboypage_screen);
 	refresh_view_buttons();
 	lv_obj_scroll_to_y(list_box, 0, LV_ANIM_OFF);
 	// Rescan on every entry: the card may have been removed, reinserted or
@@ -217,10 +260,19 @@ static void screen_loaded_cb(lv_event_t *e) {
 // The top-right gear, like the one on the Music page: opens Gearboy settings.
 static void open_settings_cb(lv_event_t *e) {
 	(void)e;
-	switch_screen(gearboysettings_screen);
+	gearboysettings_open();
 }
 
 void gearboypage_init(gui_config_t *cfg) {
+	// A page built after one was taken down (the library reloaded, or init()
+	// called again in the same copy) may scan again: the flag that tells a
+	// finishing scan nobody wants its result belongs to the teardown that set
+	// it, not to the page.
+	pthread_mutex_lock(&scan_lock);
+	scan_abandoned = false;
+	scanning = false;
+	pthread_mutex_unlock(&scan_lock);
+
 	lv_obj_add_style(gearboypage_screen, &theme_style_screen, 0);
 	lv_obj_t *page_title = settingsrow_title(gearboypage_screen, cfg, "gearboy");
 	settingsrow_title_corner_slots(page_title, cfg, 1);
@@ -300,4 +352,69 @@ void gearboypage_init(gui_config_t *cfg) {
 
 	lv_obj_add_event_cb(gearboypage_screen, screen_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 	switcher_attach_back_gesture(gearboypage_screen);
+}
+
+// ---------------------------------------------------------------------------
+// unloading
+// ---------------------------------------------------------------------------
+
+// The addon's library is about to be unmapped. Two things of this page are
+// still alive at that moment and would be code that no longer exists:
+//
+//   * the scan thread, which is detached because nothing used to wait for it.
+//     It reads the card, so it is waited for with a bound -- a read parked in a
+//     card that has just been pulled can outlast the player's own patience with
+//     the GUI thread -- and the catalogue it returns is freed by the thread
+//     itself when the flag below says nobody wants it;
+//   * the theme hook, which the player calls on every theme change.
+//
+// The rest is memory: the catalogue and the pointers into the screen. The
+// screen itself is the shell's -- init() returned it, and it deletes it after
+// this returns.
+//
+// True when the scan thread is out. False when the wait above ran out with it
+// still inside a read() on the card: the library must then not be unmapped, and
+// the loader keeps it (addon.h).
+bool gearboypage_stop(void) {
+	struct timespec deadline;
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_nsec += (long)SCAN_STOP_WAIT_MS * 1000000L;
+	if (deadline.tv_nsec >= 1000000000L) {
+		deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+		deadline.tv_nsec %= 1000000000L;
+	}
+
+	pthread_mutex_lock(&scan_lock);
+	scan_abandoned = true;
+	scan_generation++; // in flight now is stale even if it does get posted
+	while (scan_live > 0) {
+		if (pthread_cond_timedwait(&scan_done, &scan_lock, &deadline) == ETIMEDOUT) {
+			break;
+		}
+	}
+	int left = scan_live;
+	pthread_mutex_unlock(&scan_lock);
+
+	if (left > 0) {
+		// Nothing here can make a thread in a read() come back sooner. Said
+		// plainly, and returned: the loader keeps the mapping rather than letting
+		// the thread's next instruction land in nothing.
+		fprintf(stderr, "gearboy: %d scan thread(s) still reading the card; not safe to unload\n", left);
+	}
+
+	theme_unregister_refresh(refresh_view_buttons);
+
+	free(roms);
+	roms = NULL;
+	rom_count = 0;
+	scanning = false;
+	show_color = false;
+
+	list_box = NULL;
+	status_label = NULL;
+	btn_gb = NULL;
+	btn_gbc = NULL;
+	gearboypage_screen = NULL;
+
+	return left == 0;
 }

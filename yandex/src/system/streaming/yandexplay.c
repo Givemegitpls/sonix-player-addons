@@ -18,6 +18,7 @@
 #include "src/system/streaming/yandexcompat.h"
 #include "src/system/streaming/streamturn.h"
 #include "src/system/streaming/yandexcache.h"
+#include "src/system/streaming/yandexlive.h"
 #include "src/system/streaming/yandexsaved.h"
 #include "src/system/streaming/yandexwave.h"
 
@@ -243,6 +244,10 @@ static unsigned metadata_requested_generation;
 static job_kind_t running_kind;
 static char running_id[YANDEX_ID_MAX];
 static bool worker_started;
+// Set by yandexplay_stop() and never cleared: the worker's way out, and the
+// guard that keeps a straggling submit() from starting it again on a library
+// that is on its way out of the process.
+static bool stopping;
 
 typedef struct {
 	job_kind_t kind;
@@ -310,14 +315,23 @@ static void abandon_unless(const char *id) {
 
 static void *worker_main(void *arg) {
 	(void)arg;
+	// Counted in yandexlive from its first instruction to its last: stop()
+	// waits on this count, and frees the queue and the jobs below it.
+	yandexlive_enter();
 	// A tapped track is waited on: a dead network is said in seconds.
 	yandex_http_set_thread_timeout_cap(STREAM_UI_TIMEOUT_SECS);
 	for (;;) {
 		pthread_mutex_lock(&job_lock);
 		running_kind = JOB_NONE;
 		running_id[0] = '\0';
-		while (play_pending.kind == JOB_NONE && fetch_pending.kind == JOB_NONE && metadata_pending.kind == JOB_NONE) {
+		while (!stopping && play_pending.kind == JOB_NONE && fetch_pending.kind == JOB_NONE && metadata_pending.kind == JOB_NONE) {
 			pthread_cond_wait(&job_cond, &job_lock);
+		}
+		if (stopping) {
+			// A job still queued is dropped rather than started: its answer
+			// would be gui_post()ed into a library the player is unmapping.
+			pthread_mutex_unlock(&job_lock);
+			break;
 		}
 		job_t job;
 		if (play_pending.kind != JOB_NONE) {
@@ -371,11 +385,16 @@ static void *worker_main(void *arg) {
 			free(r);
 		}
 	}
+	yandexlive_leave();
 	return NULL;
 }
 
 static void submit(job_kind_t kind, const char *id, bool waiting, const char *path) {
 	pthread_mutex_lock(&job_lock);
+	if (stopping) {
+		pthread_mutex_unlock(&job_lock);
+		return;
+	}
 	if (!worker_started) {
 		pthread_t th;
 		pthread_attr_t attr;
@@ -882,10 +901,65 @@ static void wave_batch_cb(const yandex_track_t *tracks, int count, bool restarte
 // the rest of the calls
 // ---------------------------------------------------------------------------
 
+// Registered once per library, and paired: stop() takes the very function it
+// put in. device_state refuses a second copy of the same pointer, but a flag is
+// what makes the removal in stop() legal rather than a call that assumes it.
+static bool prepared;
+
 void yandexplay_init(yandexplay_listener_t l) {
 	listener = l;
 	wave_cb = wave_batch_cb;
-	device_state_add_prepare_cb(yandexplay_prepare_track);
+	if (!prepared) {
+		prepared = true;
+		device_state_add_prepare_cb(yandexplay_prepare_track);
+	}
+}
+
+// The addon being unloaded: the prepare callback comes off the player's list,
+// the worker is stopped, and the queue goes. GUI thread, from the addon's stop
+// hook, after the page's timers are deleted and before the library is unmapped.
+bool yandexplay_stop(void) {
+	// The callback first. device_state calls it from whatever thread starts a
+	// track -- the audio thread included -- and a pointer into an unmapped
+	// library would be reached on the next track played, whoever plays it.
+	if (prepared) {
+		device_state_remove_prepare_cb(yandexplay_prepare_track);
+		prepared = false;
+	}
+
+	// Then the worker: woken out of its wait and told to end. Whatever fetch it
+	// is sitting in is abandoned first, because yandexcache_start() waits for
+	// the prebuffer and would otherwise hold this thread for the length of a
+	// track nobody is going to hear.
+	yandexcache_abandon_all();
+	pthread_mutex_lock(&job_lock);
+	stopping = true;
+	play_pending.kind = JOB_NONE;
+	fetch_pending.kind = JOB_NONE;
+	metadata_pending.kind = JOB_NONE;
+	pthread_cond_broadcast(&job_cond);
+	pthread_mutex_unlock(&job_lock);
+	bool safe = yandexlive_wait("the play worker", YANDEXLIVE_WAIT_MS);
+
+	// Its answers have landed or been dropped by now. What is left is this
+	// module's memory: the queue (ids of a card that may be gone), the listener,
+	// the wave callback and the bookkeeping of a run that is over.
+	queue_set(NULL, false);
+	listener = NULL;
+	wave_cb = NULL;
+	start_index = 0;
+	wave_sleep_serial = 0;
+	skips_in_a_row = 0;
+	claims_live = false;
+	ours_valid = false;
+	ours = false;
+	ours_revision = 0;
+	metadata_requested[0] = '\0';
+	metadata_requested_generation = 0;
+	running_kind = JOB_NONE;
+	running_id[0] = '\0';
+	worker_started = false; // it has returned: the next init() starts a fresh one
+	return safe;
 }
 
 int yandexplay_paths_for(const yandex_track_t *tracks, int count, char ***paths_out) {

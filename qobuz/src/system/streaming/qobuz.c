@@ -118,6 +118,25 @@ void qobuz_reload_session(void) {
 	printf("qobuz: %s\n", auth_token[0] ? "token found in the addon's folder" : "no token in the addon's folder");
 }
 
+// See qobuz.h. Everything qobuz_init() reads again is left alone; what is
+// cleared here is what it does NOT read: the derived pair's timestamp, whose
+// pair it was, and the flag that says a derivation is running. A worker stopped
+// mid-derivation leaves that flag set, and the next init() -- on a library that
+// was mapped again after a dlclose() that failed -- would then never fetch a
+// pair again. The credentials go with it because they are a secret in memory
+// that outlives nothing.
+void qobuz_forget(void) {
+	base_url[0] = '\0';
+	app_id[0] = '\0';
+	memset(app_secret, 0, sizeof(app_secret));
+	memset(auth_token, 0, sizeof(auth_token));
+	memset(display_name, 0, sizeof(display_name));
+	creds_at = 0;
+	creds_by_user = false;
+	creds_fetching = false;
+	last_error[0] = '\0';
+}
+
 // The pair the addon's own file carries: the owner's when it names one,
 // otherwise the one derived the last time (qobuzconf.h says which is which).
 // Called again whenever the card may have been written in between.

@@ -3,6 +3,7 @@
 #include "lvgl/lvgl.h"
 
 #include "src/gui/fonts/fonts.h"
+#include "src/gui/gearboy/gearboyscreens.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
@@ -128,7 +129,6 @@ static lv_obj_t *make_pill_card(lv_obj_t *parent, const char *title_tag) {
 }
 
 void gearboysettings_init(gui_config_t *cfg) {
-	gearboysettings_screen = lv_obj_create(NULL);
 	lv_obj_t *container = settingsrow_page(gearboysettings_screen, cfg, "gearboy_settings");
 
 	// Palette: applies to original Game Boy games only, since GBC titles carry
@@ -166,4 +166,33 @@ void gearboysettings_init(gui_config_t *cfg) {
 	refresh_pills();
 	theme_register_refresh(refresh_pills);
 	switcher_attach_back_gesture(gearboysettings_screen);
+}
+
+// Opens the page -- from the list's gear icon and from the in-game menu. The
+// loader is told about the screen first: it is not the one init() returned, so
+// it knows it only if it is told, and an unload while it is up has to be able to
+// take the display off it (gearboyscreens.h).
+void gearboysettings_open(void) {
+	gearboyscreens_own(gearboysettings_screen);
+	switch_screen(gearboysettings_screen);
+}
+
+// The library is being unmapped: the hook goes -- it is code in it -- and so do
+// the pointers into the screen. Nothing else of this page leaves memory between
+// visits: the values live in gbconf, on the card, and are written as they are
+// picked (gbconf_set_int()).
+//
+// gearboysettings_screen is left alone: the addon deletes it, and nulls it once
+// it has (addon.c, drop_own_screen()).
+void gearboysettings_stop(void) {
+	theme_unregister_refresh(refresh_pills);
+
+	for (int i = 0; i < 5; i++) {
+		palette_pills[i] = NULL;
+	}
+	for (int i = 0; i < 4; i++) {
+		shader_pills[i] = NULL;
+	}
+	correction_switch = NULL;
+	bootrom_switch = NULL;
 }

@@ -93,6 +93,19 @@ typedef struct {
 
 void yandex_init(void);
 
+// The addon being unloaded: the session copy in RAM, the keys, the addresses,
+// the liked mirror, the wave session and the pacing go; nothing is written to
+// the card (the user stays signed in). Called from the addon's stop hook, after
+// the workers that write those (yandexsync, yandexwave) have been stopped.
+void yandex_stop(void);
+
+// Called first in the addon's stop hook: from here on every request this module
+// makes fails at once, so a worker that is midway through a long list -- the
+// liked ids are a page a request, paced -- ends at the next page instead of
+// running to the end of the account. Nothing else is touched, and the caller
+// still has to stop the workers themselves.
+void yandex_halt_requests(void);
+
 // Reads the settings, the keys and the session again (the state screen's
 // "reload"): the card may have been written while the player ran. UI thread.
 void yandex_reload(void);

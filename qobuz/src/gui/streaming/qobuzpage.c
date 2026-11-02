@@ -1,5 +1,6 @@
 #include "qobuzpage.h"
 
+#include "src/addon/addon.h"
 #include "src/system/device/power.h"
 
 #include <pthread.h>
@@ -29,6 +30,7 @@
 #include "src/system/streaming/qobuzservice.h"
 #include "src/system/streaming/streamturn.h"
 #include "src/system/streaming/qobuzsync.h"
+#include "src/system/streaming/qobuzthreads.h"
 #include "src/system/device/system.h"
 #include "src/system/core/utils.h"
 #include "src/system/net/wifi.h"
@@ -99,6 +101,45 @@ static job_t pending;
 static bool have_pending;
 static bool worker_started;
 
+// ---------------------------------------------------------------------------
+// stopping
+//
+// The player unloads this library when the card leaves or when its files
+// changed, and dlclose() takes the code with it: once stop() returns, nothing
+// of ours may still be running (addon.h, "Unloading"). Two threads live here --
+// the job worker below and the prefetch thread further down -- and both park on
+// a condition variable, so each loop watches this flag beside its own work and
+// the stop broadcasts to wake them.
+//
+// The flag also keeps new work from starting while the old is being taken
+// apart: a timer that fires, a callback already posted, a row still on screen --
+// each of those would otherwise submit one more job into a queue nobody drains.
+// ---------------------------------------------------------------------------
+
+static bool page_stopping;
+static qobuz_threads_t page_threads = QOBUZ_THREADS_INIT;
+// The hooks below are registered by init() and withdrawn by stop(): the flag is
+// what says there is something to withdraw, so a library that is unloaded before
+// its page was ever built does not unregister calls that were never made.
+static bool hooks_installed;
+
+// The id the shell gave this addon (sonix_addon_host_t::id, valid for the life
+// of the process), which is what sonix_addon_own_screen() files a screen under.
+static const char *page_owner;
+
+// Every top-level screen this file builds goes through here.
+//
+// There are five of them -- the home page init() returns, the list, the search,
+// the settings and the sign-in page -- and the shell can only unload a library
+// whose screens it knows about: a widget whose callback is code in a dlclose()d
+// .so is a crash on the next tap (addon.h, sonix_addon_own_screen). One
+// lv_obj_create(NULL) left outside this function is a page nobody unloads.
+static lv_obj_t *own_screen(void) {
+	lv_obj_t *screen = lv_obj_create(NULL);
+	sonix_addon_own_screen(page_owner, screen);
+	return screen;
+}
+
 // Job serial number: when it changes, a late result belongs to a request that
 // no longer matters and is discarded.
 static unsigned job_serial;
@@ -125,10 +166,14 @@ static bool page_loading;
 
 static void submit(const job_t *job) {
 	pthread_mutex_lock(&job_lock);
-	pending = *job;
-	have_pending = true;
-	job_serial++;
-	pthread_cond_signal(&job_ready);
+	// Nothing is queued while the library is coming apart: the worker has left
+	// and nobody would drain it (addon.h, "Unloading").
+	if (!page_stopping) {
+		pending = *job;
+		have_pending = true;
+		job_serial++;
+		pthread_cond_signal(&job_ready);
+	}
 	pthread_mutex_unlock(&job_lock);
 }
 
@@ -1087,14 +1132,21 @@ static void prefetch_submit(int index) {
 	(void)index;
 	pthread_mutex_lock(&prefetch_lock);
 
-	if (!prefetch_started) {
+	if (!prefetch_started && !page_stopping) {
 		pthread_t thread;
+		// Counted before the thread exists: a fast one could finish and
+		// decrement before this line ran.
+		qobuz_threads_add(&page_threads);
 		if (pthread_create(&thread, NULL, prefetch_main, NULL) == 0) {
 			pthread_detach(thread);
 			prefetch_started = true;
+		} else {
+			qobuz_threads_done(&page_threads);
 		}
 	}
-	pthread_cond_broadcast(&prefetch_ready);
+	if (!page_stopping) {
+		pthread_cond_broadcast(&prefetch_ready);
+	}
 	pthread_mutex_unlock(&prefetch_lock);
 }
 
@@ -1146,7 +1198,9 @@ static void prefetch_urgent(const char *wanted_path) {
 	qobuzcache_set_network_wanted(true);
 
 	pthread_mutex_lock(&prefetch_lock);
-	prefetch_want_id = wanted;
+	if (!page_stopping) {
+		prefetch_want_id = wanted;
+	}
 	pthread_cond_broadcast(&prefetch_ready);
 	pthread_mutex_unlock(&prefetch_lock);
 }
@@ -1319,6 +1373,12 @@ static void do_play(int index) {
 //      whether prefetching ahead or playback has reached a track that is not
 //      there yet -- in that case the first missing one is exactly the one being
 //      waited for, and gets served first on its own.
+
+// Stored, unlike the other two timers' creation: this one is also registered
+// with the power module (power_slow_in_standby), and an unload has to take it
+// out of there before deleting it.
+static lv_timer_t *queue_watch_timer;
+
 static void queue_watch_cb(lv_timer_t *timer) {
 	(void)timer;
 	// A queue that is a library list holds no cache files, and walking it here
@@ -1409,8 +1469,13 @@ static void *prefetch_main(void *arg) {
 
 	for (;;) {
 		pthread_mutex_lock(&prefetch_lock);
-		while (prefetch_want_id == 0) {
+		while (prefetch_want_id == 0 && !page_stopping) {
 			pthread_cond_wait(&prefetch_ready, &prefetch_lock);
+		}
+		if (page_stopping) {
+			prefetch_want_id = 0;
+			pthread_mutex_unlock(&prefetch_lock);
+			break;
 		}
 		long id = prefetch_want_id;
 		pthread_mutex_unlock(&prefetch_lock);
@@ -1448,6 +1513,15 @@ static void *prefetch_main(void *arg) {
 
 		qobuz_track_t track = queued_tracks[index];
 		qobuzcache_wait_idle();
+
+		// The turn can take a while -- another service's hi-res track is minutes
+		// of it -- and the stop may have come while this thread was parked in
+		// it. qobuzcache_stop() refuses every transfer from that moment on and
+		// abandons the one in the way, which is what lets this wait return at
+		// all; there is nothing left to do but leave.
+		if (page_stopping) {
+			break;
+		}
 
 		// While waiting for the slot the request may have changed: prev is
 		// pressed and another track is needed now. Without this check the one
@@ -1498,6 +1572,7 @@ static void *prefetch_main(void *arg) {
 			gui_post(resume_if_waiting_async, NULL);
 		}
 	}
+	qobuz_threads_done(&page_threads);
 	return NULL;
 }
 
@@ -1510,8 +1585,16 @@ static void *worker_main(void *arg) {
 
 	for (;;) {
 		pthread_mutex_lock(&job_lock);
-		while (!have_pending) {
+		while (!have_pending && !page_stopping) {
 			pthread_cond_wait(&job_ready, &job_lock);
+		}
+		if (page_stopping) {
+			// Whatever was queued is dropped rather than served: its answer
+			// would be drawn by a page that is being unloaded, and the caller
+			// (the shell) is not waiting for it.
+			have_pending = false;
+			pthread_mutex_unlock(&job_lock);
+			break;
 		}
 		job_t job = pending;
 		have_pending = false;
@@ -1611,17 +1694,23 @@ static void *worker_main(void *arg) {
 
 		gui_post(job_done_cb, NULL);
 	}
+	qobuz_threads_done(&page_threads);
 	return NULL;
 }
 
 static void start_worker(void) {
-	if (worker_started) {
+	if (worker_started || page_stopping) {
 		return;
 	}
 	pthread_t thread;
+	// Counted before the thread exists: a fast one could finish and decrement
+	// before this line ran.
+	qobuz_threads_add(&page_threads);
 	if (pthread_create(&thread, NULL, worker_main, NULL) == 0) {
 		pthread_detach(thread);
 		worker_started = true;
+	} else {
+		qobuz_threads_done(&page_threads);
 	}
 }
 
@@ -1863,7 +1952,7 @@ static void open_search_cb(lv_event_t *e) {
 }
 
 static void build_search_page(gui_config_t *cfg) {
-	search_screen = lv_obj_create(NULL);
+	search_screen = own_screen();
 	lv_obj_add_style(search_screen, &theme_style_screen, 0);
 
 	settingsrow_title(search_screen, cfg, "qobuz_search_qobuz");
@@ -2023,7 +2112,7 @@ static lv_obj_t *make_field(lv_obj_t *parent, gui_config_t *cfg, const char *pla
 }
 
 static void build_login_page(gui_config_t *cfg) {
-	login_screen = lv_obj_create(NULL);
+	login_screen = own_screen();
 	lv_obj_add_style(login_screen, &theme_style_screen, 0);
 
 	settingsrow_title(login_screen, cfg, "qobuz_sign_in_to_qobuz");
@@ -2191,7 +2280,7 @@ static void open_settings_cb(lv_event_t *e) {
 }
 
 static void build_settings_page(gui_config_t *cfg) {
-	qsettings_screen = lv_obj_create(NULL);
+	qsettings_screen = own_screen();
 	lv_obj_t *container = settingsrow_page(qsettings_screen, cfg, "qobuz_settings");
 
 	// Quality: a card with the name on top and the four pills below, exactly
@@ -2368,7 +2457,7 @@ static void home_loaded_cb(lv_event_t *e) {
 // ---------------------------------------------------------------------------
 
 static void build_list_page(gui_config_t *cfg) {
-	list_screen = lv_obj_create(NULL);
+	list_screen = own_screen();
 	lv_obj_add_event_cb(list_screen, list_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 	lv_obj_add_event_cb(list_screen, list_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
 	list_container = settingsrow_page(list_screen, cfg, "qobuz");
@@ -2392,10 +2481,10 @@ static void build_list_page(gui_config_t *cfg) {
 	player_sheet_attach_drag(list_container, true);
 }
 
-void qobuzpage_init(gui_config_t *cfg) {
+void qobuzpage_init(gui_config_t *cfg, const char *addon_id) {
 
-
-	qobuz_screen = lv_obj_create(NULL);
+	page_owner = addon_id;
+	qobuz_screen = own_screen();
 	home_container = settingsrow_page(qobuz_screen, cfg, "qobuz");
 
 	// Two buttons top right, like the Music gear: settings and search. The title
@@ -2411,13 +2500,15 @@ void qobuzpage_init(gui_config_t *cfg) {
 	build_busy_layer();
 	qobuzcache_set_slow_start_cb(on_slow_start);
 	device_state_add_prepare_cb(qobuz_prepare_track);
+	hooks_installed = true;
 
 	// The queue watchdog: tells the prefetch thread which track is missing next.
 	// One second is enough -- this is about tracks, not frames.
 	// Slowed with the panel dark: what it recomputes (the Wi-Fi hold, which
 	// track the prefetch wants) is measured in tracks, and the actions that
 	// raise those are immediate.
-	power_slow_in_standby(lv_timer_create(queue_watch_cb, 1000, NULL), 5000);
+	queue_watch_timer = lv_timer_create(queue_watch_cb, 1000, NULL);
+	power_slow_in_standby(queue_watch_timer, 5000);
 	// Created paused: the first cover request starts it.
 	art_timer = lv_timer_create(art_poll_cb, 120, NULL);
 	lv_timer_pause(art_timer);
@@ -2436,4 +2527,180 @@ void qobuzpage_init(gui_config_t *cfg) {
 	// The mark over the artwork and "show album" belong to the service
 	// table, which the page is the only part of the player able to fill.
 	qobuz_service_attach_gui(&icon_qobuz_badge, (void *)qobuzpage_open_album);
+}
+
+// ---------------------------------------------------------------------------
+// stopping the page
+//
+// See addon.h, "Unloading": GUI thread, once. Returns false when one of the
+// bounded waits found a worker still inside the library -- then the shell keeps
+// the mapping rather than dlclose() it under a running thread. The order below
+// is the order of the hazards: stop the things that can still start work, then
+// stop the work, then let go of every pointer.
+// ---------------------------------------------------------------------------
+
+bool qobuzpage_stop(void) {
+	// 1. Both workers wake and leave, and the entry points that could submit one
+	// more job refuse from here on.
+	pthread_mutex_lock(&job_lock);
+	page_stopping = true;
+	have_pending = false;
+	pthread_cond_broadcast(&job_ready);
+	pthread_mutex_unlock(&job_lock);
+
+	pthread_mutex_lock(&prefetch_lock);
+	prefetch_want_id = 0;
+	pthread_cond_broadcast(&prefetch_ready);
+	pthread_mutex_unlock(&prefetch_lock);
+
+	// 2. The timers, before anything that could still be running their
+	// callbacks. The watchdog goes out of the power module's standby table
+	// first: a slot left behind points at freed LVGL memory, and the next dark
+	// panel would slow whatever lives there by then.
+	//
+	// There is no listrow_stop() here because this page never binds a listrow:
+	// its cover polling is the two timers below, on its own owner token in
+	// listart.h. (The pages that do use addons/common/listrow.h -- zvuk -- are
+	// the ones that have a poll timer of its module to delete.)
+	if (queue_watch_timer) {
+		power_forget_timer(queue_watch_timer);
+		lv_timer_delete(queue_watch_timer);
+		queue_watch_timer = NULL;
+	}
+	if (art_timer) {
+		lv_timer_delete(art_timer);
+		art_timer = NULL;
+	}
+	if (art_drop_timer) {
+		lv_timer_delete(art_drop_timer);
+		art_drop_timer = NULL;
+	}
+
+	// 3. The hooks this library put into the player: two theme refreshes, the
+	// device_state callback that downloads a track the queue stopped on, the
+	// cache's slow-start notice. Each is one of our functions, and the player
+	// would call it after the code has been unmapped.
+	//
+	// The open dialogs go too, for the same reason: a popover's action and the
+	// "are you sure?" card's both point into this library, and they survive a
+	// card being pulled -- the next tap on them would be the crash.
+	if (hooks_installed) {
+		theme_unregister_refresh(paint_search_pills);
+		theme_unregister_refresh(quality_refresh);
+		device_state_remove_prepare_cb(qobuz_prepare_track);
+		hooks_installed = false;
+	}
+	qobuzcache_set_slow_start_cb(NULL);
+	popover_close();
+	confirm_close();
+
+	// 4. The transfers, before the threads that wait for them: the prefetch
+	// worker is parked in the download turn, and only an abandoned download
+	// lets it out (qobuzcache_stop, and the comment there).
+	bool cache_ok = qobuzcache_stop();
+
+	// 5. Now the two threads, bounded -- qobuzthreads.h says why a join is the
+	// wrong shape here.
+	int left = qobuz_threads_wait(&page_threads, QOBUZ_STOP_WAIT_MS);
+	if (left > 0) {
+		fprintf(stderr, "qobuz: %d worker%s still running at stop\n", left, left == 1 ? "" : "s");
+	}
+
+	// 6. Every record the player keeps of the pages built here. The shell now
+	// knows all five from sonix_addon_own_screen() and sweeps them itself, but
+	// the records are pointers rather than objects, so they go here while the
+	// screens are still alive -- the forgoings are idempotent.
+	switcher_forget_screen(list_screen);
+	switcher_forget_screen(search_screen);
+	switcher_forget_screen(login_screen);
+	switcher_forget_screen(qsettings_screen);
+	player_forget_screen(list_screen);
+	player_forget_screen(search_screen);
+	player_forget_screen(login_screen);
+	player_forget_screen(qsettings_screen);
+
+	// 7. What the widgets held that is ours: the slots of the shared cover
+	// loader (in-flight downloads abandoned, decoded pixels freed) and the veil,
+	// which lives on the system layer and so would outlive the screen.
+	//
+	// art_drop_pictures() and not art_forget_rows(): the rows are still there
+	// until the screens are deleted a few lines down, and every one of them has
+	// to be put back to the grey note before the pixels it points at go.
+	art_drop_pictures();
+	if (busy_layer) {
+		lv_obj_delete(busy_layer);
+		busy_layer = NULL;
+	}
+
+	// 7b. The four screens this file opened beside the one init() returns. The
+	// shell deletes them too -- gui_obj_alive() is what keeps that from being a
+	// double free -- but deleting them here takes the two keyboards and every
+	// row of the list down now, while the code that owns them is still in place.
+	// qobuz_screen is deliberately left alone: addon.h gives that one to the
+	// shell.
+	lv_obj_delete(login_screen);
+	lv_obj_delete(qobuz_list_screen);
+	lv_obj_delete(search_screen);
+	lv_obj_delete(qsettings_screen);
+
+	// 8. init() has to work a second time in the same process -- on a fresh
+	// mapping, or on this one if dlclose() refused to unmap it -- so no pointer
+	// to a widget and no state of this run may survive.
+	login_screen = NULL;
+	qobuz_list_screen = NULL;
+	search_screen = NULL;
+	qsettings_screen = NULL;
+	home_container = NULL;
+	settings_btn = NULL;
+	search_btn = NULL;
+	list_container = NULL;
+	list_title = NULL;
+	list_empty = NULL;
+	search_field = NULL;
+	search_clear_btn = NULL;
+	search_keyboard = NULL;
+	user_field = NULL;
+	password_field = NULL;
+	password_eye_icon = NULL;
+	login_keyboard = NULL;
+	for (int i = 0; i < 3; i++) {
+		search_pills[i] = NULL;
+	}
+	for (int i = 0; i < 4; i++) {
+		quality_pills[i] = NULL;
+	}
+	qobuz_screen = NULL;
+
+	result_count = 0;
+	result_from = 0;
+	result_kind = JOB_NONE;
+	result_title[0] = '\0';
+	result_error[0] = '\0';
+	list_kind = JOB_NONE;
+	page_more = false;
+	page_loading = false;
+	menu_index = -1;
+	sync_message[0] = '\0';
+	list_history_len = 0;
+	have_current_list = false;
+	memset(&current_list_job, 0, sizeof(current_list_job));
+	queued_count = 0;
+	waiting_for_track = false;
+	job_serial = 0;
+	worker_started = false;
+	prefetch_started = false;
+	prefetch_want_id = 0;
+	prefetch_failed_id = 0;
+	prefetch_failed_ms = 0;
+
+	// Only when nothing of ours survived: with a worker still out there the flag
+	// is what makes it leave at the next check instead of starting another job,
+	// and the unload is unsafe whether or not init() is ever called again.
+	if (left == 0) {
+		page_stopping = false;
+	}
+
+	// The whole answer: false tells the shell to keep the mapping, which is a
+	// leak instead of a jump into unmapped code.
+	return left == 0 && cache_ok;
 }

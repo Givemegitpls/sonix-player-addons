@@ -27,4 +27,8 @@ void yandexsync_like(const char *track_id, const char *album_id, bool want, yand
 // arrives on the worker, only when they arrived.
 void yandexsync_likes_refresh(void (*done)(void));
 
+// The addon being unloaded: the worker ends (waited for), the queue of likes is
+// dropped and the retry pause forgotten. GUI thread, from the addon's stop hook.
+bool yandexsync_stop(void);
+
 #endif /* YANDEXSYNC_H */

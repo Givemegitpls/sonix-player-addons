@@ -125,6 +125,17 @@ void yandexconf_set(const char *key, const char *value) {
 
 const char *yandexconf_dir(void) { return conf_dir; }
 
+// The addon being unloaded: the folder and the settings read out of it are
+// forgotten, and nothing is written. The file itself stays on the card -- it is
+// the user's, and the next init() reads it again -- so this is not a "reset".
+void yandexconf_stop(void) {
+	pthread_mutex_lock(&conf_lock);
+	conf_dir[0] = '\0';
+	settings = (store_t){0};
+	loaded = false;
+	pthread_mutex_unlock(&conf_lock);
+}
+
 bool yandexconf_path(const char *name, char *out, size_t size) {
 	if (!name || !out || size == 0) {
 		return false;

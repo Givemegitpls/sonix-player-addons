@@ -1675,3 +1675,72 @@ void flappybird_init(gui_config_t *cfg) {
 	lv_timer_pause(tick_timer);
 	power_pause_in_standby(tick_timer);
 }
+
+// ---------------------------------------------------------------------------
+// unloading
+// ---------------------------------------------------------------------------
+
+// The library is being unmapped. What outlives the screen, in the order the
+// parts depend on each other:
+//
+//   * the mixer thread and the card's PCM -- both are stopped and joined by
+//     flappysound_stop(), reached through release_all();
+//   * the artwork and the frame buffer, freed there too;
+//   * the tick timer. Paused or running, it is an LVGL timer whose callback is
+//     code in this library, and one the power manager has a record of: the
+//     record goes first (power_forget_timer() -- otherwise the next dark panel
+//     would pause or slow whatever lives at that address by then), then the
+//     timer;
+//   * the state of the run on screen and every pointer into the screen, so that
+//     a second init() -- of a copy loaded again off the card -- builds the game
+//     from nothing.
+//
+// The screen is the shell's: init() returned it, and it deletes it once this
+// returns. The best score and the sound switch are in `<addon>/state.ini` on the
+// card (fstate.h) and are written as they change, so nothing is left unsaved.
+//
+// True: the mixer is joined, which is the only thread there was, so when this
+// returns nothing of this library runs. The answer is a bool because the loader
+// asks it of the whole addon (addon.h).
+bool flappybird_stop(void) {
+	// On the display, the page's own teardown is the right one -- it also puts
+	// back the status bar and the chevron this page hides. Already left, that
+	// has happened and only the buffers are still worth releasing.
+	if (active) {
+		screen_unloaded_cb(NULL);
+	} else {
+		release_all();
+	}
+
+	if (tick_timer) {
+		power_forget_timer(tick_timer);
+		lv_timer_delete(tick_timer);
+		tick_timer = NULL;
+	}
+
+	frame_image = NULL;
+	flappybird_screen = NULL;
+
+	// The run: everything a tick reads.
+	active = false;
+	dirty = false;
+	frame_whole = false;
+	moved_n = 0;
+	changed_n = 0;
+	pressed_button = BTN_NONE;
+	fade_t = -1;
+	fade_action = NULL;
+	flash_t = -1;
+	over_t = 0;
+	score = 0;
+	new_best = false;
+	best_unsaved = false;
+	look_kept = false;
+	sound_on = false;
+	state = ST_TITLE;
+	memset(pipes, 0, sizeof(pipes));
+	memset(&stats, 0, sizeof(stats));
+	flappy_art_dir[0] = '\0'; // set again by the addon's init(), from its folder
+
+	return true;
+}

@@ -37,4 +37,14 @@ void flappybird_set_home(const char *dir);
 // file is missing.
 bool flappybird_load(void);
 
+// The library is being unmapped: the mixer thread joined and the PCM closed, the
+// artwork and the frame freed, the tick timer forgotten by the power manager and
+// deleted, every pointer into the screen dropped. Flappy Bird registers no theme
+// hook. The screen itself is the shell's to delete.
+//
+// True when the threads are out -- the mixer's join is the only wait, and it
+// always finishes. False is reserved for a worker the player cannot interrupt,
+// which would keep the library mapped (addon.h).
+bool flappybird_stop(void);
+
 #endif /* GUI_FLAPPYBIRD_H */

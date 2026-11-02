@@ -73,7 +73,8 @@ void yandexcache_track_id(const char *path, char *out, size_t size);
 // The track downloading right now, or an empty string.
 void yandexcache_downloading_id(char *out, size_t size);
 
-// Gives up every download in flight (registered with streamturn as well).
+// Gives up every download in flight (registered with streamturn as well, and
+// unregistered when the library is unloaded: yandexcache_stop).
 void yandexcache_abandon_all(void);
 
 // --- what the rest of the player asks (service.h, through yandexservice.c) ---
@@ -116,5 +117,11 @@ void yandexcache_clear(void);
 // Shutdown, restart, update, factory reset: the cache does not survive a power
 // cycle.
 void yandexcache_clear_on_exit(void);
+
+// The addon being unloaded: the downloads are abandoned, the download thread is
+// waited for and the module forgets the card (the files stay). Called from the
+// addon's stop hook, before the library is unmapped and before libcrypto is
+// closed.
+bool yandexcache_stop(void);
 
 #endif /* YANDEXCACHE_H */

@@ -19,8 +19,10 @@
 extern lv_obj_t *dino_screen;
 
 void dino_init(gui_config_t *cfg);
-
 // Opens the page. The run starts on the card, not before it.
 void dino_open(void);
+// The addon's stop(): tears the frame down and drops every pointer into the
+// screen, which the shell deletes right afterwards.
+void dino_stop(void);
 
 #endif /* GUI_DINO_H */

@@ -48,6 +48,10 @@ void yandexwave_begin(const yandex_track_t *first, int count, yandexwave_batch_c
 void yandexwave_end(void);
 bool yandexwave_running(void);
 
+// The addon being unloaded: the worker ends (waited for), the wave is
+// forgotten and nothing is reported. GUI thread, from the addon's stop hook.
+bool yandexwave_stop(void);
+
 // Once a second while the wave is the queue. `current` is the wave track
 // loaded now (NULL when what plays is not one of the wave's), `playing`
 // whether it is sounding, `remaining` how many tracks are queued after it in

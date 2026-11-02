@@ -11,6 +11,7 @@
 #include "src/system/core/utils.h"
 #include "src/system/streaming/zvukcache.h"
 #include "src/system/streaming/zvukdl.h"
+#include "src/system/streaming/zvukstop.h"
 
 // See zvuksync.h.
 
@@ -36,6 +37,10 @@ static int queue_head, queue_len;
 static bool worker_started, load_queued;
 static long load_retry_after;
 
+// The one worker, and the flag that tells it to leave: see zvukstop.h.
+static zvuk_stop_t threads = ZVUK_STOP_INIT;
+static bool stopping;
+
 static long monotonic_secs(void) {
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
@@ -46,14 +51,26 @@ static void *worker_main(void *arg);
 
 static void submit(const job_t *job) {
 	pthread_mutex_lock(&lock);
+	if (stopping) {
+		// The library is being unloaded: a write accepted now would be one the
+		// worker below never makes.
+		pthread_mutex_unlock(&lock);
+		return;
+	}
 	if (!worker_started) {
 		pthread_t thread;
 		pthread_attr_t attr;
 		pthread_attr_init(&attr);
 		pthread_attr_setstacksize(&attr, 256 * 1024);
+		// Counted before it exists, uncounted if it never started, under `lock`:
+		// zvuksync_stop() holds the same lock to set `stopping`, so no thread
+		// can appear after its wait began.
+		zvuk_stop_enter(&threads);
 		if (pthread_create(&thread, &attr, worker_main, NULL) == 0) {
 			pthread_detach(thread);
 			worker_started = true;
+		} else {
+			zvuk_stop_leave(&threads);
 		}
 		pthread_attr_destroy(&attr);
 	}
@@ -114,12 +131,17 @@ static void run_job(const job_t *job) {
 
 static void *worker_main(void *arg) {
 	(void)arg;
+	// Counted by submit(), under the lock that decides whether it may start.
 	// Nice ten, as yandexsync.c explains: a like is a tap waiting.
 	thread_be_low_priority("zvuk sync");
 	for (;;) {
 		pthread_mutex_lock(&lock);
-		while (queue_len == 0) {
+		while (queue_len == 0 && !stopping) {
 			pthread_cond_wait(&ready, &lock);
+		}
+		if (stopping) {
+			pthread_mutex_unlock(&lock);
+			break;
 		}
 		job_t job = queue[queue_head];
 		queue_head = (queue_head + 1) % QUEUE_MAX;
@@ -130,6 +152,7 @@ static void *worker_main(void *arg) {
 		pthread_mutex_unlock(&lock);
 		run_job(&job);
 	}
+	zvuk_stop_leave(&threads);
 	return NULL;
 }
 
@@ -160,5 +183,33 @@ void zvuksync_likes_refresh(void (*done)(void)) {
 // here: it is zvukservice.c, filled from these functions the way
 // addons/qobuz fills its own (docs/ADDONS.md, "A service rather than an
 // app"). zvuksync.c is the writes.
+
+// ---------------------------------------------------------------------------
+// stopping
+// ---------------------------------------------------------------------------
+
+bool zvuksync_stop(void) {
+	pthread_mutex_lock(&lock);
+	stopping = true;
+	// Writes still in the queue are not made: a like is a request of its own
+	// and the mirror that answered the tap at once goes with this library
+	// anyway. The one in flight -- a like is a short POST -- finishes or hits
+	// the wait below.
+	queue_head = 0;
+	queue_len = 0;
+	load_queued = false;
+	load_retry_after = 0;
+	pthread_cond_broadcast(&ready);
+	pthread_mutex_unlock(&lock);
+
+	bool gone = zvuk_stop_wait(&threads, "sync worker");
+	if (gone) {
+		pthread_mutex_lock(&lock);
+		worker_started = false;
+		stopping = false; // a second init() starts it again
+		pthread_mutex_unlock(&lock);
+	}
+	return gone;
+}
 
 #endif /* SONIX_ZVUK */

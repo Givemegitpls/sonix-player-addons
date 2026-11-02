@@ -108,6 +108,23 @@
 // is no longer playing.
 #define TICK_PERIOD_MS 1000
 
+// The longest stop() lets a request finish before it says so in the log and
+// joins it anyway. Every wait inside a job watches `stopping`, so this is a
+// fallback and not the normal case: a worker in poll() or in the engine's
+// start-up window gives up within one step of its own.
+#define STOP_JOB_WAIT_MS 2000
+
+// The longest one poll() may block while a request waits for its answer. The
+// reply timeout is twelve seconds and stop() runs on the GUI thread: a single
+// poll of that length would outlive the unload and leave a thread executing
+// code that has been unmapped.
+#define ENGINE_POLL_SLICE_MS 100
+
+// Requests in flight at once. One is the normal number -- the tick skips while a
+// job runs -- and the rest are the taps that arrive while an answer is on its
+// way. Bounded because each one is a thread stop() has to join.
+#define WORKER_MAX 8
+
 // Characters of a row's name that are kept; the rest is an ellipsis.
 #define ROW_NAME_CHARS 20
 
@@ -141,6 +158,7 @@ typedef struct {
 	job_kind_t kind;
 	char request[ENGINE_REQUEST_MAX];
 	int generation;
+	int slot; // where this worker's thread is recorded, for stop() to join
 	char title[80];
 } job_t;
 
@@ -180,6 +198,23 @@ static pthread_mutex_t job_lock = PTHREAD_MUTEX_INITIALIZER;
 static int list_latest;
 static int jobs_running;
 
+// Set by stop(), never cleared until it has joined everything: no new job
+// starts, and every wait inside a job -- the engine's start-up window, the poll
+// for its answer -- gives up promptly instead of living past the unload.
+// Volatile because those two loops read it outside job_lock, on a worker.
+static volatile bool stopping;
+
+// The workers, kept joinable. `jobs_running` says how many are busy; these say
+// *which threads they are*, because stop() has to wait for the last instruction
+// of each, and a counter decremented a few instructions early is not that. A
+// slot is only handed to a new job once its thread has been joined.
+typedef struct {
+	pthread_t thread;
+	bool used;
+	bool done; // the worker's last act before it leaves the function
+} worker_slot_t;
+static worker_slot_t workers[WORKER_MAX];
+
 static store_t credentials;
 
 static lv_obj_t *home_screen;
@@ -197,6 +232,16 @@ static keyboard_t *search_keyboard;
 static lv_obj_t *row_engine_value;
 static lv_obj_t *row_account_value;
 static lv_obj_t *row_error_value;
+
+// The one-second status poll, this run's own: created in init(), deleted in
+// stop(). Kept for that reason alone.
+static lv_timer_t *tick_timer;
+
+// The id the host gave this addon, copied in init(). Every top-level screen the
+// addon makes is registered with sonix_addon_own_screen() under it, so the shell
+// knows what to switch off and delete when the library is unloaded -- the screen
+// init() returns and the three the pages switch to by themselves.
+static char addon_id[ADDON_ID_MAX];
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -675,7 +720,7 @@ static bool engine_spawn_locked(char *why, size_t why_size) {
 		// the *thread* that forked, not the process, and this fork happens on a
 		// worker that exits a moment later -- the engine would be killed by its
 		// own request. The engine's life is managed explicitly instead: the
-		// tick below and spotify_atexit().
+		// tick below, and spotify_stop().
 		int null_fd = open("/dev/null", O_RDONLY);
 		if (null_fd >= 0) {
 			dup2(null_fd, STDIN_FILENO);
@@ -693,7 +738,10 @@ static bool engine_spawn_locked(char *why, size_t why_size) {
 	fprintf(stderr, "spotify: engine pid %d, socket %s, http port %d\n", (int)pid, engine_socket, port);
 
 	int waited = 0;
-	while (waited < ENGINE_SOCKET_WAIT_MS) {
+	// `stopping` as well as the clock: a stop() that arrives while the engine is
+	// still coming up must not wait out the whole three seconds before it can
+	// join this worker -- the failure path below kills what was started.
+	while (waited < ENGINE_SOCKET_WAIT_MS && !stopping) {
 		if (access(engine_socket, F_OK) == 0) {
 			char note[48];
 			snprintf(note, sizeof(note), "engine loaded (%d)", port);
@@ -755,10 +803,15 @@ static void engine_stop_locked(void) {
 		int status = 0;
 		// The engine removes its socket and exits on SIGTERM within a few
 		// milliseconds; three seconds is where waiting stops being a shutdown
-		// and becomes a hang.
+		// and becomes a hang. Half a second once the addon is being unloaded,
+		// whenever the flag arrives: SIGKILL follows, and the GUI thread is
+		// inside stop() waiting for this call.
 		for (int i = 0; i < 30; i++) {
 			if (waitpid(pid, &status, WNOHANG) == pid) {
 				reaped = true;
+				break;
+			}
+			if (stopping && i >= 5) {
 				break;
 			}
 			usleep(100000);
@@ -775,29 +828,22 @@ static void engine_stop_locked(void) {
 	unlink(engine_socket);
 }
 
-// The deinit() the addon interface does not have (src/addon/addon.h: an addon
-// is never unloaded, and the player has no shutdown path). Two things stand in
-// for one: the leave-the-page check in tick_cb(), and this handler, which keeps
-// an engine from outliving the player process.
-static void spotify_atexit(void) {
-	if (engine_pid <= 0) {
-		return;
-	}
-	pid_t pid = engine_pid;
-	kill(pid, SIGTERM);
-	for (int i = 0; i < 10; i++) {
-		if (waitpid(pid, NULL, WNOHANG) == pid) {
-			engine_pid = 0;
-			unlink(engine_socket);
-			return;
-		}
-		usleep(50000);
-	}
-	kill(pid, SIGKILL);
-	waitpid(pid, NULL, 0);
-	engine_pid = 0;
-	unlink(engine_socket);
-}
+// ---------------------------------------------------------------------------
+// The stop half
+//
+// There is no atexit() any more, and there must not be: the library is
+// dlopen()ed from the card and dlclose()d when the card leaves or its files
+// change, and a handler registered with the process would later call into a page
+// that is no longer mapped. What the handler did -- kill the engine and remove
+// its socket -- is what stop() does now, at the only moment it is safe.
+//
+// Running the interface without an engine to talk to is the price of an unload:
+// the engine is a child process whose lifetime is this library's, and a library
+// that goes away while its child runs leaves a process nobody can ever name
+// (its socket is gone with the library). So the engine is stopped here, and a
+// stream that was playing from it stops with it: the alternative is a decoder
+// reading a pipe whose other end belongs to a library that no longer exists.
+// ---------------------------------------------------------------------------
 
 // One request line in, one answer line out: the engine speaks exactly one
 // exchange per connection and then closes it.
@@ -829,9 +875,22 @@ static bool engine_exchange_locked(const char *request, char *reply, size_t size
 	}
 
 	size_t used = 0;
+	int waited_ms = 0;
 	for (;;) {
+		if (stopping) {
+			// stop() is on the GUI thread waiting to join this worker: give up
+			// now rather than leave a thread in a library that is going away.
+			snprintf(why, why_size, "the addon is stopping");
+			break;
+		}
+		// In slices, not one twelve-second wait. The whole reply budget is still
+		// ENGINE_REPLY_TIMEOUT_MS, but `stopping` is looked at every slice.
+		int slice = ENGINE_REPLY_TIMEOUT_MS - waited_ms;
+		if (slice > ENGINE_POLL_SLICE_MS) {
+			slice = ENGINE_POLL_SLICE_MS;
+		}
 		struct pollfd watching = {.fd = fd, .events = POLLIN, .revents = 0};
-		int ready = poll(&watching, 1, ENGINE_REPLY_TIMEOUT_MS);
+		int ready = poll(&watching, 1, slice);
 		if (ready < 0) {
 			if (errno == EINTR) {
 				continue;
@@ -840,6 +899,10 @@ static bool engine_exchange_locked(const char *request, char *reply, size_t size
 			break;
 		}
 		if (ready == 0) {
+			waited_ms += slice;
+			if (waited_ms < ENGINE_REPLY_TIMEOUT_MS) {
+				continue;
+			}
 			snprintf(why, why_size, "the engine did not answer");
 			break;
 		}
@@ -959,6 +1022,9 @@ static const char *job_name(job_kind_t kind) {
 
 static void *worker(void *argument) {
 	job_t *job = argument;
+	// Read before anything can free the job: the last thing this function does
+	// is report to the slot that the thread is leaving.
+	int slot = job->slot;
 	char *reply = calloc(1, ENGINE_REPLY_MAX);
 	char why[160];
 	why[0] = '\0';
@@ -1019,16 +1085,100 @@ finish:
 	free(reply);
 	pthread_mutex_lock(&job_lock);
 	jobs_running--;
+	bool going = stopping;
 	pthread_mutex_unlock(&job_lock);
-	if (post && !gui_post(job_finished, job)) {
+	if (going) {
+		// The addon is being unloaded: the answer has no interface left to go
+		// to, and the job must not outlive the join below.
 		free(job);
-	} else if (!post) {
+	} else if (!post || !gui_post(job_finished, job)) {
 		free(job);
 	}
+	// The last statement, and the reason the interface keeps these threads
+	// joinable: stop() waits on it to know this thread has left every line of
+	// this library, which is more than `jobs_running` can say.
+	pthread_mutex_lock(&job_lock);
+	workers[slot].done = true;
+	pthread_mutex_unlock(&job_lock);
 	return NULL;
 }
 
+// Joins the workers that have said they are done, and only those: a live one is
+// still working and start_job() has no business blocking on it. Called from the
+// GUI thread, never under job_lock -- a thread being joined takes that lock on
+// its way out.
+static void workers_reap(void) {
+	pthread_t finished[WORKER_MAX];
+	int count = 0;
+	pthread_mutex_lock(&job_lock);
+	for (int i = 0; i < WORKER_MAX; i++) {
+		if (workers[i].used && workers[i].done) {
+			finished[count++] = workers[i].thread;
+			workers[i].used = false;
+			workers[i].done = false;
+		}
+	}
+	pthread_mutex_unlock(&job_lock);
+	for (int i = 0; i < count; i++) {
+		pthread_join(finished[i], NULL);
+	}
+}
+
+// Whether every worker has reported that it is done -- which is one statement
+// before the thread leaves, so it is the count the join can be built on.
+static bool workers_all_done(void) {
+	bool done = true;
+	pthread_mutex_lock(&job_lock);
+	for (int i = 0; i < WORKER_MAX; i++) {
+		if (workers[i].used && !workers[i].done) {
+			done = false;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&job_lock);
+	return done;
+}
+
+// Joins every worker still recorded, finished or not. stop() has already asked
+// them to give up, so the wait here is the tail of a poll() or of a usleep().
+static void workers_join_all(void) {
+	pthread_t joining[WORKER_MAX];
+	int count = 0;
+	pthread_mutex_lock(&job_lock);
+	for (int i = 0; i < WORKER_MAX; i++) {
+		if (!workers[i].used) {
+			continue;
+		}
+		if (!workers[i].done) {
+			fprintf(stderr, "spotify: stop: a worker had not finished on its own; joining it\n");
+		}
+		joining[count++] = workers[i].thread;
+		// Nobody can take the slot while this runs: stop() clears `stopping`
+		// only after the joins below.
+		workers[i].used = false;
+	}
+	pthread_mutex_unlock(&job_lock);
+	for (int i = 0; i < count; i++) {
+		pthread_join(joining[i], NULL);
+	}
+	// After the joins, not before: the worker's last act is a write into its own
+	// slot, and it has now left.
+	memset(workers, 0, sizeof(workers));
+}
+
 static void start_job(job_kind_t kind, const char *request, const char *title) {
+	pthread_mutex_lock(&job_lock);
+	bool going = stopping;
+	pthread_mutex_unlock(&job_lock);
+	if (going) {
+		// stop() has begun: nothing new may touch the engine or the screens.
+		return;
+	}
+	// The threads of the requests that have answered are collected before a new
+	// one is made, so that a session of a thousand status polls leaves a handful
+	// of slots rather than a thousand unreaped threads.
+	workers_reap();
+
 	job_t *job = calloc(1, sizeof(*job));
 	if (!job) {
 		gui_notify_popup("out of memory");
@@ -1038,30 +1188,91 @@ static void start_job(job_kind_t kind, const char *request, const char *title) {
 	copy_text(job->request, sizeof(job->request), request);
 	copy_text(job->title, sizeof(job->title), title);
 
+	int slot = -1;
 	pthread_mutex_lock(&job_lock);
-	if (is_list_job(kind)) {
-		job->generation = ++list_latest;
+	if (!stopping) {
+		for (int i = 0; i < WORKER_MAX; i++) {
+			if (!workers[i].used) {
+				workers[i].used = true;
+				workers[i].done = false;
+				job->slot = i;
+				slot = i;
+				break;
+			}
+		}
 	}
-	jobs_running++;
+	if (slot >= 0) {
+		if (is_list_job(kind)) {
+			job->generation = ++list_latest;
+		}
+		jobs_running++;
+	}
 	pthread_mutex_unlock(&job_lock);
+
+	if (slot < 0) {
+		// Either stop() began between the two checks, or every slot is taken by
+		// a request still waiting for its answer.
+		fprintf(stderr, "spotify: %s [%s] dropped: no worker free\n", job_name(kind), title);
+		free(job);
+		return;
+	}
 
 	fprintf(stderr, "spotify: job %s [%s] %s\n", job_name(kind), job->title, job->request);
 
-	pthread_t thread;
-	if (pthread_create(&thread, NULL, worker, job) != 0) {
+	// Joinable, not detached: stop() has to be able to wait for the thread, and
+	// a detached one can be a few instructions from returning when dlclose()
+	// unmaps the code it is returning through.
+	if (pthread_create(&workers[slot].thread, NULL, worker, job) != 0) {
 		pthread_mutex_lock(&job_lock);
 		jobs_running--;
+		memset(&workers[slot], 0, sizeof(workers[slot]));
 		pthread_mutex_unlock(&job_lock);
 		free(job);
 		gui_notify_popup("could not start a worker thread");
 		return;
 	}
-	pthread_detach(thread);
 }
 
 // ---------------------------------------------------------------------------
 // Screens
 // ---------------------------------------------------------------------------
+
+// Every top-level screen this addon makes is registered the moment it exists.
+// The shell keeps the list and, on unload, moves the display off whichever of
+// them is up, forgets them in the back-stack and in the player sheet, and
+// deletes them after stop(); without the list it knows only the screen init()
+// returned, and a page the addon opened by itself would be left on the display
+// with its callbacks in a library that is being unmapped.
+static void own_screen(lv_obj_t *screen) {
+	if (screen && addon_id[0]) {
+		sonix_addon_own_screen(addon_id, screen);
+	}
+}
+
+// The same four screens again, from the first time the shell actually shows
+// home. Not redundant in this build: lib_open() takes init()'s return value as
+// the first entry of its own list *after* init() returned, and resets the count
+// to one as it does -- so what the four calls above registered during init() is
+// gone by the time the tile is on screen. Switching to home is the first moment
+// that bookkeeping is finished, and the call is a set (a screen already known is
+// ignored), so this costs four strcmps and works whether or not that reset stays.
+static bool screens_owned;
+
+static void own_all_screens(void) {
+	own_screen(home_screen);
+	own_screen(list_screen);
+	own_screen(login_screen);
+	own_screen(search_screen);
+}
+
+static void home_shown_cb(lv_event_t *e) {
+	(void)e;
+	if (screens_owned) {
+		return;
+	}
+	screens_owned = true;
+	own_all_screens();
+}
 
 // A page that scrolls, unlike settingsrow_page(): a list of search results is
 // taller than the panel.
@@ -1413,6 +1624,10 @@ static void playlists_cb(lv_event_t *e) {
 
 static void home_build(void) {
 	home_screen = lv_obj_create(NULL);
+	own_screen(home_screen);
+	// The moment the shell has finished its own list, it shows this page: that is
+	// where the other three screens are registered a second time (own_all_screens).
+	lv_obj_add_event_cb(home_screen, home_shown_cb, LV_EVENT_SCREEN_LOADED, NULL);
 	home_page = scrolling_page(home_screen, "Spotify");
 
 	// The engine first: everything below it is only meaningful if this row says
@@ -1447,11 +1662,13 @@ static lv_obj_t *make_field(lv_obj_t *parent, const char *placeholder, int y) {
 
 static void build_list_screen(void) {
 	list_screen = lv_obj_create(NULL);
+	own_screen(list_screen);
 	list_container = scrolling_page(list_screen, "Spotify");
 }
 
 static void build_login_screen(void) {
 	login_screen = lv_obj_create(NULL);
+	own_screen(login_screen);
 	lv_obj_add_style(login_screen, &theme_style_screen, 0);
 	settingsrow_title(login_screen, config, "Spotify sign in");
 	int top = settingsrow_content_top(config);
@@ -1498,6 +1715,7 @@ static void build_login_screen(void) {
 
 static void build_search_screen(void) {
 	search_screen = lv_obj_create(NULL);
+	own_screen(search_screen);
 	lv_obj_add_style(search_screen, &theme_style_screen, 0);
 	settingsrow_title(search_screen, config, "Spotify search");
 	search_field = make_field(search_screen, "what to look for", settingsrow_content_top(config) + SC(10));
@@ -1564,6 +1782,8 @@ static void tick_cb(lv_timer_t *timer) {
 
 static lv_obj_t *spotify_init(const sonix_addon_host_t *host) {
 	config = host->cfg;
+	// Before the first screen exists: own_screen() names the addon to the shell.
+	copy_text(addon_id, sizeof(addon_id), host->id);
 	copy_text(addon_dir, sizeof(addon_dir), host->dir);
 	lv_snprintf(credentials_path, sizeof(credentials_path), "%s/credentials.ini", addon_dir);
 	lv_snprintf(state_dir, sizeof(state_dir), "%s/state", addon_dir);
@@ -1584,15 +1804,21 @@ static lv_obj_t *spotify_init(const sonix_addon_host_t *host) {
 	bool known = store_load(&credentials);
 	fprintf(stderr, "spotify: credentials %s (%s)\n", credentials_path, known ? "read" : "none");
 
-	// The screens are built once: init() runs once per player process.
+	// The screens are built once per load: the shell unloads the library rather
+	// than calling init() again, and stop() below is what makes a second run of
+	// this function in one process a clean start.
 	home_build();
 	build_list_screen();
 	build_login_screen();
 	build_search_screen();
 
-	// Two stand-ins for the deinit() this interface does not have.
-	atexit(spotify_atexit);
-	lv_timer_create(tick_cb, TICK_PERIOD_MS, NULL);
+	// The status poll, this run's own: stop() deletes it, and a run that somehow
+	// begins with one already there replaces it rather than leaving two ticks
+	// asking the same engine the same question.
+	if (tick_timer) {
+		lv_timer_delete(tick_timer);
+	}
+	tick_timer = lv_timer_create(tick_cb, TICK_PERIOD_MS, NULL);
 
 	// The engine is started by this first status job rather than by init()
 	// itself: fork/execv and the wait for the socket are on the worker thread,
@@ -1602,14 +1828,164 @@ static lv_obj_t *spotify_init(const sonix_addon_host_t *host) {
 	return home_screen;
 }
 
+// The widgets of this run. The screens themselves are the shell's: every one of
+// them was registered with sonix_addon_own_screen(), and the shell deletes them
+// after stop() returns -- with the keyboards inside them, which keyboard.c now
+// unlinks and frees on LV_EVENT_DELETE.
+static void forget_widgets(void) {
+	home_screen = NULL;
+	home_page = NULL;
+	list_screen = NULL;
+	list_container = NULL;
+	login_screen = NULL;
+	search_screen = NULL;
+	search_field = NULL;
+	login_user_field = NULL;
+	login_password_field = NULL;
+	login_keyboard = NULL;
+	search_keyboard = NULL;
+	row_engine_value = NULL;
+	row_account_value = NULL;
+	row_error_value = NULL;
+}
+
+static bool stop_with_workers_running(void);
+
+// The stop half of the interface (src/addon/addon.h). Runs on the GUI thread;
+// the shell deletes the four registered screens and, when this returns true,
+// dlclose()s this library right after -- so nothing below may leave a thread, a
+// timer, a child or a static behind.
+//
+// The answer is the contract's: true means the library is safe to unmap, false
+// means a worker is still inside it. Every wait inside a job watches `stopping`,
+// so false should not happen -- but a socket the kernel will not wake, or a
+// thread stuck behind one of the mutexes, is exactly the case the flag cannot
+// paper over, and saying so is better than being unmapped under the thread.
+//
+// What there is to undo, in the order it has to happen:
+//
+//   1. the flag and the tick: no new request, and no timer that would start one;
+//   2. the workers: asked to give up, waited for (bounded, and answered false
+//      past the bound) and then joined -- the join, not the counter, is what
+//      says the thread has left this library's code;
+//   3. the engine process, and the socket file beside it;
+//   4. the pointers: four screens and two keyboards that belong to the shell
+//      from here (it deletes them next -- they are registered with
+//      sonix_addon_own_screen(), so it has all four), and every piece of per-run
+//      state a second init() would inherit.
+//
+// There is no atexit() in this library, and there must never be one again: the
+// handler would be a call into a page that is no longer mapped, from a process
+// that outlives the library by hours.
+static bool spotify_stop(void) {
+	// 1. Nothing new starts. Every wait inside a job looks at this flag -- the
+	// engine's three-second start-up and the twelve-second poll for its answer
+	// -- so the wait in step 2 is the tail of one slice, not the whole of one.
+	pthread_mutex_lock(&job_lock);
+	stopping = true;
+	pthread_mutex_unlock(&job_lock);
+
+	if (tick_timer) {
+		lv_timer_delete(tick_timer);
+		tick_timer = NULL;
+	}
+
+	// 2. The workers.
+	int waited = 0;
+	while (!workers_all_done()) {
+		if (waited >= STOP_JOB_WAIT_MS) {
+			return stop_with_workers_running();
+		}
+		usleep(50 * 1000);
+		waited += 50;
+	}
+	workers_join_all();
+
+	// 3. The child. `engine_lock` as everywhere else that touches its pid, its
+	// port or its socket; no worker is left to hold it by now.
+	pthread_mutex_lock(&engine_lock);
+	engine_stop_locked();
+	pthread_mutex_unlock(&engine_lock);
+	// Whatever way the process ended, the socket is a file this addon made.
+	unlink(engine_socket);
+
+	// 4. The pointers. The screens are the shell's to delete after this returns;
+	// the keyboards live inside them, so a stored keyboard_t* would be a
+	// dangling pointer in the next run.
+	forget_widgets();
+
+	config = NULL;
+	addon_id[0] = '\0';
+	addon_dir[0] = '\0';
+	credentials_path[0] = '\0';
+	state_dir[0] = '\0';
+	engine_binary[0] = '\0';
+	engine_binary_present = false;
+	engine_socket[0] = '\0';
+	screens_owned = false;
+
+	pthread_mutex_lock(&data_lock);
+	copy_text(engine_note, sizeof(engine_note), "engine not built");
+	copy_text(account_state, sizeof(account_state), "unknown");
+	account_error[0] = '\0';
+	list_error[0] = '\0';
+	memset(items, 0, sizeof(items));
+	item_count = 0;
+	pthread_mutex_unlock(&data_lock);
+
+	pthread_mutex_lock(&job_lock);
+	list_latest = 0;
+	stopping = false; // init() is a fresh start after this
+	pthread_mutex_unlock(&job_lock);
+
+	// The credentials store is a struct in this library, not an open file.
+	memset(&credentials, 0, sizeof(credentials));
+	return true;
+}
+
+// The false answer, and the little that can still be done while a worker is
+// inside the library: an engine whose lock is free is taken down, and the widget
+// pointers go because the shell deletes the screens whether or not this addon
+// asked for another chance. The rest is left alone on purpose -- the library
+// stays mapped, and its worker keeps writing state this run will never read
+// again, but nothing it can touch has been freed.
+static bool stop_with_workers_running(void) {
+	fprintf(stderr, "spotify: stop: a worker is still inside the library after %d ms; not safe to unload\n",
+			STOP_JOB_WAIT_MS);
+
+	if (pthread_mutex_trylock(&engine_lock) == 0) {
+		engine_stop_locked();
+		pthread_mutex_unlock(&engine_lock);
+		unlink(engine_socket);
+	} else {
+		// The worker that holds it is the one that is not finished. SIGTERM behind
+		// its back would race its own bookkeeping of engine_pid, so the child is
+		// left to the process exit.
+		fprintf(stderr, "spotify: stop: the engine is left running; a worker holds engine_lock\n");
+	}
+
+	forget_widgets();
+	// `stopping` stays set: no new request, no new screen, no second init.
+	return false;
+}
+
 static const sonix_addon_t spotify = {
 	.api = SONIX_ADDON_API,
 	.title = "Spotify",
 	.init = spotify_init,
 };
 
+static const sonix_addon_stop_t spotify_lifecycle = {
+	.api = SONIX_ADDON_API,
+	.stop = spotify_stop,
+};
+
 const sonix_addon_t *sonix_addon_entry(uint32_t api) {
 	return api == SONIX_ADDON_API ? &spotify : NULL;
+}
+
+const sonix_addon_stop_t *sonix_addon_stop_entry(uint32_t api) {
+	return api == SONIX_ADDON_API ? &spotify_lifecycle : NULL;
 }
 
 // The service half.

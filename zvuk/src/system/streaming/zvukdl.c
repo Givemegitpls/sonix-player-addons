@@ -27,6 +27,7 @@
 #include "src/system/streaming/streamcover.h"
 #include "src/system/streaming/zvukcache.h"
 #include "src/system/streaming/zvukcompat.h"
+#include "src/system/streaming/zvukstop.h"
 
 // See zvukdl.h.
 
@@ -828,6 +829,10 @@ static unsigned generation;
 static zvukdl_status_t status;
 static void (*listener)(zvukdl_event_t, int, const char *);
 
+// The save worker and the flag that tells it to leave: see zvukstop.h.
+static zvuk_stop_t threads = ZVUK_STOP_INIT;
+static bool stopping;
+
 void zvukdl_set_listener(void (*cb)(zvukdl_event_t event, int count, const char *text)) { listener = cb; }
 
 static void tell(zvukdl_event_t event, int count, const char *text) {
@@ -1105,12 +1110,17 @@ static void library_look(void *user) {
 
 static void *worker_main(void *arg) {
 	(void)arg;
+	// Counted by enqueue(), under the lock that decides whether a save may start.
 	thread_be_low_priority("zvuk save");
 	zvuk_http_set_thread_stream_headers(zvuk_stream_headers());
 	for (;;) {
 		pthread_mutex_lock(&lock);
-		while (queue_len == 0) {
+		while (queue_len == 0 && !stopping) {
 			pthread_cond_wait(&ready, &lock);
+		}
+		if (stopping) {
+			pthread_mutex_unlock(&lock);
+			break;
 		}
 		entry_t e = queue[0];
 		memmove(queue, queue + 1, (size_t)(--queue_len) * sizeof(*queue));
@@ -1188,12 +1198,13 @@ static void *worker_main(void *arg) {
 			}
 		}
 	}
+	zvuk_stop_leave(&threads);
 	return NULL;
 }
 
 static bool enqueue(const entry_t *e) {
 	pthread_mutex_lock(&lock);
-	if (!root[0] || queue_len >= QUEUE_MAX) {
+	if (!root[0] || stopping || queue_len >= QUEUE_MAX) {
 		pthread_mutex_unlock(&lock);
 		return false;
 	}
@@ -1218,7 +1229,14 @@ static bool enqueue(const entry_t *e) {
 		pthread_attr_init(&attr);
 		pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 		pthread_attr_setstacksize(&attr, 256 * 1024);
+		// Counted before it exists, under `lock` -- zvukdl_stop() sets
+		// `stopping` under the same lock, so the wait it does cannot miss a
+		// thread created here.
+		zvuk_stop_enter(&threads);
 		worker_started = pthread_create(&th, &attr, worker_main, NULL) == 0;
+		if (!worker_started) {
+			zvuk_stop_leave(&threads);
+		}
 		pthread_attr_destroy(&attr);
 	}
 	pthread_cond_signal(&ready);
@@ -1323,6 +1341,50 @@ void zvukdl_set_root(const char *sd_root) {
 	if (changed) {
 		zvukdl_cancel_all();
 	}
+}
+
+// ---------------------------------------------------------------------------
+// stopping
+// ---------------------------------------------------------------------------
+
+bool zvukdl_stop(void) {
+	// The listener first, and before the wait: it is page code, and the worker
+	// below is the thread that calls it.
+	listener = NULL;
+
+	// A detached fetch (zvukcache_fetch) runs on the worker's thread and can be
+	// minutes of network; the abandon flag is the way to end it now rather than
+	// at its timeout.
+	zvukcache_fetch_cancel();
+
+	pthread_mutex_lock(&lock);
+	stopping = true;
+	queue_len = 0;
+	generation++; // a save in flight is no longer the save whose result counts
+	status = (zvukdl_status_t){0};
+	running = false;
+	music_saved_pending = false;
+	pthread_cond_broadcast(&ready);
+	pthread_mutex_unlock(&lock);
+
+	bool gone = zvuk_stop_wait(&threads, "save worker");
+
+	pthread_mutex_lock(&lock);
+	if (gone) {
+		worker_started = false;
+		stopping = false; // a second init() starts the worker again
+		// The index of saved tracks, and the queue's array: the next init reads
+		// the card again and the root it is given is that card.
+		free(queue);
+		queue = NULL;
+		index_forget();
+	}
+	pthread_mutex_unlock(&lock);
+
+	// Which saved files were this queue's is the library's question again once
+	// the library is gone.
+	zvukdl_claim(NULL, 0);
+	return gone;
 }
 
 #endif /* SONIX_ZVUK */

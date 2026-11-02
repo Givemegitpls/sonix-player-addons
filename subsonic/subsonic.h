@@ -107,6 +107,11 @@ bool subsonic_login(const char *server, const char *user, const char *password);
 // typing the password again).
 void subsonic_logout(void);
 
+// Drops the session and the settings from memory without writing anything, for
+// the addon's stop(): the file on the card stays as it is, so the copy loaded
+// next still finds the session. The session's own lock is re-used, not rebuilt.
+void subsonic_forget(void);
+
 // Why the last call failed, fit to display. Per thread, like http_last_error().
 const char *subsonic_last_error(void);
 

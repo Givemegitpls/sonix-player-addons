@@ -1896,4 +1896,42 @@ bool zvuk_check_connection(char *report, size_t size) {
 	return ok;
 }
 
+// ---------------------------------------------------------------------------
+// stopping
+// ---------------------------------------------------------------------------
+
+void zvuk_release(void) {
+	// What init() would otherwise inherit: a session, a mirror of the
+	// collection, and the pace the previous run's requests left behind. Nothing
+	// here holds a descriptor or a thread -- the writes are zvuksync's, the
+	// downloads are zvukcache's -- and a second init() in the same process then
+	// starts from the card as the first one did.
+	pthread_mutex_lock(&session_lock);
+	memset(token, 0, sizeof(token));
+	user_name[0] = plan[0] = '\0';
+	plan_expires = 0;
+	session_store = (store_t){0};
+	expired = false;
+	needs_subscription = false;
+	session_fresh = true;
+	pthread_mutex_unlock(&session_lock);
+
+	pthread_mutex_lock(&liked_lock);
+	for (int k = 0; k < ZVUK_ITEM_KINDS; k++) {
+		free(liked[k].ids);
+		liked[k] = (id_set_t){0};
+	}
+	pthread_mutex_unlock(&liked_lock);
+
+	pthread_mutex_lock(&format_lock);
+	last_format[0] = '\0';
+	pthread_mutex_unlock(&format_lock);
+
+	pthread_mutex_lock(&pace_lock);
+	memset(&last_request, 0, sizeof(last_request));
+	blocked_until = 0;
+	strikes = 0;
+	pthread_mutex_unlock(&pace_lock);
+}
+
 #endif /* SONIX_ZVUK */

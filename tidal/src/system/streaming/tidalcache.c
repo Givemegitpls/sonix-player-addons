@@ -17,6 +17,7 @@
 #include "src/system/streaming/streamturn.h"
 #include "src/system/core/utils.h"
 #include "src/system/core/lang.h"
+#include "tidalworkers.h"
 
 #define FETCH_TIMEOUT_SECS 20
 #define FETCH_CHUNK 32768
@@ -669,6 +670,22 @@ void tidalcache_set_slow_start_cb(void (*cb)(int seconds)) { slow_start_cb = cb;
 
 void tidalcache_wait_idle(void) { streamturn_wait_idle(); }
 
+// The addon is being unloaded. Read where a download would be started and at
+// the top of the download thread, so that no new one begins after the stop.
+static pthread_mutex_t quit_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool cache_quit;
+
+static bool quitting(void) {
+	pthread_mutex_lock(&quit_lock);
+	bool quit = cache_quit;
+	pthread_mutex_unlock(&quit_lock);
+	return quit;
+}
+
+// The download threads of this cache, counted so that stop() can wait for the
+// one in flight to fall out of its loop (tidalworkers.h).
+static tidalworkers_t cache_workers = TIDALWORKERS_INIT;
+
 static pthread_mutex_t active_lock = PTHREAD_MUTEX_INITIALIZER;
 static http_stream_t *active_stream;
 static long active_track_id;
@@ -872,8 +889,13 @@ static void *download_thread(void *arg) {
 
 	download_t *d = arg;
 	bool finished = false;
+	// The pump checks the generation before every chunk (or every segment), so
+	// an unload's abandon_all() turns this into a short fall out of the loop
+	// rather than a whole track still being written after the library is gone.
 	bool ok = d->stream.kind == TIDAL_STREAM_DASH ? pump_dash(d, 0, &finished) : pump_file(d, 0, &finished);
 	download_end(d, ok && finished);
+
+	tidalworkers_done(&cache_workers);
 	return NULL;
 }
 
@@ -1095,6 +1117,12 @@ bool tidalcache_start(long track_id, const tidal_stream_t *stream, int duration_
 	out[0] = '\0';
 	set_error("");
 
+	// Unloading: a download started now would be one nobody waits for and one
+	// whose thread is about to lose its code.
+	if (quitting()) {
+		return false;
+	}
+
 	if (!tidalcache_ready()) {
 		fprintf(stderr, "tidalcache: no card to write to\n");
 		set_error(tr("download_no_card"));
@@ -1201,7 +1229,9 @@ bool tidalcache_start(long track_id, const tidal_stream_t *stream, int duration_
 	bool started_dash = d->stream.kind == TIDAL_STREAM_DASH;
 
 	pthread_t thread;
+	tidalworkers_add(&cache_workers);
 	if (pthread_create(&thread, NULL, download_thread, d) != 0) {
+		tidalworkers_done(&cache_workers);
 		set_error(tr("cannot_start_the_download"));
 		download_end(d, false); // releases the turn as well
 		out[0] = '\0';
@@ -1212,4 +1242,49 @@ bool tidalcache_start(long track_id, const tidal_stream_t *stream, int duration_
 	printf("tidalcache: %ld starts at %ld KB%s\n", track_id, started_done / 1024,
 		   started_dash ? " (segments)" : "");
 	return true;
+}
+
+// ---------------------------------------------------------------------------
+// stopping
+// ---------------------------------------------------------------------------
+
+// The addon's stop hook, for this module: no download of this cache may still
+// be running when the library is unmapped. Abandons the one in flight (the same
+// generation bump a track change uses), waits for its thread to fall out of the
+// loop (bounded, tidalworkers.h), and drops the callbacks and flags the page and
+// the power manager had come to rely on. Call after the page has stopped -- the
+// page's prefetch worker starts downloads.
+//
+// False: the download thread outlasted the bound. The caller keeps the mapping
+// (addon.h), so nothing here is freed on the assumption that it is gone.
+bool tidalcache_stop(void) {
+	pthread_mutex_lock(&quit_lock);
+	cache_quit = true;
+	pthread_mutex_unlock(&quit_lock);
+
+	tidalcache_abandon_all();
+	bool gone = tidalworkers_wait(&cache_workers, "a download");
+	if (gone) {
+		// Cleared for the same reason as the page's flags: the only second
+		// init() in this process is the one that finds the library still
+		// mapped, and a cache that refuses every download would leave Tidal
+		// unable to play anything.
+		pthread_mutex_lock(&quit_lock);
+		cache_quit = false;
+		pthread_mutex_unlock(&quit_lock);
+	}
+
+	// The radio must not stay awake for a cache that is no longer there: the
+	// service table that would have recomputed this is unregistered with the
+	// addon.
+	tidalcache_set_network_wanted(false);
+
+	// Ours and nobody else's: the callback, the tracks the queue had protected,
+	// and the slow-start notice the page installed.
+	slow_start_cb = NULL;
+	pthread_mutex_lock(&protected_lock);
+	protected_count = 0;
+	pthread_mutex_unlock(&protected_lock);
+
+	return gone;
 }

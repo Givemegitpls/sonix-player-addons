@@ -9,7 +9,23 @@
 
 // The Tidal pages: the main one, login, search and the results list (a single
 // list, reused for tracks, albums, artists and playlists).
-void tidalpage_init(gui_config_t *cfg);
+//
+// `id` is the host's name for this addon (host->id), cached here because every
+// screen built below has to be handed to the shell with it
+// (sonix_addon_own_screen): the screen list addon_unload() walks is keyed by it.
+void tidalpage_init(gui_config_t *cfg, const char *id);
+
+// The page going away, for the addon's stop hook: workers told to leave and
+// waited for, timers deleted (the one the power manager remembers handed back
+// first), the player's hooks withdrawn, every pointer cleared. On the GUI
+// thread; the library may be dlclose()d when it returns. False when a worker
+// did not come back within the bound -- a thread still inside the library, which
+// the shell answers by keeping the mapping (addon.h).
+//
+// The screens are not deleted here: they are registered with the shell as they
+// are built, and it moves the display off them and deletes them after this
+// returns.
+bool tidalpage_stop(void);
 
 // The main page, for the streaming grid.
 extern lv_obj_t *tidal_screen;

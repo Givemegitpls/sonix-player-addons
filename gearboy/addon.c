@@ -2,10 +2,14 @@
 
 #include "src/gui/gearboy/gearboypage.h"
 #include "src/gui/gearboy/gearboyplay.h"
+#include "src/gui/gearboy/gearboyscreens.h"
 #include "src/gui/gearboy/gearboysettings.h"
 #include "src/gui/nowplaying/player.h"
+#include "src/gui/shell/switcher.h"
 #include "src/system/gearboy/gbconf.h"
 #include "src/system/gearboy/gbdb.h"
+
+#include <stdio.h>
 
 // Gearboy as an addon.
 //
@@ -31,6 +35,11 @@
 // were never part of the binary.
 
 static lv_obj_t *gearboy_addon_init(const sonix_addon_host_t *host) {
+	// The name the loader knows this addon by, for the screens it is told about
+	// (sonix_addon_own_screen): the host structure is the player's and is filled
+	// in again for the next addon, so it is copied rather than remembered.
+	gearboyscreens_init(host->id);
+
 	// Where the emulator looks for the games, and where it keeps what belongs to
 	// the game rather than to the device: its own settings in the addon's folder
 	// on the card, and the cartridges' saves in Games/Saves beside the ROMs.
@@ -52,7 +61,83 @@ static lv_obj_t *gearboy_addon_init(const sonix_addon_host_t *host) {
 	// player can be pulled in from it.
 	player_sheet_attach_drag(gearboypage_screen, true);
 
+	// The screen the tile opens. The shell also knows it by return value; said
+	// from here as well so that every screen this addon puts up is on the
+	// loader's list (addon.h, sonix_addon_own_screen). The other two are
+	// reported where they are opened -- gearboyplay_open() and
+	// gearboysettings_open() -- because a list the loader writes from init()'s
+	// return value does not keep what init() reported before it returned.
+	gearboyscreens_own(gearboypage_screen);
+
 	return gearboypage_screen;
+}
+
+// Deletes one of the screens this addon made. The loader deletes every screen
+// registered with it after stop() and checks gui_obj_alive() before each, so
+// this is both the fallback for one it was never told about and the reason the
+// addon's own pointers are gone by the time the next init() runs.
+//
+// False while the screen is on the display: lv_obj_delete() of the active screen
+// leaves the display without one at all (lv_obj_tree.c), and a page whose
+// callbacks are about to be unmapped must not be left up either -- so the caller
+// keeps the library mapped instead.
+static bool drop_own_screen(lv_obj_t **screen, const char *what) {
+	lv_obj_t *s = *screen;
+	*screen = NULL;
+	if (!s) {
+		return true;
+	}
+
+	if (lv_screen_active() == s) {
+		fprintf(stderr, "gearboy: %s is still on the display; not safe to unload\n", what);
+		return false;
+	}
+
+	switcher_forget_screen(s);
+	player_forget_screen(s);
+	lv_obj_delete(s);
+	return true;
+}
+
+// The library is going away (`docs/ADDONS.md`, addon.h). In the order the parts
+// depend on each other: the game first (its thread writes the framebuffer, and
+// the touch reader feeds it), then the two pages that are only state, then the
+// screens.
+//
+// Nothing on the card is open between calls -- gbconf and gbdb read their files
+// and close them (addons/common/store.c) -- so there is no descriptor to close
+// here; the .sav of a running game is written by gearboy_stop(), inside the
+// emulator thread, before it returns.
+//
+// True when every thread is out of the library. The one wait that can give up is
+// the scan's (gearboypage_stop(), bounded); the rest are joins, and a page left
+// on the display is the other case the loader must not unmap under.
+static bool gearboy_addon_stop(void) {
+	bool safe = true;
+
+	// The emulator thread joined, the touch reader joined, the page's two timers
+	// deleted and its theme hook withdrawn.
+	if (!gearboyplay_stop()) {
+		safe = false;
+	}
+
+	// The settings page's hook and pointers, then the list's scan thread (waited
+	// for, bounded), its catalogue and its hook.
+	gearboysettings_stop();
+	if (!gearboypage_stop()) {
+		safe = false;
+	}
+
+	// The two screens that are this addon's. gearboypage_screen is not one of
+	// them: init() returned it and the loader deletes it after this returns.
+	if (!drop_own_screen(&gearboyplay_screen, "the game screen")) {
+		safe = false;
+	}
+	if (!drop_own_screen(&gearboysettings_screen, "the settings screen")) {
+		safe = false;
+	}
+
+	return safe;
 }
 
 static const sonix_addon_t gearboy = {
@@ -61,6 +146,15 @@ static const sonix_addon_t gearboy = {
 	.init = gearboy_addon_init,
 };
 
+static const sonix_addon_stop_t gearboy_lifecycle = {
+	.api = SONIX_ADDON_API,
+	.stop = gearboy_addon_stop,
+};
+
 const sonix_addon_t *sonix_addon_entry(uint32_t api) {
 	return api == SONIX_ADDON_API ? &gearboy : NULL;
+}
+
+const sonix_addon_stop_t *sonix_addon_stop_entry(uint32_t api) {
+	return api == SONIX_ADDON_API ? &gearboy_lifecycle : NULL;
 }

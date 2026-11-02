@@ -6,6 +6,7 @@
 
 #include "src/system/core/utils.h"
 #include "src/system/core/lang.h"
+#include "src/system/streaming/qobuzthreads.h"
 
 // How many favourites are cached. Beyond this the oldest show an empty star
 // until touched again: the trade-off between always knowing the truth (one
@@ -115,6 +116,12 @@ static job_t pending;
 static bool have_pending;
 static bool worker_started;
 
+// The library is being unloaded: the worker leaves and nothing new is queued.
+// Read and written under job_lock, which is also what the loop parks on.
+static bool stopping;
+
+static qobuz_threads_t worker = QOBUZ_THREADS_INIT;
+
 static void do_favorites_load(const job_t *job) {
 	long ids[FAVORITES_MAX];
 	int count = qobuz_favorite_track_ids(ids, FAVORITES_MAX);
@@ -217,8 +224,15 @@ static void *worker_main(void *arg) {
 
 	for (;;) {
 		pthread_mutex_lock(&job_lock);
-		while (!have_pending) {
+		while (!have_pending && !stopping) {
 			pthread_cond_wait(&job_ready, &job_lock);
+		}
+		if (stopping) {
+			// A job still queued is dropped, not run: its `done` is a callback
+			// of the page that is being unloaded with this library.
+			have_pending = false;
+			pthread_mutex_unlock(&job_lock);
+			break;
 		}
 		job_t job = pending;
 		have_pending = false;
@@ -250,17 +264,30 @@ static void *worker_main(void *arg) {
 			break;
 		}
 	}
+	qobuz_threads_done(&worker);
 	return NULL;
 }
 
 static void submit(const job_t *job) {
 	pthread_mutex_lock(&job_lock);
+	if (stopping) {
+		// Answer the caller rather than leave it waiting for a callback that
+		// will never come: the page stops submitting before this flag is set,
+		// so this only catches work that was already on its way.
+		pthread_mutex_unlock(&job_lock);
+		if (job->done) {
+			job->done(false, tr("cannot_start_the_request"), job->user);
+		}
+		return;
+	}
 	if (!worker_started) {
 		pthread_t thread;
+		qobuz_threads_add(&worker);
 		if (pthread_create(&thread, NULL, worker_main, NULL) == 0) {
 			pthread_detach(thread);
 			worker_started = true;
 		} else {
+			qobuz_threads_done(&worker);
 			pthread_mutex_unlock(&job_lock);
 			if (job->done) {
 				job->done(false, tr("cannot_start_the_request"), job->user);
@@ -272,6 +299,41 @@ static void submit(const job_t *job) {
 	have_pending = true;
 	pthread_cond_signal(&job_ready);
 	pthread_mutex_unlock(&job_lock);
+}
+
+// See qobuzsync.h.
+bool qobuzsync_stop(void) {
+	pthread_mutex_lock(&job_lock);
+	stopping = true;
+	have_pending = false;
+	pthread_cond_broadcast(&job_ready);
+	pthread_mutex_unlock(&job_lock);
+
+	// Bounded, and it can run out: an account write already in flight is left
+	// to finish on its own -- halfway through it would leave the account's
+	// state unknown, which is exactly what the comment above the worker refuses
+	// to do. The line below is then the one that says the unload was not safe.
+	int left = qobuz_threads_wait(&worker, QOBUZ_STOP_WAIT_MS);
+	if (left > 0) {
+		fprintf(stderr, "qobuzsync: a request is still in flight at stop, its result is lost\n");
+	}
+
+	// The mirror belongs to the account that was signed in on this run, and
+	// init() fetches it again: under another user the old one would be a lie.
+	qobuzsync_forget();
+
+	pthread_mutex_lock(&job_lock);
+	worker_started = false;
+	// Only with nothing left running: a worker still out there must find the
+	// flag set at its next check rather than take one more job. With it clear,
+	// the next submit() starts a fresh worker -- which is what makes a second
+	// init() work when dlclose() left the library mapped.
+	if (left == 0) {
+		stopping = false;
+	}
+	pthread_mutex_unlock(&job_lock);
+
+	return left == 0;
 }
 
 // ---------------------------------------------------------------------------

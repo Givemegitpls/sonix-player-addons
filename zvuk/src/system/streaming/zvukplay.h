@@ -51,4 +51,10 @@ bool zvukplay_prepare_track(const char *path);
 // Memory-only display metadata from the loaded queue page.
 bool zvukplay_peek_metadata(const char *path, song_metadata_t *out);
 
+// Stops the module for good: the prepare callback is withdrawn, the watch timer
+// is deleted, the worker leaves and the queue of ids is dropped. False when the
+// worker was still inside the library at the end of the wait. A later init()
+// installs the callback again. src/addon/addon.h, "the stop half".
+bool zvukplay_stop(void);
+
 #endif /* ZVUKPLAY_H */

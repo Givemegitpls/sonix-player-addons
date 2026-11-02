@@ -765,3 +765,44 @@ void game_frame_build(game_frame_t *g, gui_config_t *cfg) {
 void game_frame_open(game_frame_t *g) {
 	switch_screen(g->screen);
 }
+
+// The page is going away for good -- the addon's library is being unloaded and
+// the shell deletes the screen right after this. Everything the frame holds that
+// outlives the screen goes: the clock (a paused timer is still a timer the
+// power manager remembers), the frame's place in the theme hook's list, and the
+// hook itself when this was the last frame. The structure is left empty, so the
+// game's own init() can build a new one.
+void game_frame_release(game_frame_t *g) {
+	if (!g) {
+		return;
+	}
+
+	if (g->timer) {
+		power_forget_timer(g->timer); // the player's record of it
+		lv_timer_delete(g->timer);
+		g->timer = NULL;
+	}
+
+	for (int i = 0; i < frame_count; i++) {
+		if (frames[i] != g) {
+			continue;
+		}
+		frames[i] = frames[frame_count - 1];
+		frames[frame_count - 1] = NULL;
+		frame_count--;
+		break;
+	}
+
+	if (frame_count == 0 && theme_hook_installed) {
+		theme_unregister_refresh(games_theme_refresh);
+		theme_hook_installed = false;
+	}
+
+	// A best score still waiting for a quiet moment: the write was meant for
+	// here, and there will be no later one.
+	if (g->best_unsaved) {
+		game_frame_save_best(g);
+	}
+
+	memset(g, 0, sizeof(*g));
+}

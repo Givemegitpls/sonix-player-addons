@@ -76,4 +76,14 @@ int qobuzsync_playlists(qobuz_playlist_t *out, int max);
 // Whether the list has been received at least once.
 bool qobuzsync_playlists_known(void);
 
+// Ends the account worker: the addon is being unloaded.
+//
+// Wakes it, drops the job that was waiting its turn (its `done` is a callback
+// of the page, which is going away with the library), waits a bounded while for
+// a request already in flight, and forgets the mirror. A write that is still in
+// flight is deliberately NOT abandoned -- aborting it halfway would leave the
+// account's state unknown -- so false is a possible answer, and it is the one
+// that keeps the shell from dlclose()ing code the request is running.
+bool qobuzsync_stop(void);
+
 #endif /* QOBUZSYNC_H */

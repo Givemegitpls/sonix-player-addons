@@ -666,3 +666,48 @@ void dino_open(void) {
 	srand((unsigned)time(NULL) ^ (unsigned)lv_tick_get());
 	game_frame_open(&frame);
 }
+
+// The addon is being unloaded. The frame goes first (its timer is the player's
+// business by then), and every widget pointer this module kept into the screen
+// is dropped with it: the shell deletes the screen after stop() returns, and a
+// static pointing at freed LVGL memory is the next run's crash.
+void dino_stop(void) {
+	game_frame_release(&frame);
+
+	sky = NULL;
+	ground = NULL;
+	for (int i = 0; i < PIECES_MAX; i++) {
+		dino_piece[i] = NULL;
+	}
+	for (int i = 0; i < OB_MAX; i++) {
+		for (int p = 0; p < 3; p++) {
+			ob_piece[i][p] = NULL;
+		}
+		ob_live[i] = false;
+		ob_at[i] = 0;
+	}
+	for (int i = 0; i < 3; i++) {
+		cloud[i] = NULL;
+	}
+	for (int i = 0; i < 4; i++) {
+		pebble[i] = NULL;
+	}
+	for (int i = 0; i < 5; i++) {
+		star[i] = NULL;
+	}
+	moon = NULL;
+	moon_bite = NULL;
+	dino_screen = NULL;
+
+	run_fp = 0;
+	y_fp = 0;
+	vy_fp = 0;
+	until_next_fp = 0;
+	speed = 0;
+	score = 0;
+	ground_y = 0;
+	grounded = false;
+	night = false;
+	dead = false;
+	running = false;
+}

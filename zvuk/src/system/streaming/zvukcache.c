@@ -22,6 +22,7 @@
 #include "src/system/streaming/streamcover.h"
 #include "src/system/streaming/streamturn.h"
 #include "src/system/streaming/zvukcompat.h"
+#include "src/system/streaming/zvukstop.h"
 #include "src/system/device/system.h"
 
 // See zvukcache.h.
@@ -63,6 +64,11 @@ typedef struct {
 
 static download_t *current;
 static download_t *detached;
+
+// The cache's download thread, and the flag that tells it to stop. See
+// zvukstop.h for what the count is for.
+static zvuk_stop_t threads = ZVUK_STOP_INIT;
+static bool stopping;
 
 static void set_error(const char *fmt, ...) {
 	va_list ap;
@@ -586,6 +592,7 @@ static bool transfer(download_t *d) {
 
 static void *download_main(void *arg) {
 	download_t *d = arg;
+	// Counted by zvukcache_start() before this thread existed: see zvukstop.h.
 	thread_be_low_priority("zvuk download");
 	zvuk_http_set_thread_stream_headers(zvuk_stream_headers());
 	streamturn_acquire();
@@ -619,6 +626,7 @@ static void *download_main(void *arg) {
 	}
 	pthread_mutex_unlock(&lock);
 	free(d);
+	zvuk_stop_leave(&threads);
 	return NULL;
 }
 
@@ -676,6 +684,12 @@ void zvukcache_fetch_cancel(void) {
 
 static void streamturn_hook(void) { zvukcache_abandon_all(); }
 
+// Whether this module's hook is in the player's abandon table (streamturn.h).
+// Registered once, on the first download, and taken back in zvukcache_stop():
+// the hook is code in this library and the table is walked by every service
+// that is about to download.
+static bool abandon_hook_installed;
+
 static void prune(long room);
 
 bool zvukcache_start(const zvuk_track_t *track, const zvuk_stream_t *stream, char *out, size_t size) {
@@ -683,10 +697,12 @@ bool zvukcache_start(const zvuk_track_t *track, const zvuk_stream_t *stream, cha
 	if (out && size) {
 		out[0] = '\0';
 	}
-	static bool registered;
-	if (!registered) {
-		registered = true;
+	if (stopping) {
+		return false;
+	}
+	if (!abandon_hook_installed) {
 		streamturn_register_abandon(streamturn_hook);
+		abandon_hook_installed = true;
 	}
 	if (!zvukcache_ready()) {
 		set_error("%s", tr("download_failed"));
@@ -751,8 +767,14 @@ bool zvukcache_start(const zvuk_track_t *track, const zvuk_stream_t *stream, cha
 	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 	pthread_attr_setstacksize(&attr, 192 * 1024); // TLS through the reconnects
 	snprintf(out, size, "%s", d->path);
+	// Counted before it exists and uncounted when it never started. The two
+	// callers -- zvukplay's worker and zvukdl's -- are both stopped and waited
+	// for before zvukcache_stop(), so nothing can be created after its wait
+	// began.
+	zvuk_stop_enter(&threads);
 	int thread_error = pthread_create(&th, &attr, download_main, d);
 	if (thread_error != 0) {
+		zvuk_stop_leave(&threads);
 		set_error("%s: %s", tr("download_failed"), strerror(thread_error));
 		if (out && size) {
 			out[0] = '\0';
@@ -1033,6 +1055,68 @@ void zvukcache_write_sidecars(const zvuk_track_t *track, const char *path) {
 		}
 	}
 	free(body);
+}
+
+// ---------------------------------------------------------------------------
+// stopping
+// ---------------------------------------------------------------------------
+
+bool zvukcache_stop(void) {
+	// The one hook this module leaves in the player goes first, before anything
+	// is waited for: the table is walked by every service that is about to
+	// download, and the function it holds is code in this library.
+	if (abandon_hook_installed) {
+		streamturn_unregister_abandon(streamturn_hook);
+		abandon_hook_installed = false;
+	}
+
+	// The download next: it is the longest-lived thread here and the only one
+	// holding a file open. The abandon flag and the socket wake are what end a
+	// transfer -- a recv() on a stalled connection has no other interruption --
+	// and they leave the part file and its marker cleaned up by the thread
+	// itself.
+	pthread_mutex_lock(&lock);
+	stopping = true;
+	if (current) {
+		current->abandon = true;
+		if (current->st_open) {
+			http_stream_wake(&current->st);
+		}
+	}
+	if (detached) {
+		// The caller's own fetch, on zvukdl's worker: it should be gone by now,
+		// and marking it costs nothing.
+		detached->abandon = true;
+		if (detached->st_open) {
+			http_stream_wake(&detached->st);
+		}
+	}
+	pthread_mutex_unlock(&lock);
+
+	// A thread that did not come back still owns `current` and the file it has
+	// open: the pointers are left for it rather than cleared under it, and
+	// `stopping` stays up so no new download starts in what is left of this
+	// library's life. The false is what stops the player from unmapping.
+	if (!zvuk_stop_wait(&threads, "cache download")) {
+		return false;
+	}
+
+	pthread_mutex_lock(&lock);
+	current = detached = NULL;
+	stopping = false;
+	pthread_mutex_unlock(&lock);
+
+	// The card, and the two lists of paths on it: init() puts the root back
+	// from the host it is given, and a protected path from the previous card
+	// would keep a file of that card from being swept.
+	cache_dir[0] = '\0';
+	network_wanted = false;
+	pthread_mutex_lock(&keep_lock);
+	protected_count = 0;
+	recent_next = 0;
+	played_since_clear = 0;
+	pthread_mutex_unlock(&keep_lock);
+	return true;
 }
 
 #endif /* SONIX_ZVUK */

@@ -34,12 +34,32 @@ static lv_obj_t *dino_addon_init(const sonix_addon_host_t *host) {
 	return dino_screen;
 }
 
+// The clock's timer goes with the frame, the theme hook is withdrawn, and every
+// pointer into the screen is dropped: the shell deletes the screen after this
+// returns, and the library is dlclose()d after that. init() is then fresh again.
+//
+// Always true: the clock is an LVGL timer, not a thread -- there is nothing left
+// running inside the library once the frame is released.
+static bool dino_addon_stop(void) {
+	dino_stop();
+	return true;
+}
+
 static const sonix_addon_t dino = {
 	.api = SONIX_ADDON_API,
 	.title = "Dino",
 	.init = dino_addon_init,
 };
 
+static const sonix_addon_stop_t dino_lifecycle = {
+	.api = SONIX_ADDON_API,
+	.stop = dino_addon_stop,
+};
+
 const sonix_addon_t *sonix_addon_entry(uint32_t api) {
 	return api == SONIX_ADDON_API ? &dino : NULL;
+}
+
+const sonix_addon_stop_t *sonix_addon_stop_entry(uint32_t api) {
+	return api == SONIX_ADDON_API ? &dino_lifecycle : NULL;
 }

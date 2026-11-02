@@ -70,6 +70,10 @@ void yandexconf_set(const char *key, const char *value);
 // The addon's folder, "" when there is none.
 const char *yandexconf_dir(void);
 
+// The addon being unloaded: the folder and the settings read out of it are
+// forgotten, nothing is written. Called from the addon's stop hook.
+void yandexconf_stop(void);
+
 // <dir>/<name>, false when there is no card.
 bool yandexconf_path(const char *name, char *out, size_t size);
 

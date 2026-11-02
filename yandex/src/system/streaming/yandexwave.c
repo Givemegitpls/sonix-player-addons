@@ -7,6 +7,7 @@
 #include <time.h>
 
 #include "src/system/core/utils.h"
+#include "src/system/streaming/yandexlive.h"
 
 // See yandexwave.h.
 
@@ -88,6 +89,9 @@ static pthread_cond_t ready = PTHREAD_COND_INITIALIZER;
 static job_t queue[QUEUE_MAX];
 static int queue_len;
 static bool worker_started;
+// yandexwave_stop()'s way out of the worker, and the refusal that keeps a
+// report or a request from re-starting it while the library is being unmapped.
+static bool stopping;
 
 static void *worker_main(void *arg);
 
@@ -95,6 +99,9 @@ static void *worker_main(void *arg);
 // drops its oldest report, never a request for tracks: that one is what keeps
 // the music going.
 static void submit_locked(const job_t *job) {
+	if (stopping) {
+		return; // the library is leaving: this job has nowhere to go
+	}
 	if (!worker_started) {
 		pthread_t thread;
 		pthread_attr_t attr;
@@ -178,13 +185,20 @@ static void run_more(void) {
 
 static void *worker_main(void *arg) {
 	(void)arg;
+	yandexlive_enter();
 	// Below the interface, not starved by it: see yandexsync.c for why not
 	// SCHED_IDLE. A batch is a request somebody's music is waiting on.
 	thread_be_low_priority("yandex wave");
 	for (;;) {
 		pthread_mutex_lock(&lock);
-		while (queue_len == 0) {
+		while (!stopping && queue_len == 0) {
 			pthread_cond_wait(&ready, &lock);
+		}
+		if (stopping) {
+			// Whatever is left in the queue is dropped, not sent: a request on
+			// the way out would only be answered into a dead library.
+			pthread_mutex_unlock(&lock);
+			break;
 		}
 		job_t job = queue[0];
 		memmove(&queue[0], &queue[1], (size_t)(--queue_len) * sizeof(queue[0]));
@@ -195,6 +209,7 @@ static void *worker_main(void *arg) {
 			yandex_wave_feedback(job.event, job.id[0] ? job.id : NULL, job.album, job.secs);
 		}
 	}
+	yandexlive_leave();
 	return NULL;
 }
 
@@ -254,6 +269,41 @@ void yandexwave_end(void) {
 		report_ended();
 		printf("yandex: wave: no longer the queue\n");
 	}
+}
+
+// The addon being unloaded: the worker ends, and the wave is forgotten.
+//
+// Unlike yandexwave_end() this reports nothing. A "track left" is one more
+// request to the station, and the caller is a GUI thread that has to return
+// before the player unmaps this library; the station's session goes with
+// yandex.c's statics anyway, so the next run starts a fresh one either way.
+bool yandexwave_stop(void) {
+	pthread_mutex_lock(&lock);
+	stopping = true;
+	queue_len = 0;
+	pthread_cond_broadcast(&ready);
+	pthread_mutex_unlock(&lock);
+	bool safe = yandexlive_wait("the wave worker", YANDEXLIVE_WAIT_MS);
+
+	pthread_mutex_lock(&lock);
+	running = false;
+	batch_cb = NULL;
+	batch_user = NULL;
+	received_count = 0;
+	memset(received, 0, sizeof(received));
+	in_flight = false;
+	strikes = 0;
+	next_try_ms = 0;
+	pthread_mutex_unlock(&lock);
+
+	// The track the watch was following, left over from a queue yandexplay_stop()
+	// has already dropped.
+	now_id[0] = now_album[0] = disliked_id[0] = '\0';
+	now_duration = 0;
+	heard_ms = 0;
+	last_watch_ms = 0;
+	worker_started = false;
+	return safe;
 }
 
 bool yandexwave_running(void) {

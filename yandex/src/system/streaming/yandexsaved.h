@@ -41,6 +41,10 @@
 // loaded index (the next call reads the new card's).
 void yandexsaved_set_root(const char *sd_root);
 
+// The addon being unloaded: the index in memory and the queue's claims go; the
+// file on the card stays. Called from the addon's stop hook.
+void yandexsaved_stop(void);
+
 // A save completed (or found its file already there): `track` with the album
 // details the file was tagged with, `path` absolute. Replaces an older entry
 // of the same id.

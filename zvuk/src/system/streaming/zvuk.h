@@ -115,6 +115,12 @@ typedef struct {
 
 void zvuk_init(void);
 
+// The other end: the session, the mirror of the collection and the request pace
+// are dropped, and init() afterwards reads the card again. For the addon's stop
+// hook (src/addon/addon.h); nothing here has a thread or a descriptor of its
+// own.
+void zvuk_release(void);
+
 // Always true: Zvuk needs no keys of the firmware's, only the user's token.
 bool zvuk_configured(void);
 bool zvuk_logged_in(void);

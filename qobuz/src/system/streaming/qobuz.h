@@ -117,6 +117,11 @@ void qobuz_init(void);
 // written (qobuzconf_reload()).
 void qobuz_reload_session(void);
 
+// Drops what qobuz_init() keeps in memory, for the addon's stop(): see
+// addon.h, "Unloading". The next init() reads the card again and must not find
+// anything of the previous run still set.
+void qobuz_forget(void);
+
 // False when the keys file is missing: the service is not broken, it is off,
 // and the menu entry must say so instead of trying and failing.
 bool qobuz_configured(void);

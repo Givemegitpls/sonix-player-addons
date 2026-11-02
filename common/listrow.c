@@ -462,3 +462,27 @@ void listrow_forget(lv_obj_t *row) {
 		entry_unlink(e);
 	}
 }
+
+void listrow_stop(void) {
+	if (poll_timer) {
+		lv_timer_delete(poll_timer);
+		poll_timer = NULL;
+	}
+
+	listrow_entry_t *e = entries;
+	while (e) {
+		listrow_entry_t *next = e->next;
+		entry_release_slot(e);
+		entry_drop_image(e);
+		free(e);
+		e = next;
+	}
+	entries = NULL;
+
+	active_owner = NULL;
+	window_owner = NULL;
+	window_first = -1;
+	window_last = -1;
+	// The setting is re-read on the next page open, which is what a reload is.
+	enabled = -1;
+}

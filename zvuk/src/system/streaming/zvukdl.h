@@ -67,6 +67,12 @@ void zvukdl_set_listener(void (*listener)(zvukdl_event_t event, int count, const
 void zvukdl_cancel_all(void);
 void zvukdl_set_root(const char *sd_root);
 
+// Stops the module for good: the listener is dropped, the worker leaves, the
+// queue and the index of saved tracks are freed, the claimed paths are let go.
+// False when the worker was still inside the library at the end of the wait.
+// src/addon/addon.h, "the stop half".
+bool zvukdl_stop(void);
+
 // --- the index -------------------------------------------------------------
 
 int zvukdl_saved_count(void);

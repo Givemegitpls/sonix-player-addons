@@ -19,9 +19,24 @@
 // screen's LV_EVENT_SCREEN_LOADED.
 extern lv_obj_t *zvukpage_screen;
 
-// Builds the page. `sd_root` is the card, for the token file, the covers and
-// the saved tracks; `cfg` is the shell's geometry.
-void zvukpage_init(gui_config_t *cfg, const char *sd_root);
+// Builds the page. `id` is the addon's directory name, which every screen it
+// builds is registered with (sonix_addon_own_screen); `sd_root` is the card, for
+// the token file, the covers and the saved tracks; `cfg` is the shell's
+// geometry.
+void zvukpage_init(gui_config_t *cfg, const char *id, const char *sd_root);
+
+// The other end of init(). Withdraws the theme hooks and the save listener,
+// closes an open row menu, confirm and busy toast, gives back listart's slots
+// and deletes listrow's poll timer, stops the worker and any sign-in, and drops
+// every widget and state pointer, so that the library may be dlclose()d and the
+// page opened again.
+//
+// The screens are not touched: every one of them was registered as it was made,
+// the shell took them off the display and out of its records before this call
+// and deletes them after it. False is a thread still inside the library at the
+// end of the wait, which tells the shell not to unmap. src/addon/addon.h, "the
+// stop half".
+bool zvukpage_stop(void);
 
 // "Show album" in the player, for a Zvuk track: opens the release's track list.
 // Filled into the service table by zvuk_service_attach_gui(); returns the

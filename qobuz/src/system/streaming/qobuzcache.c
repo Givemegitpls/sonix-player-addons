@@ -13,6 +13,7 @@
 #include "src/system/decode/growfile.h"
 #include "src/system/net/http.h"
 #include "src/system/streaming/streamturn.h"
+#include "src/system/streaming/qobuzthreads.h"
 #include "src/system/core/utils.h"
 #include "src/system/core/lang.h"
 
@@ -20,6 +21,11 @@
 #define FETCH_CHUNK 32768
 
 static char cache_dir[512];
+
+// Set by qobuzcache_stop(), asked before anything is sent or written. Not
+// locked: it only ever goes false -> true, and a reader that misses the store
+// costs one download that the stop then waits for.
+static volatile bool stopping;
 
 // The reason a download failed, for the page to show.
 //
@@ -35,16 +41,24 @@ void qobuzcache_abandon_all(void);
 
 // Registers with the shared turn once, at the first opportunity: from then on
 // a track requested from Tidal knows how to make a Qobuz download let go, and
-// vice versa.
+// vice versa. Taken back by qobuzcache_stop(), because the function it hands
+// over is code in this library.
+static bool abandon_registered;
+
 static void register_abandon_once(void) {
-	static bool done;
-	if (!done) {
-		done = true;
+	if (!abandon_registered) {
+		abandon_registered = true;
 		streamturn_register_abandon(qobuzcache_abandon_all);
 	}
 }
 
 void qobuzcache_set_root(const char *sd_root) {
+	// Every init() of the addon begins here (addon.c), so this is also where a
+	// library that was stopped comes back to life: the flag qobuzcache_stop()
+	// raises would otherwise refuse every transfer for the rest of the process,
+	// which is what a dlclose() that failed leaves behind. The abandon hook goes
+	// back into the shared turn with it (qobuzcache_stop took it out).
+	stopping = false;
 	register_abandon_once();
 	if (!sd_root || !*sd_root) {
 		cache_dir[0] = '\0';
@@ -576,6 +590,11 @@ static http_stream_t *active_stream;
 // wrong.
 static long active_track_id;
 
+// The download threads still running -- there is at most one, but the count is
+// what stop() waits on, and a count survives a bug in the one-at-a-time rule
+// better than a flag would.
+static qobuz_threads_t downloaders = QOBUZ_THREADS_INIT;
+
 long qobuzcache_downloading_id(void) {
 	pthread_mutex_lock(&active_lock);
 	long id = active_track_id;
@@ -728,6 +747,7 @@ static void *download_thread(void *arg) {
 	bool finished = false;
 	bool ok = download_pump(d, 0, &finished);
 	download_end(d, ok && finished);
+	qobuz_threads_done(&downloaders);
 	return NULL;
 }
 
@@ -737,6 +757,13 @@ bool qobuzcache_start(long track_id, const char *url, const char *mime, int dura
 	}
 	out[0] = '\0';
 	set_error("");
+
+	// The library is being unloaded: nothing may be written to a card that is
+	// being handed back, and no thread may be born after stop() last looked.
+	if (stopping) {
+		set_error(tr("download_cancelled"));
+		return false;
+	}
 
 	if (!qobuzcache_ready()) {
 		fprintf(stderr, "qobuzcache: no card to write to\n");
@@ -787,6 +814,18 @@ bool qobuzcache_start(long track_id, const char *url, const char *mime, int dura
 	// by whoever received a user command, which is the page: see
 	// streamturn_abandon_all().
 	busy_acquire();
+
+	// The turn can take a while -- another service's hi-res track, minutes of
+	// it -- and stop() may have come while this waited for it. Checked again
+	// here because the abandon it issues cannot cancel a download that had not
+	// started yet, and this one would then hold the card for the whole file
+	// with nobody left to stop it.
+	if (stopping) {
+		set_error(tr("download_cancelled"));
+		busy_release();
+		free(d);
+		return false;
+	}
 
 	// Take the generation AFTER the wait: a value read before it would be stale
 	// by the time the turn arrives, and a track change that happened during the
@@ -963,7 +1002,11 @@ bool qobuzcache_start(long track_id, const char *url, const char *mime, int dura
 	long started_total = d->total;
 
 	pthread_t thread;
+	// Counted before the thread exists: a fast one could otherwise finish and
+	// decrement before this line ran, and stop() would see a negative count.
+	qobuz_threads_add(&downloaders);
 	if (pthread_create(&thread, NULL, download_thread, d) != 0) {
+		qobuz_threads_done(&downloaders);
 		set_error(tr("cannot_start_the_download"));
 		download_end(d, false); // also releases the turn
 		out[0] = '\0';
@@ -974,6 +1017,65 @@ bool qobuzcache_start(long track_id, const char *url, const char *mime, int dura
 	printf("qobuzcache: %ld starts at %ld KB of %ld KB\n", track_id, started_done / 1024,
 		   started_total > 0 ? started_total / 1024 : 0);
 	return true;
+}
+
+// See qobuzcache.h. Called from the page's stop(), before it waits for its own
+// two workers: the prefetch thread is parked in the download turn
+// (qobuzcache_wait_idle) and what lets it out is the download it waits for
+// giving up, which is the first thing done here.
+bool qobuzcache_stop(void) {
+	stopping = true;
+
+	// The wake the page uses on a track change: bump the generation and shut
+	// the socket down under the blocked recv(), so a download unwinds now
+	// rather than at the twenty-second receive timeout.
+	qobuzcache_abandon_all();
+
+	int left = qobuz_threads_wait(&downloaders, QOBUZ_STOP_WAIT_MS);
+	if (left > 0) {
+		fprintf(stderr, "qobuzcache: %d download thread%s still running at stop\n", left, left == 1 ? "" : "s");
+	}
+
+	// The turn's table holds a pointer to qobuzcache_abandon_all(), which is
+	// code in this library: without this the next abandon -- any service's, not
+	// just ours -- is a call into an unmapped page. The flag goes with it so
+	// that a second init() on a mapping that was not freed registers again.
+	streamturn_unregister_abandon(qobuzcache_abandon_all);
+	abandon_registered = false;
+
+	// Everything that would outlive the library. The paths below are copies,
+	// but the slow-start callback and the published stream are pointers into
+	// this .so: a hook left behind is a call into unmapped memory the next time
+	// a download reports its speed. The page withdraws both of them as well --
+	// twice is harmless, once missed is not.
+	slow_start_cb = NULL;
+
+	pthread_mutex_lock(&active_lock);
+	active_stream = NULL;
+	active_track_id = 0;
+	pthread_mutex_unlock(&active_lock);
+
+	// The protected list names tracks of a queue that no longer exists, and
+	// the recent ring names files of a session that is over: both are the next
+	// run's state, not this one's.
+	pthread_mutex_lock(&protected_lock);
+	protected_count = 0;
+	pthread_mutex_unlock(&protected_lock);
+
+	pthread_mutex_lock(&recent_lock);
+	memset(recent_paths, 0, sizeof(recent_paths));
+	recent_next = 0;
+	pthread_mutex_unlock(&recent_lock);
+	played_since_clear = 0;
+
+	network_wanted = false;
+
+	// init() sets it again, and it must: the card can come back under another
+	// mount point. Until then there is no cache, which is also the honest
+	// answer for a library that is about to be gone.
+	cache_dir[0] = '\0';
+
+	return left == 0;
 }
 
 // ---------------------------------------------------------------------------

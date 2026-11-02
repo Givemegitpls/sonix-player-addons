@@ -22,4 +22,10 @@ void zvuksync_like(zvuk_item_t kind, const char *id, bool want, zvuksync_done_cb
 // when they arrived.
 void zvuksync_likes_refresh(void (*done)(void));
 
+// Stops the module for good: the worker leaves, the writes still queued are
+// dropped, and a later init starts it again. False when the worker was still
+// inside the library at the end of the wait. src/addon/addon.h, "the stop
+// half".
+bool zvuksync_stop(void);
+
 #endif /* ZVUKSYNC_H */

@@ -131,6 +131,12 @@ void game_frame_build(game_frame_t *g, gui_config_t *cfg);
 // Switches to the page. The game's on_show runs when it comes up.
 void game_frame_open(game_frame_t *g);
 
+// Tears the frame down: timer deleted (and forgotten by the power manager), the
+// frame dropped from the theme hook's list, the hook withdrawn when it was the
+// last one, and the structure emptied so init() can build again. Call it from
+// the addon's stop(), before the shell deletes the screen.
+void game_frame_release(game_frame_t *g);
+
 // The score line. Either way the number moves, the best follows it in the same
 // call; the best is written to the config once, when the page is left, because a
 // config write rewrites the whole file and has no business in the middle of a run.

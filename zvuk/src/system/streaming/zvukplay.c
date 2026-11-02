@@ -23,6 +23,7 @@
 #include "src/system/streaming/streamturn.h"
 #include "src/system/streaming/zvukcache.h"
 #include "src/system/streaming/zvukdl.h"
+#include "src/system/streaming/zvukstop.h"
 
 // See zvukplay.h. The shape of yandexplay.c, and its comments hold here; what
 // differs is said where it differs.
@@ -218,6 +219,12 @@ static unsigned metadata_requested_generation;
 static job_kind_t running_kind;
 static bool worker_started;
 
+// The worker, the flag that tells it to leave, and whether the prepare
+// callback is in the player's table: see zvukstop.h and zvukplay_stop().
+static zvuk_stop_t threads = ZVUK_STOP_INIT;
+static bool stopping;
+static bool prepare_installed;
+
 typedef struct {
 	job_kind_t kind;
 	unsigned generation;
@@ -272,12 +279,18 @@ static void abandon_unless(const char *id) {
 
 static void *worker_main(void *arg) {
 	(void)arg;
+	// Counted by submit(), under job_lock: see zvukstop.h.
 	zvuk_http_set_thread_timeout_cap(STREAM_UI_TIMEOUT_SECS);
 	for (;;) {
 		pthread_mutex_lock(&job_lock);
 		running_kind = JOB_NONE;
-		while (play_pending.kind == JOB_NONE && fetch_pending.kind == JOB_NONE && metadata_pending.kind == JOB_NONE) {
+		while (play_pending.kind == JOB_NONE && fetch_pending.kind == JOB_NONE && metadata_pending.kind == JOB_NONE &&
+			   !stopping) {
 			pthread_cond_wait(&job_cond, &job_lock);
+		}
+		if (stopping) {
+			pthread_mutex_unlock(&job_lock);
+			break;
 		}
 		job_t job;
 		if (play_pending.kind != JOB_NONE) {
@@ -330,18 +343,30 @@ static void *worker_main(void *arg) {
 			free(r);
 		}
 	}
+	zvuk_stop_leave(&threads);
 	return NULL;
 }
 
 static void submit(job_kind_t kind, const char *id, bool waiting, const char *path) {
 	pthread_mutex_lock(&job_lock);
+	if (stopping) {
+		pthread_mutex_unlock(&job_lock);
+		return;
+	}
 	if (!worker_started) {
 		pthread_t th;
 		pthread_attr_t attr;
 		pthread_attr_init(&attr);
 		pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 		pthread_attr_setstacksize(&attr, 256 * 1024);
+		// Counted before it exists, uncounted when it never started, and both
+		// under job_lock -- the same lock stop() takes to set `stopping`, so a
+		// thread cannot be created between its wait and the unload.
+		zvuk_stop_enter(&threads);
 		worker_started = pthread_create(&th, &attr, worker_main, NULL) == 0;
+		if (!worker_started) {
+			zvuk_stop_leave(&threads);
+		}
 		pthread_attr_destroy(&attr);
 	}
 	job_t job = {.kind = kind, .waiting = waiting, .sleep_serial = zvuk_sleeptimer_expiration_serial()};
@@ -405,7 +430,9 @@ static lv_timer_t *watch_timer;
 static void watch_cb(lv_timer_t *timer);
 
 static void watch_start(void) {
-	if (!watch_timer) {
+	// Nothing new on the way out: stop() deletes the timer, and a worker still
+	// finishing a job must not put one back.
+	if (!watch_timer && !stopping) {
 		watch_timer = lv_timer_create(watch_cb, 1000, NULL);
 	}
 }
@@ -727,7 +754,13 @@ bool zvukplay_prepare_track(const char *path) {
 
 void zvukplay_init(zvukplay_listener_t l) {
 	listener = l;
-	device_state_add_prepare_cb(zvukplay_prepare_track);
+	// Once per library, not once per call: the page calls this again with its
+	// own listener, and stop() takes the callback back so a reload installs a
+	// fresh one.
+	if (!prepare_installed) {
+		prepare_installed = true;
+		device_state_add_prepare_cb(zvukplay_prepare_track);
+	}
 }
 
 int zvukplay_paths_for(const zvuk_track_t *tracks, int count, char ***paths_out) {
@@ -816,6 +849,68 @@ static void watch_cb(lv_timer_t *timer) {
 		watch_timer = NULL;
 		idle_ticks = 0;
 	}
+}
+
+// ---------------------------------------------------------------------------
+// stopping
+// ---------------------------------------------------------------------------
+
+bool zvukplay_stop(void) {
+	// The prepare callback first: it is the player's, it is code in this
+	// library, and it runs from whatever thread starts a track -- including one
+	// the player starts while this is happening.
+	if (prepare_installed) {
+		device_state_remove_prepare_cb(zvukplay_prepare_track);
+		prepare_installed = false;
+	}
+
+	// The watch is the only LVGL object here. Left behind, the player's timer
+	// loop would call watch_cb() in an unmapped page a second later.
+	if (watch_timer) {
+		lv_timer_delete(watch_timer);
+		watch_timer = NULL;
+	}
+	idle_ticks = 0;
+
+	// Whatever is in flight gives way before the wait: a fetch is minutes of
+	// network, and the wait below is two seconds.
+	zvukcache_abandon_all();
+	zvukcache_fetch_cancel();
+
+	pthread_mutex_lock(&job_lock);
+	stopping = true;
+	play_pending.kind = fetch_pending.kind = metadata_pending.kind = JOB_NONE;
+	running_kind = JOB_NONE;
+	pthread_cond_broadcast(&job_cond);
+	pthread_mutex_unlock(&job_lock);
+
+	bool gone = zvuk_stop_wait(&threads, "playback worker");
+	pthread_mutex_lock(&job_lock);
+	if (gone) {
+		worker_started = false;
+		stopping = false; // a second init() starts a worker again
+	}
+	pthread_mutex_unlock(&job_lock);
+
+	// The queue of ids: the player's playlist copied the paths out of it, and
+	// nothing here survives the unload.
+	pthread_mutex_lock(&queue_lock);
+	zvuklist_t *old = queue;
+	queue = NULL;
+	queue_generation++;
+	pthread_mutex_unlock(&queue_lock);
+	zvuklist_free(old);
+
+	listener = NULL;
+	ours_valid = false;
+	ours = false;
+	ours_revision = 0;
+	claims_live = false; // the claims themselves are zvukdl's, dropped in its own stop
+	skips_in_a_row = 0;
+	start_index = 0;
+	metadata_requested[0] = '\0';
+	metadata_requested_generation = 0;
+	return gone;
 }
 
 #endif /* SONIX_ZVUK */

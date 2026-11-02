@@ -9,6 +9,7 @@
 
 #include "common/listrow.h"
 
+#include "src/addon/addon.h"
 #include "src/gui/fonts/fonts.h"
 #include "src/gui/nowplaying/player.h"
 #include "src/gui/shell/confirm.h"
@@ -31,6 +32,7 @@
 #include "src/system/streaming/zvuklist.h"
 #include "src/system/streaming/zvukplay.h"
 #include "src/system/streaming/zvukservice.h"
+#include "src/system/streaming/zvukstop.h"
 #include "src/system/streaming/zvuksync.h"
 
 // ---------------------------------------------------------------------------
@@ -147,6 +149,11 @@ static lv_obj_t *list_screen, *search_screen;
 static gui_config_t *page_cfg;
 static char card_root[400];
 
+// The id the host gave this addon, kept because every screen it builds has to
+// be registered with the shell as it is made, and the shell finds the addon by
+// that name (sonix_addon_own_screen, src/addon/addon.h).
+static char addon_id[ADDON_ID_MAX];
+
 // The covers of a list. Only its address matters (listart.h gives `owner` the
 // same meaning); one page owns the slots at a time.
 static const char zvuk_art_owner;
@@ -164,6 +171,13 @@ static int events_count;
 static bool worker_started;
 static unsigned list_generation;
 
+// The worker and the sign-in it may have started, the flag that tells them to
+// leave, and whether this page's two theme hooks are in the player's table:
+// see zvukstop.h and zvukpage_stop().
+static zvuk_stop_t threads = ZVUK_STOP_INIT;
+static bool stopping;
+static bool theme_registered;
+
 // Worker side: the answer being built.
 static row_t *result;
 static int result_count;
@@ -178,6 +192,15 @@ static bool is_event(job_kind_t kind) { return kind == JOB_PROFILE || kind == JO
 
 static void submit(const job_t *job) {
 	pthread_mutex_lock(&job_lock);
+	if (stopping) {
+		// The worker is on its way out, and a job accepted now is one that
+		// would never run: the page's list ref goes with it.
+		pthread_mutex_unlock(&job_lock);
+		if (job->kind == JOB_PAGE) {
+			zvuklist_free(job->list);
+		}
+		return;
+	}
 	if (is_event(job->kind)) {
 		if (events_count < EVENTS_MAX) {
 			events[events_count++] = *job;
@@ -428,11 +451,19 @@ static void free_result(job_result_t *r) {
 
 static void *worker_main(void *arg) {
 	(void)arg;
+	// The count was raised by start_worker(), under the lock that decides
+	// whether a worker may start at all: a thread that has been created but has
+	// not reached its first line is still a thread stop() would dlclose() from
+	// under.
 	zvuk_http_set_thread_timeout_cap(STREAM_UI_TIMEOUT_SECS);
 	for (;;) {
 		pthread_mutex_lock(&job_lock);
-		while (pending.kind == JOB_NONE && page_pending.kind == JOB_NONE && events_count == 0) {
+		while (pending.kind == JOB_NONE && page_pending.kind == JOB_NONE && events_count == 0 && !stopping) {
 			pthread_cond_wait(&job_cond, &job_lock);
+		}
+		if (stopping) {
+			pthread_mutex_unlock(&job_lock);
+			break;
 		}
 		job_t job;
 		if (pending.kind != JOB_NONE) {
@@ -477,11 +508,12 @@ static void *worker_main(void *arg) {
 			free_result(r);
 		}
 	}
+	zvuk_stop_leave(&threads);
 	return NULL;
 }
 
 static void start_worker(void) {
-	if (worker_started) {
+	if (worker_started || stopping) {
 		return;
 	}
 	if (!result) {
@@ -492,7 +524,14 @@ static void start_worker(void) {
 	pthread_attr_init(&attr);
 	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 	pthread_attr_setstacksize(&attr, 256 * 1024);
+	// Counted before it exists and uncounted when it never started: a thread
+	// that is created and not yet running must not slip past the wait in
+	// zvukpage_stop().
+	zvuk_stop_enter(&threads);
 	worker_started = result && pthread_create(&th, &attr, worker_main, NULL) == 0;
+	if (!worker_started) {
+		zvuk_stop_leave(&threads);
+	}
 	pthread_attr_destroy(&attr);
 }
 
@@ -1433,6 +1472,9 @@ static void list_loaded_cb(lv_event_t *e) {
 
 static void build_list_page(gui_config_t *cfg) {
 	list_screen = lv_obj_create(NULL);
+	// The shell knows the screen init() returns and nothing else unless it is
+	// told: this one it has to take off the display and delete at unload.
+	sonix_addon_own_screen(addon_id, list_screen);
 	list_container = settingsrow_page(list_screen, cfg, "Zvuk");
 	list_title = settingsrow_page_title(list_screen);
 
@@ -1533,6 +1575,8 @@ static void open_search_cb(lv_event_t *e) {
 
 static void build_search_page(gui_config_t *cfg) {
 	search_screen = lv_obj_create(NULL);
+	// Registered for the same reason as the list screen (see build_list_page).
+	sonix_addon_own_screen(addon_id, search_screen);
 	lv_obj_add_style(search_screen, &theme_style_screen, 0);
 	settingsrow_title(search_screen, cfg, "Search");
 	int top = settingsrow_content_top(cfg);
@@ -1831,14 +1875,17 @@ static void answer_async(void *user) {
 
 static void *sign_in_main(void *arg) {
 	(void)arg;
+	// Counted by start_sign_in() before this thread existed: see worker_main().
 	answer_t *a = calloc(1, sizeof(*a));
 	if (!a) {
+		zvuk_stop_leave(&threads);
 		return NULL;
 	}
 	char token[ZVUK_TOKEN_MAX];
 	if (!read_token_file(token, sizeof(token))) {
 		snprintf(a->message, sizeof(a->message), "No %s at the root of the card.", ZVUK_TOKEN_FILE);
 		gui_post(answer_async, a);
+		zvuk_stop_leave(&threads);
 		return NULL;
 	}
 	cardimport_result_t result = zvuk_sign_in(token, a->message, sizeof(a->message));
@@ -1850,17 +1897,23 @@ static void *sign_in_main(void *arg) {
 	if (!gui_post(answer_async, a)) {
 		free(a);
 	}
+	zvuk_stop_leave(&threads);
 	return NULL;
 }
 
 static void start_sign_in(void) {
+	if (stopping) {
+		return;
+	}
 	sign_in_running = true;
 	pthread_t th;
 	pthread_attr_t attr;
 	pthread_attr_init(&attr);
 	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 	pthread_attr_setstacksize(&attr, 256 * 1024);
+	zvuk_stop_enter(&threads);
 	if (pthread_create(&th, &attr, sign_in_main, NULL) != 0) {
+		zvuk_stop_leave(&threads);
 		sign_in_running = false;
 		gui_notify_popup("Could not start a worker.");
 	}
@@ -2008,6 +2061,12 @@ static void job_done_async(void *user) {
 
 static void home_loaded_cb(lv_event_t *e) {
 	(void)e;
+	// Never on the way out: this is where a token on the card starts a sign-in
+	// and where the profile is asked for, and stop() has just waited for
+	// threads like those.
+	if (stopping) {
+		return;
+	}
 	// The card may have come or gone since the page was built.
 	listart_set_root(card_root[0] ? card_root : NULL);
 	rebuild_home();
@@ -2036,12 +2095,17 @@ static void *open_album_for_player(const char *album_id, const char *title) {
 
 void *zvukpage_open_album(const char *album_id, const char *title) { return open_album_for_player(album_id, title); }
 
-void zvukpage_init(gui_config_t *cfg, const char *sd_root) {
+void zvukpage_init(gui_config_t *cfg, const char *id, const char *sd_root) {
 	page_cfg = cfg;
+	snprintf(addon_id, sizeof(addon_id), "%s", id ? id : "");
 	snprintf(card_root, sizeof(card_root), "%s", sd_root ? sd_root : "");
 	listart_set_root(card_root[0] ? card_root : NULL);
 
 	zvukpage_screen = lv_obj_create(NULL);
+	// init()'s own screen is registered here too: the shell records the one
+	// init() returns by itself, and this makes the list of screens this library
+	// owns independent of that one field (the call ignores a repeat).
+	sonix_addon_own_screen(addon_id, zvukpage_screen);
 	home_container = settingsrow_page(zvukpage_screen, cfg, "Zvuk");
 	// One corner button, the magnifier: search is not a row among the others.
 	settingsrow_title_corner_slots(settingsrow_page_title(zvukpage_screen), cfg, 1);
@@ -2067,7 +2131,10 @@ void zvukpage_init(gui_config_t *cfg, const char *sd_root) {
 	switcher_attach_back_gesture(zvukpage_screen);
 	player_sheet_attach_drag(zvukpage_screen, true);
 	player_sheet_attach_drag(home_container, true);
+	// The second of the two theme hooks; the first came with the search page.
+	// One flag for both: zvukpage_stop() is the only place that takes them back.
 	theme_register_refresh(quality_refresh);
+	theme_registered = true;
 
 	// The downloads report here, so the list and the home stay true while
 	// something is being saved.
@@ -2079,4 +2146,122 @@ void zvukpage_init(gui_config_t *cfg, const char *sd_root) {
 	// which the page is the only part of the player able to fill. There is no
 	// Zvuk badge in this player's icon set, so the artwork keeps none.
 	zvuk_service_attach_gui(NULL, open_album_for_player);
+}
+
+// ---------------------------------------------------------------------------
+// stopping
+// ---------------------------------------------------------------------------
+
+bool zvukpage_stop(void) {
+	// Nothing new starts from here: the stops below wait for threads, and a
+	// handler that ran in between would start one of them again.
+	pthread_mutex_lock(&job_lock);
+	stopping = true;
+	zvuklist_free(page_pending.list);
+	page_pending = (job_t){0};
+	pending = (job_t){0};
+	events_count = 0;
+	pthread_cond_broadcast(&job_cond);
+	pthread_mutex_unlock(&job_lock);
+
+	// The two theme hooks are code here: a theme or accent change after the
+	// unload would call into the mapping.
+	if (theme_registered) {
+		theme_unregister_refresh(paint_search_pills);
+		theme_unregister_refresh(quality_refresh);
+		theme_registered = false;
+	}
+
+	// No more reports from the save queue, and the covers of the rows on screen
+	// go back to listart before the rows themselves are deleted -- by the shell,
+	// after this returns, one screen at a time. listrow_stop() takes the poll
+	// timer with it: it is not a child of any widget and its callback is code in
+	// this library.
+	zvukdl_set_listener(NULL);
+	listrow_reset((void *)&zvuk_art_owner);
+	listrow_stop();
+
+	// A row menu left open is on the player's top layer, not on this screen: it
+	// would keep the tap that runs do_like()/do_save() -- code here -- reachable
+	// over whatever page came next. The same for the confirm card the delete
+	// path opens, and for a "checking the connection" toast, which is otherwise
+	// never taken down by itself.
+	popover_close();
+	confirm_close();
+	if (toast_busy_showing()) {
+		toast_busy_end();
+	}
+
+	// The worker, and any sign-in it started. A job in flight is a request with
+	// a cap of its own (STREAM_UI_TIMEOUT_SECS), so the wait is the contract and
+	// not a promise; false is the thread it could not outlast.
+	bool gone = zvuk_stop_wait(&threads, "page worker");
+
+	// The result array is the worker's own scratch space, so it goes only when
+	// the thread that writes it is gone; `page_pending` above is what a job of
+	// the list's next page held.
+	pthread_mutex_lock(&job_lock);
+	if (gone) {
+		worker_started = false;
+		stopping = false; // a second init() starts a worker again
+		free(result);
+		result = NULL;
+		zvuklist_free(result_list);
+		result_list = NULL;
+	}
+	list_generation++;
+	pthread_mutex_unlock(&job_lock);
+
+	// The list on screen: its ids are this page's, the player's playlist is not
+	// the same thing and does not point here.
+	free_result(shown);
+	shown = NULL;
+
+	// Everything below pointed into the screens the shell deletes once this
+	// returns, and the next run would write through it.
+	list_container = NULL;
+	list_title = NULL;
+	list_empty = NULL;
+	list_spin = NULL;
+	search_field = NULL;
+	search_keyboard = NULL;
+	quality_note = NULL;
+	home_container = NULL;
+	zvukpage_screen = NULL;
+	list_screen = NULL;
+	search_screen = NULL;
+	for (int i = 0; i < ZVUK_SEARCH_KINDS; i++) {
+		search_pills[i] = NULL;
+	}
+	for (int i = 0; i < ZVUK_QUALITY_COUNT; i++) {
+		quality_pills[i] = NULL;
+	}
+
+	// And the state, so that a second init() in the same process starts where
+	// the first one did rather than on what the last one happened to show.
+	page_cfg = NULL;
+	addon_id[0] = '\0';
+	card_root[0] = '\0';
+	list_kind = JOB_NONE;
+	page_asked = -1;
+	page_failed = -1;
+	page_failed_at = 0;
+	playing_id[0] = '\0';
+	list_history_len = 0;
+	list_has_current = false;
+	memset(&list_current, 0, sizeof(list_current));
+	memset(&menu_row, 0, sizeof(menu_row));
+	search_kind_index = 0;
+	profile_asked = false;
+	sign_in_running = false;
+	result_count = 0;
+	result_error[0] = '\0';
+	result_class = STREAM_ERR_NONE;
+	memset(&result_spoken, 0, sizeof(result_spoken));
+
+	// The service table is in this library too, and its two GUI halves point at
+	// this page. The player unregisters the table itself; emptying it here is
+	// for the unload that fails and leaves the library mapped.
+	zvuk_service_attach_gui(NULL, NULL);
+	return gone;
 }

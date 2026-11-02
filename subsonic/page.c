@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <pthread.h>
 #include <time.h>
 #include <stdio.h>
@@ -33,10 +34,24 @@
 // Nothing that talks to the network runs on the UI thread: a request is a
 // detached worker that fills the shared arrays and posts itself back, and a
 // reply that arrives after the user has moved on is dropped by its generation.
+//
+// An addon can also be unloaded -- the card leaving, the .so on it replaced by a
+// newer one -- and the detached workers are what that has to survive: stop(), at
+// the end of this file, stops new ones starting, waits (bounded) for the ones
+// still out there, clears what they were filling, and answers whether the
+// library may be unmapped.
 
 #define LIST_MAX 100
 #define LEVELS_MAX 6
 #define TEXT_MAX 256
+
+// How long stop() gives a request to come back. A request is an HTTP call with a
+// twenty-second timeout of its own and no way to be interrupted, and stop() runs
+// on the GUI thread of a player whose card may be leaving the slot: two seconds
+// is long enough for the ordinary case -- a reply already on the wire -- and
+// short enough that it does not look like the freeze this unloading exists to
+// prevent.
+#define STOP_WAIT_MS 2000
 
 typedef enum {
 	JOB_NONE = 0,
@@ -59,7 +74,9 @@ typedef struct {
 } level_t;
 
 static gui_config_t *config;
+static char self_id[ADDON_ID_MAX]; // the host's name for us, for sonix_addon_own_screen()
 static lv_obj_t *home_screen;
+static lv_obj_t *home_page;
 static lv_obj_t *list_screen;
 static lv_obj_t *list_container;
 static lv_obj_t *entry_screen;
@@ -85,6 +102,19 @@ static subsonic_artist_t artists[LIST_MAX];
 static subsonic_album_t albums[LIST_MAX];
 static subsonic_track_t tracks[LIST_MAX];
 static subsonic_playlist_t playlists[LIST_MAX];
+
+// Whether a stop() is under way. The shell unloads an addon when the card leaves
+// or when the .so on it changed, and after stop() returns the library may be
+// unmapped: from that moment no request may start and no reply may be posted,
+// because both of those are code in this library.
+static bool stopping;
+
+// The workers that are alive. One detached thread per request, so there is
+// nothing to join and nothing to keep: what stop() waits for is this number.
+// `worker_gone` is signalled by the last statement of a worker.
+static pthread_mutex_t worker_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t worker_gone = PTHREAD_COND_INITIALIZER;
+static int workers_live;
 
 // What the sign-in flow has typed so far.
 static char pending_server[SUBSONIC_SERVER_MAX];
@@ -399,8 +429,26 @@ static void *worker(void *arg) {
 	lv_snprintf(result_error, sizeof(result_error), "%s", error ? error : "");
 	pthread_mutex_unlock(&data_lock);
 
-	gui_post(job_finished, (void *)(intptr_t)job->generation);
+	// A reply for a page that is being taken away is dropped rather than posted:
+	// job_finished() is a function in this library, and unmapping it is what the
+	// stop() that set `stopping` is counting towards. (The loader drops whatever
+	// is already in the queue by address range; this is the half that stops it
+	// being queued at all.)
+	pthread_mutex_lock(&worker_lock);
+	bool wanted = !stopping;
+	pthread_mutex_unlock(&worker_lock);
+
+	if (wanted) {
+		gui_post(job_finished, (void *)(intptr_t)job->generation);
+	}
 	free(job);
+
+	// The last statement, and the one stop() is counting: after this no line of
+	// this library runs on this thread again.
+	pthread_mutex_lock(&worker_lock);
+	workers_live--;
+	pthread_cond_broadcast(&worker_gone);
+	pthread_mutex_unlock(&worker_lock);
 	return NULL;
 }
 
@@ -416,12 +464,33 @@ static void start_job(job_kind_t kind, const char *id, const char *query) {
 	if (query) {
 		lv_snprintf(job->query, sizeof(job->query), "%s", query);
 	}
+
+	// Counted here and not in the worker's first statement: between
+	// pthread_create() and that statement stop() would read nought, return, and
+	// leave the thread to run this library's code as its first act. start_job()
+	// and stop() are both the GUI thread's, so the flag is read and the count
+	// taken in one go and neither can see the other half-way.
+	pthread_mutex_lock(&worker_lock);
+	bool go = !stopping;
+	if (go) {
+		workers_live++;
+	}
+	pthread_mutex_unlock(&worker_lock);
+	if (!go) {
+		free(job);
+		return;
+	}
+
 	pthread_mutex_lock(&gen_lock);
 	job->generation = ++request_generation;
 	pthread_mutex_unlock(&gen_lock);
 
 	pthread_t thread;
 	if (pthread_create(&thread, NULL, worker, job) != 0) {
+		pthread_mutex_lock(&worker_lock);
+		workers_live--;
+		pthread_cond_broadcast(&worker_gone);
+		pthread_mutex_unlock(&worker_lock);
 		free(job);
 		list_show_message("could not start a worker thread");
 		return;
@@ -611,25 +680,24 @@ static void sign_out_cb(lv_event_t *e) {
 }
 
 static void home_build(void) {
-	static lv_obj_t *page;
-	if (!page) {
+	if (!home_page) {
 		home_screen = lv_obj_create(NULL);
-		page = scrolling_page(home_screen, "Subsonic");
+		home_page = scrolling_page(home_screen, "Subsonic");
 	}
-	lv_obj_clean(page);
+	lv_obj_clean(home_page);
 
 	if (subsonic_logged_in()) {
 		char value[TEXT_MAX];
 		subsonic_display_name(value, sizeof(value));
-		row(page, "Account", value, account_cb, NULL);
-		row(page, "Artists", "", artists_cb, NULL);
-		row(page, "Newest", "", newest_cb, NULL);
-		row(page, "Random", "", random_cb, NULL);
-		row(page, "Playlists", "", playlists_cb, NULL);
-		row(page, "Search", "", search_cb, NULL);
-		row(page, "Sign out", "", sign_out_cb, NULL);
+		row(home_page, "Account", value, account_cb, NULL);
+		row(home_page, "Artists", "", artists_cb, NULL);
+		row(home_page, "Newest", "", newest_cb, NULL);
+		row(home_page, "Random", "", random_cb, NULL);
+		row(home_page, "Playlists", "", playlists_cb, NULL);
+		row(home_page, "Search", "", search_cb, NULL);
+		row(home_page, "Sign out", "", sign_out_cb, NULL);
 	} else {
-		row(page, "Sign in", "server, user, password", account_cb, NULL);
+		row(home_page, "Sign in", "server, user, password", account_cb, NULL);
 	}
 }
 
@@ -639,6 +707,36 @@ static void home_build(void) {
 
 static lv_obj_t *subsonic_init(const sonix_addon_host_t *host) {
 	config = host->cfg;
+
+	// The name the shell knows this addon by, for the screen list it keeps
+	// (sonix_addon_own_screen): it is the key, and the pointer alone would not
+	// say whose page it is.
+	lv_snprintf(self_id, sizeof(self_id), "%s", host->id);
+
+	// A second run of this library in the same process is possible -- a
+	// dlclose() that failed, a worker that outlived the wait in stop() -- and it
+	// has to find the state a fresh library would: nothing stopping, no request
+	// numbered, nothing in the arrays that a generation could still match. The
+	// locks need nothing done to them: they are statics with
+	// PTHREAD_*_INITIALIZER, they are never destroyed, and a mutex that is never
+	// destroyed is ready for the next run as it stands.
+	pthread_mutex_lock(&worker_lock);
+	stopping = false;
+	pthread_mutex_unlock(&worker_lock);
+
+	pthread_mutex_lock(&gen_lock);
+	request_generation = 0;
+	pthread_mutex_unlock(&gen_lock);
+
+	pthread_mutex_lock(&data_lock);
+	result_kind = JOB_NONE;
+	result_count = 0;
+	result_error[0] = '\0';
+	pthread_mutex_unlock(&data_lock);
+
+	level_count = 0;
+	entry_done = NULL;
+
 	subsonic_load(host->dir);
 
 	// What is already known fills the form: signing in again after a token
@@ -648,11 +746,20 @@ static lv_obj_t *subsonic_init(const sonix_addon_host_t *host) {
 
 	home_build();
 
+	// Every screen this addon puts on the display, handed to the shell as it is
+	// made: this is the list addon_unload() walks to move the display off
+	// whichever one is up and to delete them all once stop() has returned. A
+	// screen missing from it is a page left standing with widget callbacks
+	// pointing into a library that is about to be unmapped.
+	sonix_addon_own_screen(self_id, home_screen);
+
 	list_screen = lv_obj_create(NULL);
+	sonix_addon_own_screen(self_id, list_screen);
 	list_container = scrolling_page(list_screen, "Subsonic");
 	switcher_set_back_guard(list_screen, list_back_guard);
 
 	entry_screen = lv_obj_create(NULL);
+	sonix_addon_own_screen(self_id, entry_screen);
 	lv_obj_add_style(entry_screen, &theme_style_screen, 0);
 	entry_title = settingsrow_title(entry_screen, config, "");
 	int top = settingsrow_content_top(config);
@@ -675,12 +782,140 @@ static lv_obj_t *subsonic_init(const sonix_addon_host_t *host) {
 	return home_screen;
 }
 
+// The addon is going away: the card was pulled, or addon.so on it changed and
+// the shell is unloading this copy before loading the new one. Runs on the GUI
+// thread with this addon's screens already off the display, and the answer is
+// whether the library may be dlclose()d: true when nothing of it is running any
+// more, false when a request is still inside it and the shell has to keep the
+// mapping instead.
+static bool subsonic_addon_stop(void) {
+	// 1. No new work from here: start_job() reads this before it counts or
+	// creates anything, and a worker reads it before it says its result came
+	// back. Nothing may be posted after this point, because the callback is code
+	// in a library that is about to be unmapped.
+	pthread_mutex_lock(&worker_lock);
+	stopping = true;
+	pthread_mutex_unlock(&worker_lock);
+
+	// 2. The workers, bounded. Each one is a request over the network with a
+	// twenty-second timeout of its own and no way to interrupt it: waiting for
+	// all of them is waiting twenty seconds on the GUI thread, and the card is
+	// what is waiting. So two seconds, then a line in the log naming what is
+	// still out there -- and a false answer, which is what keeps the loader from
+	// unmapping the code that thread is standing in. (Its gui_post() is dropped
+	// either way: `stopping` above, and the loader's own sweep of the queue by
+	// address range.)
+	pthread_mutex_lock(&worker_lock);
+	if (workers_live > 0) {
+		struct timespec until;
+		clock_gettime(CLOCK_REALTIME, &until);
+		until.tv_sec += STOP_WAIT_MS / 1000;
+		until.tv_nsec += (long)(STOP_WAIT_MS % 1000) * 1000000L;
+		if (until.tv_nsec >= 1000000000L) {
+			until.tv_sec++;
+			until.tv_nsec -= 1000000000L;
+		}
+		while (workers_live > 0) {
+			if (pthread_cond_timedwait(&worker_gone, &worker_lock, &until) == ETIMEDOUT) {
+				break;
+			}
+		}
+	}
+	int left = workers_live;
+	pthread_mutex_unlock(&worker_lock);
+	if (left > 0) {
+		fprintf(stderr, "subsonic: stop: %d request(s) still running, keeping the library mapped\n", left);
+	}
+
+	// 3. What the last run put in the shared state. Left alone while a worker is
+	// still writing it (the arrays are its, and the lock would make this wait for
+	// the network all over again), and cleared otherwise, above all for the case
+	// this is not the last run: a library that stopped and starts again has to
+	// find the arrays and the numbering as a fresh one would.
+	if (left == 0) {
+		pthread_mutex_lock(&data_lock);
+		result_kind = JOB_NONE;
+		result_count = 0;
+		result_error[0] = '\0';
+		memset(artists, 0, sizeof(artists));
+		memset(albums, 0, sizeof(albums));
+		memset(tracks, 0, sizeof(tracks));
+		memset(playlists, 0, sizeof(playlists));
+		memset(levels, 0, sizeof(levels));
+		pthread_mutex_unlock(&data_lock);
+	}
+	pthread_mutex_lock(&gen_lock);
+	request_generation = 0;
+	pthread_mutex_unlock(&gen_lock);
+
+	level_count = 0;
+
+	// The next step of the sign-in flow, when one was waiting for an entry
+	// screen's OK: a function in this library, and the keyboard that would call
+	// it is the player's.
+	entry_done = NULL;
+
+	// What was typed is the user's, and one of the three is a password.
+	memset(pending_password, 0, sizeof(pending_password));
+	memset(pending_user, 0, sizeof(pending_user));
+	memset(pending_server, 0, sizeof(pending_server));
+
+	// 4. The session, from memory only. The file on the card is the record and
+	// stop() is an unload, not a sign-out: writing here would be a write to a
+	// filesystem that may be going away, and would end the session of the copy
+	// that is loaded next.
+	subsonic_forget();
+
+	// 5. The one hook this addon put in the player. The list screen takes the
+	// back chevron for itself (switcher_set_back_guard), and that handler is a
+	// function in this library: NULL replaces it, which is what switcher.h says
+	// registering the same screen again does.
+	if (list_screen && gui_obj_alive(list_screen)) {
+		switcher_set_back_guard(list_screen, NULL);
+	}
+
+	// 6. Every pointer this file kept into LVGL, cleared: the screens are the
+	// shell's from here. Each one was registered as it was made
+	// (sonix_addon_own_screen), so addon_unload() moves the display off whichever
+	// of them is up, forgets them in the back-stack and deletes them once this
+	// returns -- with its own aliveness check, so nothing here may delete them
+	// too, and the keyboard on the entry screen goes with its parent
+	// (keyboard.c drops it from its own list when the tray is deleted).
+	config = NULL;
+	home_screen = NULL;
+	home_page = NULL;
+	list_screen = NULL;
+	list_container = NULL;
+	entry_screen = NULL;
+	entry_field = NULL;
+	entry_title = NULL;
+	entry_keyboard = NULL;
+
+	// The answer the loader acts on: nought workers above, and every thread of
+	// this library has run its last instruction. A false here is not a failure to
+	// report -- the shell keeps the mapping and refuses to open this addon again
+	// for the rest of the run, which is a leak instead of a jump into an unmapped
+	// page.
+	return left == 0;
+}
+
 static const sonix_addon_t subsonic = {
 	.api = SONIX_ADDON_API,
 	.title = "Subsonic",
 	.init = subsonic_init,
 };
 
+// One function, one flag and one count: the whole of what this addon has to undo
+// is a page that is still on the network. See addon.h for the contract.
+static const sonix_addon_stop_t subsonic_lifecycle = {
+	.api = SONIX_ADDON_API,
+	.stop = subsonic_addon_stop,
+};
+
 const sonix_addon_t *sonix_addon_entry(uint32_t api) {
 	return api == SONIX_ADDON_API ? &subsonic : NULL;
+}
+
+const sonix_addon_stop_t *sonix_addon_stop_entry(uint32_t api) {
+	return api == SONIX_ADDON_API ? &subsonic_lifecycle : NULL;
 }

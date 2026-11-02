@@ -19,8 +19,14 @@
 // row is tapped (the sign-in runs on a worker and posts back).
 
 // Builds the screen. Called once, from the addon's init(); `sd_root` is the
-// card, where yandex_token.txt is looked for.
-void yandexstate_init(gui_config_t *cfg, const char *sd_root);
+// card, where yandex_token.txt is looked for, and `id` is the id the host gave
+// the library, which the screen is registered under (sonix_addon_own_screen).
+void yandexstate_init(gui_config_t *cfg, const char *sd_root, const char *id);
+// Undoes init(): both timers deleted, the page's workers waited for, every
+// pointer into the screen and the login flow dropped. Called from the addon's
+// stop hook, on the GUI thread, before the service modules are stopped. False
+// when one of the page's workers did not come back in time.
+bool yandexstate_stop(void);
 // The screen the tile opens.
 extern lv_obj_t *yandexstate_screen;
 

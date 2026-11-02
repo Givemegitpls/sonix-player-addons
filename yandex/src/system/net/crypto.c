@@ -272,3 +272,17 @@ bool crypto_aes128_cbc_decrypt(const uint8_t key[CRYPTO_AES128_KEY_SIZE], const 
 	}
 	return true;
 }
+
+// The addon being unloaded. The table of EVP functions and the handle they were
+// found in are dropped together, and the next call resolves them again: a table
+// of pointers left behind would be a table of pointers into a library that
+// openssl_runtime_close() has since dlclose()d, which is the one way a reload
+// could decrypt into freed code.
+void crypto_forget(void) {
+	pthread_mutex_lock(&load_lock);
+	memset(&evp, 0, sizeof(evp));
+	lib_crypto = NULL;
+	load_state = LOAD_UNTRIED;
+	aes256_ok = false;
+	pthread_mutex_unlock(&load_lock);
+}

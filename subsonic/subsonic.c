@@ -559,6 +559,21 @@ void subsonic_logout(void) {
 	pthread_mutex_unlock(&session_lock);
 }
 
+// The addon is being unloaded. The session and the settings leave memory and
+// nothing is written: the file on the card is the record, an unload is not a
+// sign-out, and the write would land on a filesystem that may be going away with
+// the card. What this buys is the library that starts again in this process --
+// after a dlclose() that failed, say -- seeing the state a freshly loaded one
+// would fill in from the file anyway, rather than a password sitting in a page
+// nobody asked for.
+void subsonic_forget(void) {
+	pthread_mutex_lock(&session_lock);
+	memset(&session, 0, sizeof(session));
+	store_init(&settings, NULL);
+	pthread_mutex_unlock(&session_lock);
+	quality = SUBSONIC_QUALITY_ORIGINAL;
+}
+
 bool subsonic_ping(void) {
 	char *body;
 	json_doc_t doc;
