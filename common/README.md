@@ -22,5 +22,5 @@ What is here:
   URL, the picture appears in it when it arrives, and the twelve download slots
   the player has are shared out among the rows that are actually on screen. The
   downloading itself is the player's (`listart`); this is the row bookkeeping
-  the pages would otherwise each write out by hand. Off unless
-  `[streaming] list_art` is on.
+  the pages would otherwise each write out by hand. On unless the card sets
+  `[streaming] list_art = 0`; there is no page for it in the interface.

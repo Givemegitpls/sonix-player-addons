@@ -43,11 +43,13 @@
 //            that differs between pages (the address of a static char in the
 //            page's own translation unit). One page is on screen at a time.
 //
-// The setting: [streaming] list_art, off by default. Off, listrow_bind()
-// records nothing, no timer is created and no memory is allocated -- a page may
-// call this unconditionally and pay nothing. The setting is read when a page
-// resets (listrow_reset()), so a change made in the settings takes effect the
-// next time a page opens.
+// The setting: [streaming] list_art, on unless the card sets it to 0. There is
+// no page for it in the interface, so "off by default" used to mean no cover
+// appeared in any list of any addon. Off, listrow_bind() records nothing, no
+// timer is created and no memory is allocated -- a page may call this
+// unconditionally and pay nothing. The setting is read when a page resets
+// (listrow_reset()), so a change made in the settings takes effect the next
+// time a page opens.
 //
 // Threading: every function here runs on the GUI thread, and so does the timer
 // inside. listart downloads on its own worker; this module only polls with an

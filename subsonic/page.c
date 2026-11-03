@@ -9,6 +9,7 @@
 #include "subsonic.h"
 
 #include "common/addonfs.h"
+#include "common/listrow.h"
 
 #include "src/addon/addon.h"
 #include "src/gui/fonts/fonts.h"
@@ -24,6 +25,7 @@
 #include "src/gui/shell/toast.h"
 #include "src/system/playback/device_state.h"
 
+#include "src/gui/streaming/listart.h"
 #include "src/system/streaming/streamturn.h"
 #include "src/system/streaming/subsoniccache.h"
 #include "src/system/streaming/subsonicplay.h"
@@ -103,6 +105,11 @@ static lv_obj_t *entry_screen;
 static lv_obj_t *entry_field;
 static lv_obj_t *entry_title;
 static keyboard_t *entry_keyboard;
+
+// The page, in listrow's sense (common/listrow.h): the address of a static here
+// is a stable key that is this page's and no other page's, which is how the
+// downloader knows whose rows it is serving.
+static const char art_owner;
 
 static level_t levels[LEVELS_MAX];
 static int level_count;
@@ -382,6 +389,10 @@ static void row_menu_cb(lv_event_t *e) {
 static void list_show_level(void);
 
 static void list_show_message(const char *text) {
+	// Nothing of the list above is left: the message replaces every row, so the
+	// covers it had are given back rather than held for rows that no longer
+	// exist.
+	listrow_reset((void *)&art_owner);
 	lv_obj_clean(list_container);
 	lv_obj_t *label = lv_label_create(list_container);
 	lv_label_set_text(label, text);
@@ -401,6 +412,11 @@ static void heading_set(const char *text) {
 static void start_job(job_kind_t kind, const char *id, const char *query);
 
 static void row_artist_cb(lv_event_t *e) {
+	// A gesture that ends over a row is not a tap on it: the rows let presses
+	// through so the back swipe and the sheet's drag can start on one.
+	if (switcher_back_drag_active() || player_sheet_drag_active()) {
+		return;
+	}
 	int index = (int)(intptr_t)lv_event_get_user_data(e);
 	const subsonic_artist_t *a = &artists[index];
 	if (level_count >= LEVELS_MAX) {
@@ -415,6 +431,10 @@ static void row_artist_cb(lv_event_t *e) {
 }
 
 static void row_album_cb(lv_event_t *e) {
+	// As row_artist_cb: a drag that ends here is not a tap on the album.
+	if (switcher_back_drag_active() || player_sheet_drag_active()) {
+		return;
+	}
 	int index = (int)(intptr_t)lv_event_get_user_data(e);
 	const subsonic_album_t *a = &albums[index];
 	if (level_count >= LEVELS_MAX) {
@@ -428,41 +448,179 @@ static void row_album_cb(lv_event_t *e) {
 	start_job(JOB_TRACKS, a->id, NULL);
 }
 
-// A track row is the shell's row plus an ellipsis on its right: the tap plays
-// the list from this row, the ellipsis opens the menu. The duration moves left
-// to make room for it.
-static void track_row(lv_obj_t *parent, int index) {
-	const subsonic_track_t *track = &tracks[index];
-	char short_name[SUBSONIC_TITLE_MAX];
-	char sub[TEXT_MAX];
-	lv_snprintf(sub, sizeof(sub), "%d:%02d", track->duration / 60, track->duration % 60);
-	lv_obj_t *value = NULL;
-	lv_obj_t *r = settingsrow_add(parent, clip(short_name, sizeof(short_name), track->title), &value, row_track_cb,
-								  (void *)(intptr_t)index);
-	if (value) {
-		lv_label_set_text(value, sub);
-		lv_obj_align(value, LV_ALIGN_RIGHT_MID, -SC(48), 0);
+// ---------------------------------------------------------------------------
+// A list row
+//
+// The shell's settingsrow_add() is a name and a value and has nowhere to put a
+// picture, so the lists build their rows here: a cover on the left, the name
+// after it, the list's own value (an album's year, a track's length) dim on the
+// right. The row keeps the shell's card -- same height, radius, padding and
+// press style -- so the list still reads as part of this player.
+//
+// The cover is listart's, through common/listrow.h: this file says which
+// picture belongs to which row and which rows are on screen, and nothing else.
+// listrow keeps the rest -- the request, the slot, the decoded picture, and the
+// delete handler that gives a slot back when a row goes.
+// ---------------------------------------------------------------------------
+
+#define ROW_H SC(100)		// the shell's own row height
+#define ROW_THUMB SC(64)	// leaves the card's own margin above and below
+// What the cover is asked for from the server. The decode is the object's
+// width (listrow.h), this is only the size of the file the server sends: at
+// twice the thumbnail it stays sharp without moving a large picture over wifi.
+#define ROW_COVER_PX 100
+
+static lv_obj_t *list_row(lv_obj_t *parent, const char *name, const char *value, const char *cover_id, int index,
+						  lv_event_cb_t cb, bool menu) {
+	lv_obj_t *r = lv_btn_create(parent);
+	lv_obj_set_size(r, lv_pct(100), ROW_H);
+	lv_obj_add_style(r, &theme_style_card, 0);
+	lv_obj_add_style(r, &theme_style_card_pressed, LV_STATE_PRESSED);
+	lv_obj_set_style_radius(r, SC(12), 0);
+	lv_obj_set_style_border_width(r, 0, 0);
+	lv_obj_set_style_shadow_width(r, 0, 0);
+	lv_obj_set_style_pad_hor(r, SC(16), 0);
+	lv_obj_set_style_pad_ver(r, 0, 0);
+	lv_obj_set_style_pad_column(r, SC(14), 0);
+	lv_obj_set_scrollable(r, false);
+	lv_obj_set_flex_flow(r, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(r, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	// Gestures (the back swipe, and pulling the player sheet in) start on rows
+	// too, and a button keeps the press to itself: without this neither works
+	// over the list.
+	lv_obj_set_event_bubble(r, true);
+	lv_obj_add_event_cb(r, cb, LV_EVENT_CLICKED, (void *)(intptr_t)index);
+
+	// The cover, or the quiet rounded box it has until there is one: an artist
+	// with no coverArt, a server that will not answer for this id, or the
+	// settings' list_art turned off. The picture, when it comes, is set on this
+	// object by listrow and needs no help from here.
+	lv_obj_t *thumb = lv_image_create(r);
+	lv_obj_set_size(thumb, ROW_THUMB, ROW_THUMB);
+	lv_obj_set_style_bg_color(thumb, theme()->surface_pressed, 0);
+	lv_obj_set_style_bg_opa(thumb, LV_OPA_COVER, 0);
+	lv_obj_set_style_radius(thumb, SC(8), 0);
+	lv_obj_set_style_clip_corner(thumb, true, 0);
+	lv_obj_set_event_bubble(thumb, true);
+	if (cover_id && cover_id[0]) {
+		char url[SUBSONIC_URL_MAX];
+		subsonic_cover_url(cover_id, ROW_COVER_PX, url, sizeof(url));
+		// Building a URL reads the saved session and touches no network: it is
+		// the request listart makes later that leaves the player.
+		listrow_bind((void *)&art_owner, thumb, index, url);
 	}
 
-	// A plain object with the tap on it: no button style to undo, and the
-	// handler stops the event (lv_event_stop_bubbling) so it never reaches the
-	// row underneath, where a tap is "play".
-	lv_obj_t *more = lv_obj_create(r);
-	lv_obj_set_size(more, SC(56), SC(56));
-	lv_obj_align(more, LV_ALIGN_RIGHT_MID, 0, 0);
-	lv_obj_set_style_bg_opa(more, LV_OPA_TRANSP, 0);
-	lv_obj_set_style_border_width(more, 0, 0);
-	lv_obj_set_style_shadow_width(more, 0, 0);
-	lv_obj_set_style_pad_all(more, 0, 0);
-	lv_obj_add_event_cb(more, row_menu_cb, LV_EVENT_CLICKED, (void *)(intptr_t)index);
-	lv_obj_t *dots = lv_image_create(more);
-	lv_image_set_src(dots, &icon_ellipsis_vertical);
-	lv_obj_add_style(dots, &theme_style_icon, 0);
-	lv_obj_set_style_image_opa(dots, LV_OPA_70, 0);
-	lv_obj_center(dots);
+	// The name ellipsizes itself: unlike the shell row, whose name is laid out
+	// from a resize event that arrives after the value is filled in (see
+	// clip()), this label is a flex child and gets its width from the layout
+	// that places it, so LV_LABEL_LONG_DOT can do the shortening and the row
+	// does not have to keep titles short by hand.
+	lv_obj_t *label = lv_label_create(r);
+	lv_label_set_text(label, name ? name : "");
+	lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+	lv_obj_set_height(label, lv_font_get_line_height(&font_ui_24));
+	lv_obj_set_flex_grow(label, 1);
+	lv_obj_add_style(label, &theme_style_text, 0);
+	lv_obj_set_style_text_font(label, &font_ui_24, 0);
+
+	if (value && value[0]) {
+		lv_obj_t *right = lv_label_create(r);
+		lv_label_set_text(right, value);
+		lv_obj_add_style(right, &theme_style_text_dim, 0);
+		lv_obj_set_style_text_font(right, &font_ui_22, 0);
+	}
+
+	if (menu) {
+		// A plain object with the tap on it: no button style to undo, and the
+		// handler stops the event (lv_event_stop_bubbling) so it never reaches
+		// the row underneath, where a tap is "play".
+		lv_obj_t *more = lv_obj_create(r);
+		lv_obj_set_size(more, SC(56), SC(56));
+		lv_obj_set_style_bg_opa(more, LV_OPA_TRANSP, 0);
+		lv_obj_set_style_border_width(more, 0, 0);
+		lv_obj_set_style_shadow_width(more, 0, 0);
+		lv_obj_set_style_pad_all(more, 0, 0);
+		lv_obj_add_event_cb(more, row_menu_cb, LV_EVENT_CLICKED, (void *)(intptr_t)index);
+		lv_obj_t *dots = lv_image_create(more);
+		lv_image_set_src(dots, &icon_ellipsis_vertical);
+		lv_obj_add_style(dots, &theme_style_icon, 0);
+		lv_obj_set_style_image_opa(dots, LV_OPA_70, 0);
+		lv_obj_center(dots);
+	}
+
+	return r;
+}
+
+// The rows on screen, as a range of indices for listrow_visible(). Read from
+// the row objects themselves: the container's flex layout is the only thing
+// that knows where a row ended up, and a pitch guessed here would drift from
+// the panel it is drawn on.
+static void list_visible_range(int *first, int *last) {
+	*first = 0;
+	*last = -1;
+	if (!list_container) {
+		return;
+	}
+	int count = (int)lv_obj_get_child_count(list_container);
+	if (count <= 0) {
+		return;
+	}
+	int32_t top = lv_obj_get_scroll_y(list_container);
+	int32_t height = lv_obj_get_height(list_container);
+	int f = count, l = -1;
+	for (int i = 0; i < count; i++) {
+		lv_obj_t *r = lv_obj_get_child(list_container, i);
+		if (!r) {
+			continue;
+		}
+		int32_t y = lv_obj_get_y(r);
+		int32_t h = lv_obj_get_height(r);
+		if (y + h < top) {
+			continue;
+		}
+		if (y > top + height) {
+			break;
+		}
+		if (i < f) {
+			f = i;
+		}
+		l = i;
+	}
+	if (l >= 0) {
+		*first = f;
+		*last = l;
+	}
+}
+
+// The one call the downloader needs: which of this page's rows are worth a
+// picture right now. The rows just outside it keep theirs (listrow.h), so
+// scrolling back a screen finds the covers already there.
+static void list_visible_update(void) {
+	int first, last;
+	list_visible_range(&first, &last);
+	listrow_visible((void *)&art_owner, first, last);
+}
+
+static void list_scrolled_cb(lv_event_t *e) {
+	(void)e;
+	list_visible_update();
+}
+
+// A track row is the same card with the length in place of the value and an
+// ellipsis on its right: the tap plays the list from this row, the ellipsis
+// opens the menu.
+static void track_row(lv_obj_t *parent, int index) {
+	const subsonic_track_t *track = &tracks[index];
+	char sub[TEXT_MAX];
+	lv_snprintf(sub, sizeof(sub), "%d:%02d", track->duration / 60, track->duration % 60);
+	list_row(parent, track->title, sub, track->cover_id, index, row_track_cb, true);
 }
 
 static void row_playlist_cb(lv_event_t *e) {
+	// As row_artist_cb: a drag that ends here is not a tap on the playlist.
+	if (switcher_back_drag_active() || player_sheet_drag_active()) {
+		return;
+	}
 	int index = (int)(intptr_t)lv_event_get_user_data(e);
 	const subsonic_playlist_t *p = &playlists[index];
 	if (level_count >= LEVELS_MAX) {
@@ -486,14 +644,18 @@ static void list_show_level(void) {
 		return;
 	}
 
+	// Every row goes, and every cover this page asked for goes with it: the
+	// entries listrow keeps are keyed by row object, and a rebuilt list is a
+	// different set of rows even when the names repeat.
+	listrow_reset((void *)&art_owner);
 	lv_obj_clean(list_container);
 	char sub[TEXT_MAX];
 	for (int i = 0; i < result_count; i++) {
 		switch (result_kind) {
 		case JOB_ARTISTS:
 			lv_snprintf(sub, sizeof(sub), "%d", artists[i].album_count);
-			row(list_container, artists[i].name, artists[i].album_count ? sub : "", row_artist_cb,
-				(void *)(intptr_t)i);
+			list_row(list_container, artists[i].name, artists[i].album_count ? sub : "", artists[i].cover_id, i,
+					 row_artist_cb, false);
 			break;
 		case JOB_ALBUMS:
 		case JOB_NEWEST:
@@ -504,7 +666,7 @@ static void list_show_level(void) {
 			} else {
 				sub[0] = '\0';
 			}
-			row(list_container, albums[i].title, sub, row_album_cb, (void *)(intptr_t)i);
+			list_row(list_container, albums[i].title, sub, albums[i].cover_id, i, row_album_cb, false);
 			break;
 		case JOB_TRACKS:
 		case JOB_PLAYLIST_TRACKS:
@@ -514,13 +676,19 @@ static void list_show_level(void) {
 			break;
 		case JOB_PLAYLISTS:
 			lv_snprintf(sub, sizeof(sub), "%d", playlists[i].song_count);
-			row(list_container, playlists[i].name, playlists[i].song_count ? sub : "", row_playlist_cb,
-				(void *)(intptr_t)i);
+			list_row(list_container, playlists[i].name, playlists[i].song_count ? sub : "", playlists[i].cover_id, i,
+					 row_playlist_cb, false);
 			break;
 		default:
 			break;
 		}
 	}
+
+	// The rows have places only after the layout has run them through the flex
+	// column, and the covers are asked for by place: this is what turns the
+	// list that was just built into the first range of rows on screen.
+	lv_obj_update_layout(list_container);
+	list_visible_update();
 }
 
 static void home_build(void);
@@ -541,6 +709,12 @@ static void page_reset(void) {
 	memset(tracks, 0, sizeof(tracks));
 	memset(playlists, 0, sizeof(playlists));
 	pthread_mutex_unlock(&data_lock);
+
+	// The covers were the last server's as much as the ids were: the rows may
+	// still be on the list screen, and what they show must not outlive the
+	// account it came from. The rows go with their own reset on the next
+	// rebuild; this one only takes the pictures and the slots back.
+	listrow_reset((void *)&art_owner);
 
 	pthread_mutex_lock(&gen_lock);
 	request_generation++;
@@ -1310,6 +1484,13 @@ static lv_obj_t *subsonic_init(const sonix_addon_host_t *host) {
 	subsoniccache_set_addon_dir(have_cache ? cache : NULL);
 	subsoniccache_set_root(host->sd_root);
 
+	// The covers of the list rows come from the player's listart, which keeps
+	// what it downloads in <card>/.local/listart and knows nothing about this
+	// addon's folder. Somebody has to point it at the card -- every page with
+	// covers does -- and without the call it has no directory at all, so the
+	// rows keep their placeholder boxes for ever (listart.h).
+	listart_set_root(host->sd_root);
+
 	// The prepare callback goes in here, not on the first tap: the player
 	// restores its queue at boot and can start a track of ours before this page
 	// is ever opened.
@@ -1347,6 +1528,10 @@ static lv_obj_t *subsonic_init(const sonix_addon_host_t *host) {
 	sonix_addon_own_screen(self_id, list_screen);
 	list_container = scrolling_page(list_screen, "Subsonic");
 	switcher_set_back_guard(list_screen, list_back_guard);
+	// Which rows are on screen decides which covers are asked for: the list is
+	// taller than the panel, and every scroll moves the window the downloader
+	// serves. Registered once, here, because the container outlives the lists.
+	lv_obj_add_event_cb(list_container, list_scrolled_cb, LV_EVENT_SCROLL, NULL);
 
 	entry_screen = lv_obj_create(NULL);
 	sonix_addon_own_screen(self_id, entry_screen);
@@ -1500,7 +1685,18 @@ static bool subsonic_addon_stop(void) {
 		switcher_set_back_guard(list_screen, NULL);
 	}
 
-	// 6. Every pointer this file kept into LVGL, cleared: the screens are the
+	// 6. The rows' covers, before their rows go with the screens: listart's
+	// slots are shared and a slot held by a page that is leaving starves the
+	// next one. listrow_stop() then deletes the poll timer -- not a child of any
+	// widget, and its callback is code in this library, so a tick after the
+	// unload would jump into the mapping -- and forgets every row. The rows
+	// themselves are the shell's to delete, and it does that before this
+	// library is unmapped (addon.c, step 4), which is why the delete handler
+	// listrow left on them finds nothing left to release.
+	listrow_reset((void *)&art_owner);
+	listrow_stop();
+
+	// 7. Every pointer this file kept into LVGL, cleared: the screens are the
 	// shell's from here. Each one was registered as it was made
 	// (sonix_addon_own_screen), so addon_unload() moves the display off whichever
 	// of them is up, forgets them in the back-stack and deletes them once this

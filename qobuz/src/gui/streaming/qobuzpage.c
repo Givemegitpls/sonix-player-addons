@@ -135,6 +135,12 @@ static const char *page_owner;
 // outside this function is a page nobody unloads.
 static lv_obj_t *own_screen(void) {
 	lv_obj_t *screen = lv_obj_create(NULL);
+	// The theme's screen style, which is where the page's background colour
+	// comes from. Without it the screen keeps LVGL's default, which is white:
+	// every card looked right on a white page, and the corner glyphs -- drawn
+	// in the theme's icon colour, i.e. light in the dark theme -- were almost
+	// invisible on it, the magnifier included.
+	lv_obj_add_style(screen, &theme_style_screen, 0);
 	sonix_addon_own_screen(page_owner, screen);
 	return screen;
 }
@@ -1985,7 +1991,6 @@ static void open_search_cb(lv_event_t *e) {
 
 static void build_search_page(gui_config_t *cfg) {
 	search_screen = own_screen();
-	lv_obj_add_style(search_screen, &theme_style_screen, 0);
 
 	settingsrow_title(search_screen, cfg, "qobuz_search_qobuz");
 	int top = settingsrow_content_top(cfg);
@@ -2077,7 +2082,9 @@ static void build_search_page(gui_config_t *cfg) {
 // /user/login answers "invalid credentials" for accounts that are perfectly
 // valid, so two fields and a button could only ever fail. What works is the
 // account's user_auth_token, left in Addons/qobuz/token.txt on the card; every
-// call afterwards carries it in a header anyway (qobuz.h).
+// call afterwards carries it in a header anyway (qobuz.h). What Qobuz accepted
+// is then kept in Addons/qobuz/session.ini, which is the file every start reads
+// (qobuzconf.h), so the token file is a way in rather than the session itself.
 //
 // The rows are in plain English, like the other addons': these strings are new
 // and the player's language files are on the read-only rootfs.
@@ -2117,29 +2124,42 @@ static const char *account_line(bool signed_in) {
 	return "";
 }
 
+// Where the two files stand, said once and under the card that used to name only
+// the first of them: the token is read from token.txt, and what Qobuz accepted
+// is kept in session.ini so that the next start has an account without touching
+// the card. Both are written by hand-editable text, and the second one is not a
+// backup -- it is what the player reads at boot (qobuz.h, qobuzconf.h).
+static const char *session_note(void) {
+	return "The token is read from this file. Once Qobuz has accepted it, the session is kept in "
+		   QOBUZ_SESSION_REL ", which is what the next start reads.";
+}
+
 // The token file, as a card rather than as a row with a value: the path is
 // longer than the half of a 320-pixel row that would be left for it. The name
-// sits where every row's name sits, the path underneath in the dim value style.
+// sits where every row's name sits, the path underneath in the dim value style,
+// and under both the sentence about where the accepted token goes.
 static void token_file_row(lv_obj_t *parent) {
 	lv_obj_t *card = lv_obj_create(parent);
 	lv_obj_set_width(card, lv_pct(100));
-	lv_obj_set_height(card, SC(100));
+	lv_obj_set_height(card, SC(132));
 	lv_obj_add_style(card, &theme_style_card, 0);
 	lv_obj_set_style_radius(card, SC(12), 0);
 	lv_obj_set_style_border_width(card, 0, 0);
 	lv_obj_set_style_shadow_width(card, 0, 0);
 	lv_obj_set_style_pad_hor(card, SC(20), 0);
-	lv_obj_set_style_pad_ver(card, SC(14), 0);
+	lv_obj_set_style_pad_ver(card, SC(12), 0);
+	lv_obj_set_style_pad_gap(card, SC(4), 0);
 	lv_obj_set_scrollable(card, false);
 	// Presses reach the page container, as on any other row, so the swipe-back
 	// gesture can start here too.
 	lv_obj_set_event_bubble(card, true);
+	lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
 	lv_obj_t *name = lv_label_create(card);
 	lv_label_set_text(name, "Token file");
 	lv_obj_add_style(name, &theme_style_text, 0);
 	lv_obj_set_style_text_font(name, &font_ui_24, 0);
-	lv_obj_align(name, LV_ALIGN_TOP_LEFT, 0, 0);
 
 	lv_obj_t *value = lv_label_create(card);
 	lv_obj_add_style(value, &theme_style_text_dim, 0);
@@ -2147,13 +2167,25 @@ static void token_file_row(lv_obj_t *parent) {
 	lv_label_set_long_mode(value, LV_LABEL_LONG_DOT);
 	lv_obj_set_width(value, lv_pct(100));
 	lv_label_set_text(value, QOBUZ_TOKEN_REL);
-	lv_obj_align(value, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+	lv_obj_t *note = lv_label_create(card);
+	lv_obj_add_style(note, &theme_style_text_dim, 0);
+	lv_obj_set_style_text_font(note, &font_ui_14, 0);
+	lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+	lv_obj_set_width(note, lv_pct(100));
+	lv_label_set_text(note, session_note());
 }
 
-// Both ways in are the same read of the same file: one drops the session first
-// (a fresh start on a card whose token has been replaced, and no session left
-// if it turns out to be no good), the other keeps it (a user who has just
-// edited the file and wants the running session to survive a bad paste).
+// The one way in: read token.txt, ask Qobuz who it belongs to, and make it the
+// session when the answer is yes. There used to be two rows over this -- one
+// that dropped the session before asking and one that kept it -- which read as
+// two different actions and were the same read of the same file. Keeping the
+// session is the useful half of that pair: a token edited by hand and pasted
+// wrong leaves the account on the card working, and a good one replaces it.
+//
+// The start of a run passes false instead: there the session in session.ini has
+// not been checked with the server either, and one the server rejects is not
+// worth keeping.
 static void sign_in_run(bool keep_current) {
 	job_t job = {0};
 	job.kind = JOB_SIGN_IN;
@@ -2164,11 +2196,6 @@ static void sign_in_run(bool keep_current) {
 }
 
 static void sign_in_from_card_cb(lv_event_t *e) {
-	(void)e;
-	sign_in_run(false);
-}
-
-static void read_again_cb(lv_event_t *e) {
 	(void)e;
 	sign_in_run(true);
 }
@@ -2422,7 +2449,6 @@ static void rebuild_home(void) {
 
 	token_file_row(home_container);
 	settingsrow_action(home_container, "Sign in from the card", sign_in_from_card_cb, NULL);
-	settingsrow_action(home_container, "Read again", read_again_cb, NULL);
 
 	update_corner_buttons();
 	if (!signed_in) {

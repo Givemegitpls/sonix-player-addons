@@ -77,7 +77,10 @@ static int enabled = -1;
 
 static bool listrow_on(void) {
 	if (enabled < 0) {
-		enabled = config_get_bool("streaming", "list_art", false) ? 1 : 0;
+		// On unless the card says otherwise: the setting has no page in the
+		// interface, so "off by default" meant no list cover anywhere -- an
+		// addon's rows showed their placeholder and nothing ever asked.
+		enabled = config_get_bool("streaming", "list_art", true) ? 1 : 0;
 	}
 	return enabled == 1;
 }
@@ -416,8 +419,9 @@ void listrow_visible(void *owner, int first, int last) {
 
 void listrow_reset(void *owner) {
 	// A page is opening: this is the one moment at which a change made in the
-	// settings can take effect.
-	enabled = config_get_bool("streaming", "list_art", false) ? 1 : 0;
+	// settings can take effect ("on" unless the card turned it off, as in
+	// listrow_on).
+	enabled = config_get_bool("streaming", "list_art", true) ? 1 : 0;
 
 	if (owner && active_owner == owner) {
 		active_owner = NULL;

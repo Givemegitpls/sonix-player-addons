@@ -121,6 +121,10 @@ typedef struct {
 // the whole of what the account half needs.
 #define QOBUZ_TOKEN_FILE "token.txt"
 #define QOBUZ_TOKEN_REL "Addons/qobuz/token.txt"
+// Where the accepted token and the account name are kept: session.ini, beside
+// the token file, read at every start (qobuzconf.h). token.txt is the question,
+// this is the answer, and the page names both so the pair is not a surprise.
+#define QOBUZ_SESSION_REL "Addons/qobuz/session.ini"
 
 // What qobuz_sign_in_from_card() answered.
 typedef enum {
@@ -134,10 +138,11 @@ typedef enum {
 // to (one /user/get, the only call whose business is the account itself) and,
 // when the server accepts it, makes it the session and writes session.ini.
 //
-// `keep_current` is "Read again": a token or a server answer that is no good
-// leaves the session as it was. With it false -- "Sign in from the card", and
-// the check init() starts -- a failure signs out, so no session is kept that the
-// server rejected. Qobuz's own sentence, when it gave one, is in
+// `keep_current` is "leave the running session alone": a token or a server
+// answer that is no good leaves the session as it was, which is what the page's
+// one sign-in row asks for. init()'s check passes false instead: a session the
+// server rejects is not worth keeping, and there is nothing else to fall back
+// on at the start of a run. Qobuz's own sentence, when it gave one, is in
 // qobuz_last_error(). The token is never logged and never returned.
 qobuz_card_result_t qobuz_sign_in_from_card(bool keep_current);
 
