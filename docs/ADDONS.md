@@ -444,6 +444,12 @@ passed through as it is for the player. `host` is not in there: the simulator's
 addons link against the machine's own libraries, so `make host` runs on
 the machine.
 
+The one exception is the Spotify engine, which is Rust and needs a compiler the
+player's image deliberately does not carry: it has an image of its own,
+`spotify/engine-mips/docker/Dockerfile` (the same Ubuntu 24.04, plus the pinned
+nightly and the musl cross compiler), built by `make -C spotify/engine-mips`
+when it is not there. The player's image has no Rust in it at all.
+
 `make` compiles every directory that has an `addon.json`, plus
 everything in `common/` (compiled into each addon on purpose: an addon is
 a self-contained package). `ADDON_IDS="…"` narrows it to the named ones, which

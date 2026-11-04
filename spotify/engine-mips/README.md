@@ -19,6 +19,7 @@ What is proven here, and what is not:
 
 ```
 $ make                       # build the engine in the docker image
+$ make image                 # build that image: docker/, Ubuntu 24.04 + nightly + musl gcc
 $ make client                # build the unix-socket probe client
 $ make check                 # file/readelf/size: static, MIPS, no dynamic section
 $ make probe                 # push both, start on the device, ask it `probe`
@@ -27,8 +28,8 @@ $ make clean
 
 ## The command
 
-From this directory, in the image `sonix-player/sonix-player/docker/Dockerfile` builds
-(`docker build -t tempotec-player-build sonix-player/docker`):
+From this directory, in the image `docker/Dockerfile` here builds
+(`make image`, or `docker build -t tempotec-spotify-engine docker`):
 
 ```sh
 RUSTFLAGS="-C linker=mipsel-linux-musl-gcc \

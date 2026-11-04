@@ -50,8 +50,9 @@ add an addon to the whitelist without a device run to point at — `docs/ADDONS.
   player's `device_config.ini`.
 - The tile icon is `icon.png` next to `addon.json`, 74 px box (SC(111)) on this
   panel; `tools/make_icon.py` draws one in the player's style.
-- `spotify/engine-mips/` is a Rust crate whose device build needs the player's
-  docker image (musl cross compiler, pinned nightly); its `target/` is not in git
+- `spotify/engine-mips/` is a Rust crate whose device build needs its own docker
+  image (`spotify/engine-mips/docker/`: musl cross compiler, pinned nightly), not
+  the player's; its `target/` is not in git
   and `addons/spotify/addon.mk` copies the built binary into `spotify/assets/`.
   The addon without that binary says "engine not built" — never commit a stale
   one.

@@ -11,11 +11,12 @@
 #
 #   * `make addons` copies the already-built device binary into
 #     spotify/assets/, which is the one place addons/Makefile's pack rule looks
-#     for a second file. It does NOT build it: that needs docker (the image
-#     carries the musl cross compiler and the pinned Rust nightly), and `make
-#     addons` runs on machines that have neither. To build the engine:
+#     for a second file. It does NOT build it: that needs docker and this
+#     addon's own image (docker/ in engine-mips/: the musl cross compiler and the
+#     pinned Rust nightly), and `make addons` runs on machines that have neither.
+#     To build the engine:
 #
-#         make -C addons/spotify/engine-mips        (in the docker image)
+#         make -C addons/spotify/engine-mips        (builds its image first)
 #
 #     With no binary there, the addon is built without one and says "engine
 #     not built" on the screen. Nothing fails, and no stale binary is left in
@@ -65,7 +66,7 @@ spotify-engine-pack:
 	else \
 		rm -f "$(spotify_ENGINE_ASSET)"; \
 		echo "spotify: engine not built for the device: $(spotify_ENGINE_MIPS) is not there"; \
-		echo "spotify:   build it with: make -C addons/spotify/engine-mips   (docker + the image's toolchain)"; \
+		echo "spotify:   build it with: make -C addons/spotify/engine-mips   (docker; its own image)"; \
 		echo "spotify:   the addon is built without it and says \"engine not built\" on the screen"; \
 	fi
 

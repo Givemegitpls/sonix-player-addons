@@ -1,6 +1,8 @@
 # The librespot half of the Spotify addon, built the way the player is built.
 #
 #   make            build the engine binary in the docker image
+#   make image      build that image (docker/, Ubuntu 24.04 + nightly rustc +
+#                   the musl cross compiler); made on demand by the rule below
 #   make client     build the unix-socket probe client (same cross compiler)
 #   make check      file/readelf/size on the result: static, MIPS, no dynamic section
 #   make probe      push both, start the engine on the device, ask it `probe`
@@ -10,6 +12,10 @@
 # mipsel-unknown-linux-musl is a Tier 3 target, so std has to be compiled from
 # source (-Z build-std, nightly, rust-src), and that the link needs the musl
 # cross compiler from the image instead of rustc's own start files.
+#
+# The image is this addon's own (docker/Dockerfile) and not the player's: the
+# player's image carries make, python3 and the sources of the Rockbox toolchain,
+# which is what the addon's C half needs, and nothing about Rust at all.
 #
 # The docker invocation mirrors sonix-player/sonix-player/docker/build.sh: the tree mounted
 # at its own absolute path, the calling user, HOME=/tmp. Nothing is written
@@ -24,7 +30,8 @@
 # "the trait bound `&Build: CoerceUnsized<&dyn Add>` is not satisfied"). Do not
 # run `cargo update` without re-running `make`.
 
-IMAGE ?= tempotec-player-build
+IMAGE ?= tempotec-spotify-engine
+IMAGE_DIR := $(CURDIR)/docker
 REPO := $(abspath $(CURDIR)/../../../..)
 
 TOOLCHAIN := +nightly-2026-10-01
@@ -59,12 +66,19 @@ DOCKER_RUN_HOST := docker run --rm \
 	-e HOME=/tmp \
 	$(IMAGE)
 
-.PHONY: all build client check probe test clean
+.PHONY: all image build client check probe test clean
 
 all: build
 
-build:
+# Asked every run, not only when the image is missing: docker reuses the layers
+# of an unchanged Dockerfile in a second, and an edit to it would otherwise be
+# silently left out.
+image:
 	@command -v docker >/dev/null || { echo "engine-mips: docker is what builds this" >&2; exit 1; }
+	@echo "engine-mips: the image $(IMAGE) from docker/ (cached layers)"
+	@docker build -t $(IMAGE) $(IMAGE_DIR)
+
+build: image
 	$(DOCKER_RUN) $(CARGO)
 
 # The unit tests of the parts that have no account in them: the INI parser, the
@@ -72,9 +86,12 @@ build:
 # pipe against a locally encrypted stand-in. No network, no device.
 test:
 	@command -v docker >/dev/null || { echo "engine-mips: docker is what builds this" >&2; exit 1; }
+	$(MAKE) image
 	$(DOCKER_RUN_HOST) cargo $(TOOLCHAIN) test
 
 client:
+	@command -v docker >/dev/null || { echo "engine-mips: docker is what builds this" >&2; exit 1; }
+	$(MAKE) image
 	@mkdir -p $(dir $(CLIENT))
 	$(DOCKER_RUN) mipsel-linux-musl-gcc -Os -static -o $(CLIENT) tools/probe-client.c
 	@file $(CLIENT)
