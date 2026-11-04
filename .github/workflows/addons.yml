@@ -53,14 +53,22 @@ jobs:
           path: sonix-player/sonix-player/rockbox-toolchain
           key: rockbox-toolchain-${{ hashFiles('sonix-player/sonix-player/docker/Dockerfile', 'sonix-player/sonix-player/rockboxdev/**') }}
 
+      # The goal is the toolchain's own gcc by its absolute path: the rule in the
+      # player's Makefile is `$(CROSS_CC)`, which is
+      # `$(ROCKBOX_TOOLCHAIN_DIR)/bin/mipsel-rockbox-linux-gnu-gcc` and so an
+      # absolute path, and make matches command-line goals by string, not by
+      # resolving them (`No rule to make target 'rockbox-toolchain/bin/...'`).
+      # The tree is mounted at its own absolute path, so the path is the same
+      # inside the container as here.
       - name: Build the cross toolchain
         if: steps.toolchain.outputs.cache-hit != 'true'
         run: |
+          player="$PWD/sonix-player/sonix-player"
           docker run --rm \
-            -v "$PWD:$PWD" -w "$PWD/sonix-player/sonix-player" \
+            -v "$PWD:$PWD" -w "$player" \
             --user "$(id -u):$(id -g)" -e HOME=/tmp \
             "$IMAGE" \
-            make rockbox-toolchain/bin/mipsel-rockbox-linux-gnu-gcc
+            make "$player/rockbox-toolchain/bin/mipsel-rockbox-linux-gnu-gcc"
 
       # The addons include LVGL's headers as the player's interface does. The
       # player's Makefile clones the pinned tag; this repository does the same,
