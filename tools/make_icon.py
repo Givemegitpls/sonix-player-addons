@@ -23,6 +23,7 @@ present; none of them is needed to build the player.
 import argparse
 import base64
 import io
+import math
 import os
 import re
 import shutil
@@ -33,21 +34,77 @@ import sys
 # are already in the player's icon set (tidal, gearboy, flappy-bird): the upright card
 # carries the glyph and is the translucent of the two, the rotated one lies
 # over it, opaque, which is what makes the seam read.
-CARD = 0.72  # side of one card
+CARD = 0.60  # side of one card
 RADIUS = 0.25  # corner radius, as a fraction of the card's side
-FRONT = (0.455, 0.555)  # centre of the upright card
-BACK = (0.575, 0.445)  # centre of the rotated one
+FRONT = (0.475, 0.607)  # nominal centre of the upright card, the one with the glyph
+BACK_DX = 0.14  # how far the rotated card sits to the side -- either side, see below
+BACK_DY = 0.170  # and how far above the upright one
 BACK_ROT = 13.0  # its rotation, degrees
-FRONT_ALPHA = 0.94  # the upright card, so the two read as one object
-GLYPH_BOX = 0.54  # the glyph's longest side, as a fraction of the card
+FRONT_ALPHA = 0.78  # translucent, so the rotated card reads through it
+GLYPH_BOX = 0.64  # the glyph's longest side, as a fraction of the card
+GLYPH_OPACITY = 0.94  # the stock glyphs are off-white, not paper white
+# The glyph is white, and stays white. The stock set does use light tints of the
+# card's own hue on the coloured tiles (music's cream note, radio's pale rose),
+# but at the size that matters -- 74 px, SC(111) -- a tint at lightness 0.92 is
+# indistinguishable from white, and pushing it further costs the one thing the
+# glyph is for: reading the tile in a row. --glyph-colour takes any colour for
+# the tiles that want one, and --mono is the dark brand pairing (tidal, qobuz).
+
+# Where a tile's cards actually sit: the nominal places above, moved by a stable
+# per-tile offset. Two tiles drawn a day apart used to be pixel-identical in
+# placement, which is what made a row of them look machine-made; a real set is
+# not that tidy. The seed is the glyph's name, so the same command writes the
+# same file (no diff noise in git) while different tiles differ.
+#
+# Which side the rotated card sits on is part of that: in the stock set it is
+# up-left of the upright one in music and radio, up-right in settings, and a row
+# of tiles that all lean one way reads as a template rather than a set. The
+# rotation flips with the side, so the two cards stay one tilted object.
+JITTER_XY = 0.022  # fraction of the canvas, each way (the x axis)
+# Next to nothing on y: the top and bottom edges of a row of stock tiles line up
+# (top 15 px, bottom 13 px on a 140 px file), and a few px of vertical drift is
+# what makes a set look hand-placed in the wrong way. The side and the sideways
+# offset carry the variety instead.
+JITTER_Y = 0.006
+JITTER_ROT = 2.2  # degrees, on the rotated card
 
 # Gradient stops, light at the top left and dark at the bottom right. Two pairs:
 # the upright card is the washed-out face, the rotated one the saturated face,
 # which is the pairing the checked-in tiles use (see gearboy, ebook, flappy).
-LIGHT_TOP, LIGHT_BOTTOM = 0.84, 0.68
-SAT_LIGHT, SAT_DARK = 0.62, 0.66
-BACK_LIGHT_TOP, BACK_LIGHT_BOTTOM = 0.80, 0.55
-BACK_SAT_TOP, BACK_SAT_BOTTOM = 0.90, 0.88
+#
+# The values are matched against the stock tiles (tidal.png, qobuz.png): both
+# cards stay dark, the back one darker still and only its saturated edge reads,
+# and the glyph is what carries the colour of a pale tile. The first version was
+# a stop lighter on both cards, and a row of those looked like pastel stickers
+# next to the menu.
+LIGHT_TOP, LIGHT_BOTTOM = 0.62, 0.46
+SAT_LIGHT, SAT_DARK = 0.62, 0.70
+BACK_LIGHT_TOP, BACK_LIGHT_BOTTOM = 0.46, 0.26
+BACK_SAT_TOP, BACK_SAT_BOTTOM = 0.95, 0.92
+
+
+def placement(seed):
+    """One tile's offsets: front x/y, back x/y, back rotation, and its side.
+
+    The six are (jx, jy, jbx, jby, jrot, side); `side` is +1 when the rotated
+    card sits to the right of the upright one and -1 when it sits to the left.
+    Stable for a seed and different between seeds; see JITTER_XY.
+    """
+    import hashlib
+    import random
+
+    digest = hashlib.sha256(str(seed or "").encode("utf-8")).hexdigest()
+    rnd = random.Random(int(digest[:8], 16))
+    side = rnd.choice((-1, 1))
+    jfx = rnd.uniform(-JITTER_XY, JITTER_XY)
+    jbx = rnd.uniform(-JITTER_XY, JITTER_XY)
+    jy = rnd.uniform(-JITTER_Y, JITTER_Y)
+    jby = rnd.uniform(-JITTER_Y, JITTER_Y)
+    return (jfx, jy, jbx, jby, rnd.uniform(-JITTER_ROT, JITTER_ROT), side)
+
+
+def _clamp(value, low, high):
+    return low if value < low else high if value > high else value
 
 
 def hsl_to_rgb(h, s, lightness):
@@ -102,7 +159,7 @@ def _viewbox(attrs, fallback=(0, 0, 24, 24)):
         return fallback
 
 
-def _glyph_markup(path, colour):
+def _glyph_markup(path, colour, silhouette=False):
     """The glyph as a <g>, in its own units, centred on its viewBox.
 
     The SVG's own root attributes are carried onto the wrapper, which is what
@@ -113,10 +170,21 @@ def _glyph_markup(path, colour):
     measured bounding box (fit_glyph).
     """
     if path.lower().endswith(".png"):
-        img_data = base64.b64encode(open(path, "rb").read()).decode("ascii")
         from PIL import Image  # only needed for PNG glyphs
 
-        w, h = Image.open(path).size
+        im = Image.open(path).convert("RGBA")
+        if silhouette:
+            # A coloured sprite used as a mark: its alpha becomes the shape and
+            # the fill is the glyph colour, which is what makes a game's bird
+            # read as white on a saturated tile instead of as its own palette.
+            solid = Image.new("RGBA", im.size, colour)
+            solid.putalpha(im.getchannel("A"))
+            buf = io.BytesIO()
+            solid.save(buf, format="PNG")
+            img_data = base64.b64encode(buf.getvalue()).decode("ascii")
+        else:
+            img_data = base64.b64encode(open(path, "rb").read()).decode("ascii")
+        w, h = im.size
         return (
             '<g transform="translate(%f %f)">'
             '<image x="0" y="0" width="%d" height="%d" href="data:image/png;base64,%s"'
@@ -152,14 +220,14 @@ def _glyph_markup(path, colour):
     )
 
 
-def fit_glyph(path, box, colour, scale=1.0):
+def fit_glyph(path, box, colour, scale=1.0, silhouette=False):
     """The glyph, scaled so its ink fills `box` px, centred on (0,0).
 
     The ink's bounding box is measured, not assumed: the glyph is drawn once on
     a probe canvas and its alpha read back, which is the only way to make a
     traced logo and a Lucide icon come out the same size on the tile.
     """
-    markup = _glyph_markup(path, colour)
+    markup = _glyph_markup(path, colour, silhouette)
     probe_size = 512
     probe = (
         '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d">'
@@ -195,12 +263,33 @@ def fit_glyph(path, box, colour, scale=1.0):
 # ---------------------------------------------------------------------------
 
 
-def tile_svg(size, hue, glyph, colour="#ffffff", mono=False, glyph_scale=1.0, rim=0.22):
-    """The whole tile as one SVG document."""
+def tile_svg(
+    size,
+    hue,
+    glyph,
+    colour="#ffffff",
+    mono=False,
+    glyph_scale=1.0,
+    rim=0.18,
+    seed=None,
+    silhouette=False,
+):
+    """The whole tile as one SVG document. `seed` places the two cards."""
     a = size * CARD
     r = a * RADIUS
-    fcx, fcy = FRONT[0] * size, FRONT[1] * size
-    bcx, bcy = BACK[0] * size, BACK[1] * size
+    jfx, jfy, jbx, jby, jrot, side = placement(seed)
+    # The rotated card reaches further than its side: half of it times
+    # cos + sin of the angle. Neither card may leave the canvas -- a clipped
+    # corner reads as a mistake, not as a tile -- so the centres are clamped.
+    rad = math.radians(BACK_ROT)
+    reach = a / 2.0 * (math.cos(rad) + math.sin(rad))
+    # The pair is what is centred, not the upright card: with the rotated one on
+    # the left the glyph card has to move right by half the offset, or the tile
+    # visibly hangs to one side of its 140 px square.
+    fcx = _clamp((FRONT[0] - side * BACK_DX / 2.0 + jfx) * size, a / 2.0, size - a / 2.0)
+    fcy = _clamp((FRONT[1] + jfy) * size, a / 2.0, size - a / 2.0)
+    bcx = _clamp(fcx + (side * BACK_DX + jbx) * size, reach, size - reach)
+    bcy = _clamp(fcy - (BACK_DY + jby) * size, reach, size - reach)
     box = a * GLYPH_BOX
 
     if mono:
@@ -228,7 +317,7 @@ def tile_svg(size, hue, glyph, colour="#ffffff", mono=False, glyph_scale=1.0, ri
   <stop offset="0" stop-color="{back_top}"/><stop offset="1" stop-color="{back_bottom}"/>
  </linearGradient>
  <filter id="shine" x="-20%" y="-20%" width="140%" height="140%">
-  <feDropShadow dx="0" dy="{shadow}" stdDeviation="{blur}" flood-color="#000" flood-opacity="0.30"/>
+  <feDropShadow dx="0" dy="{shadow}" stdDeviation="{blur}" flood-color="#000" flood-opacity="0.22"/>
  </filter>
 </defs>
 <g filter="url(#shine)">
@@ -237,7 +326,7 @@ def tile_svg(size, hue, glyph, colour="#ffffff", mono=False, glyph_scale=1.0, ri
  <rect x="{rim_x}" y="{rim_y}" width="{rim_w}" height="{rim_h}" rx="{r}" fill="none"
        stroke="#fff" stroke-opacity="{rim_opacity}" stroke-width="{rim_sw}"/>
 </g>
-<g transform="translate({gcx} {gcy})">{glyph}</g>
+<g transform="translate({gcx} {gcy})" opacity="{glyph_opacity}">{glyph}</g>
 </svg>
 """.format(
         s=size,
@@ -251,7 +340,7 @@ def tile_svg(size, hue, glyph, colour="#ffffff", mono=False, glyph_scale=1.0, ri
         # the order the checked-in tiles use, and the reason the seam reads as
         # two faces of one object rather than as a shadow.
         front=card(fcx, fcy, "front", 0.0, FRONT_ALPHA),
-        back=card(bcx, bcy, "backg", BACK_ROT, 1.0),
+        back=card(bcx, bcy, "backg", side * (BACK_ROT + jrot), 1.0),
         rim_x=fcx - a / 2,
         rim_y=fcy - a / 2,
         rim_w=a,
@@ -261,7 +350,8 @@ def tile_svg(size, hue, glyph, colour="#ffffff", mono=False, glyph_scale=1.0, ri
         r=r,
         gcx=fcx,
         gcy=fcy,
-        glyph=fit_glyph(glyph, box, colour, glyph_scale),
+        glyph=fit_glyph(glyph, box, colour, glyph_scale, silhouette),
+        glyph_opacity=GLYPH_OPACITY,
     )
 
 
@@ -345,8 +435,20 @@ def main():
     ap.add_argument(
         "--rim",
         type=float,
-        default=0.22,
-        help="brightness of the card's light edge, 0..1 (default 0.22)",
+        default=0.18,
+        help="brightness of the card's light edge, 0..1 (default 0.18)",
+    )
+    ap.add_argument(
+        "--glyph-silhouette",
+        action="store_true",
+        help="a PNG glyph used as a mask: its alpha in --glyph-colour "
+        "(a coloured sprite, e.g. a game's bird)",
+    )
+    ap.add_argument(
+        "--seed",
+        default=None,
+        help="place the cards from this seed instead of the glyph's name "
+        "(the default: the same command writes the same file)",
     )
     ap.add_argument(
         "--preview", help="also write this sheet: the tile at size and at SC(111)"
@@ -367,6 +469,8 @@ def main():
         mono=args.mono,
         glyph_scale=args.glyph_scale,
         rim=args.rim,
+        seed=args.seed if args.seed is not None else os.path.basename(args.glyph),
+        silhouette=args.glyph_silhouette,
     )
 
     if args.svg_only:

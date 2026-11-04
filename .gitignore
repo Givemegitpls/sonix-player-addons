@@ -15,3 +15,6 @@ spotify/engine-mips/target/
 # Caches and local noise
 .ruff_cache/
 .DS_Store
+
+# Python bytecode from running tools/ by import
+__pycache__/
