@@ -73,6 +73,34 @@ pub fn log(message: impl std::fmt::Display) {
 	eprintln!("spotify-engine: {message}");
 }
 
+/// librespot reports through the `log` crate, and without a backend those lines
+/// are dropped: the one that matters is
+/// `librespot does not support "free" accounts`, printed immediately before
+/// `Session::check_catalogue` ends the process. Warnings and errors are the
+/// whole of what is useful there, so that is the level.
+struct StderrLogger;
+
+impl log::Log for StderrLogger {
+	fn enabled(&self, metadata: &log::Metadata) -> bool {
+		metadata.level() <= log::Level::Warn
+	}
+
+	fn log(&self, record: &log::Record) {
+		if self.enabled(record.metadata()) {
+			let level = match record.level() {
+				log::Level::Error => "error",
+				log::Level::Warn => "warn",
+				_ => "info",
+			};
+			log(format!("librespot {level}: {}", record.args()));
+		}
+	}
+
+	fn flush(&self) {}
+}
+
+static LOGGER: StderrLogger = StderrLogger;
+
 /// The target this was compiled for, in the names the addon and the protocol
 /// use. Read from `cfg!`, not from `std::env::consts`, because `mipsel` is a
 /// distinction that lives in the target triple: `consts::ARCH` says "mips" for
@@ -98,7 +126,7 @@ pub struct App {
 	pub self_test_file: Option<PathBuf>,
 }
 
-fn failure(error: &str) -> Value {
+pub(crate) fn failure(error: &str) -> Value {
 	json!({"ok": false, "protocol": PROTOCOL, "error": error})
 }
 
@@ -135,6 +163,8 @@ async fn handle(request: Request, app: &Arc<App>) -> Value {
 		"probe" => probe(app),
 		"status" => app.session.status().await,
 		"login" => app.session.login().await,
+		"oauth_start" => app.session.oauth_start().await,
+		"oauth_finish" => app.session.oauth_finish().await,
 		"logout" => app.session.logout().await,
 		"search" | "playlists" | "playlist_tracks" | "album_tracks" | "track" => {
 			catalog_op(request, app).await
@@ -151,19 +181,36 @@ async fn catalog_op(request: Request, app: &Arc<App>) -> Value {
 	if request.offset > OFFSET_MAX {
 		return failure("invalid request");
 	}
-	let session = match app.session.session().await {
-		Ok(session) => session,
-		Err(error) => return failure(error),
+	// No session, no catalog: the token below is the account's, and a list
+	// without an account would be a list nobody asked for.
+	if let Err(error) = app.session.session().await {
+		return failure(error);
+	}
+	// The catalog is the Web API (catalog.rs says why). Its bearer token is not
+	// the session's auth data -- after an access-point login librespot replaces
+	// that with the server's reusable credential, which the Web API refuses with
+	// a 401. `access_token` answers the account's own token: the authorization's
+	// when the card has one (refreshed if it is about to expire), the pasted one
+	// otherwise.
+	let Some(token) = app.session.access_token().await else {
+		return failure("token_expired");
 	};
+	let catalog = catalog::Catalog::new(token, app.session.proxy().as_deref());
 
 	let page = match request.op.as_str() {
-		"search" => catalog::search(&session, &request.query, request.offset, limit).await,
-		"playlists" => catalog::playlists(&session, request.offset, limit).await,
+		"search" => catalog.search(&request.query, request.offset, limit).await,
+		"playlists" => catalog.playlists(request.offset, limit).await,
 		"playlist_tracks" => {
-			catalog::playlist_tracks(&session, &request.id, request.offset, limit).await
+			catalog
+				.playlist_tracks(&request.id, request.offset, limit)
+				.await
 		}
-		"album_tracks" => catalog::album_tracks(&session, &request.id, request.offset, limit).await,
-		_ => catalog::track(&session, &request.id).await,
+		"album_tracks" => {
+			catalog
+				.album_tracks(&request.id, request.offset, limit)
+				.await
+		}
+		_ => catalog.track(&request.id).await,
 	};
 
 	match page {
@@ -574,6 +621,11 @@ fn loopback_up() -> std::io::Result<()> {
 }
 
 fn main() {
+	// Before anything librespot does: the line that explains a process ending
+	// itself is written through `log` (StderrLogger).
+	let _ = log::set_logger(&LOGGER);
+	log::set_max_level(log::LevelFilter::Warn);
+
 	let mode = match parse_args() {
 		Ok(mode) => mode,
 		Err(error) => {

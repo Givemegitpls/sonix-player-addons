@@ -245,18 +245,24 @@ async fn source(
 		],
 	};
 
+	log(format!("stream: track {id:?}, session country {:?}", session.country()));
 	let mut candidates = VecDeque::from([SpotifyUri::Track { id }]);
 	for _ in 0..8 {
 		let Some(uri) = candidates.pop_front() else {
 			break;
 		};
-		let item = AudioItem::get_file(session, uri)
-			.await
-			.map_err(|_| "track_unavailable")?;
+		let item = AudioItem::get_file(session, uri).await.map_err(|error| {
+			// The one failure here that a user cannot see any other way: the
+			// access point knows why a track will not play (region, account,
+			// withdrawal) and says so only to this call.
+			log(format!("stream: {error}"));
+			"track_unavailable"
+		})?;
 		if let Some(alternatives) = item.alternatives {
 			candidates.extend(alternatives.0.into_iter().take(8));
 		}
-		if item.availability.is_err() {
+		if let Err(error) = item.availability {
+			log(format!("stream: availability: {error:?}"));
 			continue;
 		}
 		for format in wanted {

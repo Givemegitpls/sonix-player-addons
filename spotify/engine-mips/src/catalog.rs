@@ -1,5 +1,17 @@
-//! The catalog: search, playlists, albums and one track, on librespot's
-//! metadata.
+//! The catalog: search, playlists, albums and one track, over Spotify's **Web
+//! API**.
+//!
+//! Why not librespot's metadata, which this addon used first: in librespot 0.8
+//! every catalog read goes through `spclient`, and `spclient` asks
+//! `login5().auth_token()` for a bearer token. `login5` only accepts a *stored
+//! credential* (the blob an old username/password login produced); with the
+//! access token a user copies out of the web player it answers
+//! `Login request was denied: INVALID_CREDENTIALS`, for a free account and a
+//! Premium one alike. Verified against the real service on 2026-11-03: the same
+//! token is accepted by `api.spotify.com` (401 for a bogus one, 429 with a valid
+//! one), so the catalog is built here instead. Playback still goes through
+//! librespot: the access point accepts that token and the audio key is the
+//! server's decision.
 //!
 //! Every op answers the same shape, because the addon draws every list with one
 //! row layout:
@@ -11,48 +23,36 @@
 //!  "total":40,"more":true}
 //! ```
 //!
-//! `total` is what the engine knows of the collection and `more` says whether
-//! there is another page; for a collection that is walked page by page (a
-//! playlist, a search) `total` can be a lower bound when the walk stopped at
-//! the end of a page -- `more` is the field to page on, `total` is the field to
-//! show.
+//! `total` is what the service says the collection holds and `more` whether
+//! another page exists. Ids are the 22-character base62 form Spotify uses in
+//! these endpoints, never a URI: they travel in a URL path (`/stream/<id>`) and
+//! in a JSON line, and the base62 alphabet is what makes both safe. Local files
+//! and podcast episodes come back with no id and are dropped -- they cannot be
+//! streamed from here.
 //!
-//! Ids are the 22-character base62 form (`0JQ5DAqbMKF...`), never a URI: they
-//! travel in a URL path (`/stream/<id>`) and in a JSON line, and the base62
-//! alphabet is what makes both safe. `kind` is `track`, `album`, `artist` or
-//! `playlist`; the fields a kind has no answer for are empty (an album has no
-//! duration, an artist has no album).
-//!
-//! Playlists and searches are read through librespot's context endpoint, which
-//! is what the Spotify client itself uses for "the list behind this URI": it
-//! returns pages of `spotify:track:` URIs plus a link to the next page. The
-//! ids are then turned into items one by one, so a page costs one metadata
-//! request per row. That is deliberate: the alternative is a mirror of the
-//! catalog in this process, and the card's 58 MB of RAM is not the place for
-//! it.
+//! The token is the one in `credentials.ini` (or in the cache after a sign-in):
+//! `catalog_op` in main.rs takes it from the session, so a sign-in and a resume
+//! are the same thing to this file. It expires about an hour after the user
+//! copies it, and then every op answers `token_expired` -- which the page says
+//! in words, because pasting a new one is the fix.
 
-use std::collections::VecDeque;
-
-use librespot_core::spotify_id::SpotifyId;
-use librespot_core::{Session, SpotifyUri};
+use bytes::Bytes;
+use http::{header, Request};
+use librespot_core::http_client::HttpClient;
+use librespot_core::error::ErrorKind;
 use librespot_metadata::audio::{AudioFileFormat, AudioFiles};
-use librespot_metadata::image::Images;
-use librespot_metadata::{Album, Artist, Metadata, Playlist, Track};
-use librespot_protocol::playlist4_external::SelectedListContent;
-use protobuf::Message;
 use serde::Serialize;
 use serde_json::Value;
 
 /// Rows per answer when the request does not say, and the most it may ask for.
-/// Fifty is where one answer is still a few kilobytes of JSON and fifty
-/// metadata requests, which is the most this CPU should do for one tap.
+/// The Web API takes up to 50 for these endpoints, and fifty rows is still a few
+/// kilobytes of JSON.
 pub const PAGE_DEFAULT: usize = 20;
 pub const PAGE_MAX: usize = 50;
 
-/// The most URIs a walk over context pages collects for one request, and the
-/// most pages it follows. Both bound the work one op can cause.
-const URIS_MAX: usize = 500;
-const PAGES_MAX: usize = 8;
+/// The base of every request. Overridable so the simulator can answer from a
+/// local mock -- the engine then has no idea it is not talking to Spotify.
+const BASE_DEFAULT: &str = "https://api.spotify.com/v1";
 
 #[derive(Serialize, Default)]
 pub struct Item {
@@ -65,8 +65,8 @@ pub struct Item {
 	pub cover_url: String,
 }
 
-/// What a page of a collection came to: the rows, how much the engine knows of
-/// the collection, and whether another page exists.
+/// What a page of a collection came to: the rows, how much the collection holds,
+/// and whether another page exists.
 pub struct Page {
 	pub items: Vec<Item>,
 	pub total: usize,
@@ -89,247 +89,124 @@ fn short(text: &str) -> String {
 		.collect()
 }
 
-/// The cover nearest 320 pixels wide, in the form the addon can fetch. Empty
-/// when Spotify sent no image at all, which is a normal answer for a local
-/// track and for some podcasts.
-fn cover(images: &Images) -> String {
-	images
-		.0
+/// The cover nearest 320 pixels wide, as a URL. Empty when Spotify sent no
+/// image at all, which is a normal answer for a local track.
+fn image_url(images: Option<&Value>) -> String {
+	let Some(images) = images.and_then(Value::as_array) else {
+		return String::new();
+	};
+	let nearest = images
 		.iter()
-		.filter(|image| image.width > 0)
-		.min_by_key(|image| (image.width - 320).abs())
-		.or_else(|| images.0.first())
-		.and_then(|image| image.id.to_base16().ok())
-		.map(|id| format!("https://i.scdn.co/image/{id}"))
+		.filter_map(|image| {
+			let width = image.get("width").and_then(Value::as_u64).unwrap_or(0);
+			let url = image.get("url").and_then(Value::as_str)?;
+			Some((width, url))
+		})
+		.min_by_key(|(width, _)| (*width as i64 - 320).abs());
+	nearest
+		.or_else(|| {
+			images
+				.first()
+				.and_then(|image| image.get("url"))
+				.and_then(Value::as_str)
+				.map(|url| (0, url))
+		})
+		.map(|(_, url)| url.to_string())
 		.unwrap_or_default()
 }
 
-fn artists(track: &Track) -> String {
+/// "Aphex Twin, Brian Eno" -- what the row shows under a title.
+fn artist_names(artists: Option<&Value>) -> String {
+	let Some(list) = artists.and_then(Value::as_array) else {
+		return String::new();
+	};
 	short(
-		&track
-			.artists
-			.0
+		&list
 			.iter()
-			.map(|artist| artist.name.as_str())
+			.filter_map(|artist| artist.get("name").and_then(Value::as_str))
 			.collect::<Vec<_>>()
 			.join(", "),
 	)
 }
 
-fn track_item(id: &str, info: &Track) -> Item {
-	Item {
+fn track_item(track: &Value, album_hint: Option<&Value>) -> Option<Item> {
+	let id = track.get("id").and_then(Value::as_str)?;
+	if !valid_id(id) {
+		// A local file or an episode: no base62 id, nothing to stream from here.
+		return None;
+	}
+	let album = track.get("album").or(album_hint);
+	Some(Item {
 		id: id.to_string(),
 		kind: "track",
-		title: short(&info.name),
-		artist: artists(info),
-		album: short(&info.album.name),
-		duration_ms: info.duration.max(0) as u32,
-		cover_url: cover(&info.album.covers),
-	}
-}
-
-pub async fn track(session: &Session, id: &str) -> Result<Page, &'static str> {
-	if !valid_id(id) {
-		return Err("invalid_id");
-	}
-	let uri = SpotifyUri::Track {
-		id: SpotifyId::from_base62(id).map_err(|_| "invalid_id")?,
-	};
-	let info = Track::get(session, &uri).await.map_err(|_| "metadata_failed")?;
-	Ok(Page {
-		items: vec![track_item(id, &info)],
-		total: 1,
-		more: false,
+		title: short(track.get("name").and_then(Value::as_str).unwrap_or("")),
+		artist: artist_names(track.get("artists")),
+		album: short(album.and_then(|album| album.get("name")).and_then(Value::as_str).unwrap_or("")),
+		duration_ms: track
+			.get("duration_ms")
+			.and_then(Value::as_u64)
+			.unwrap_or(0)
+			.min(u32::MAX as u64) as u32,
+		cover_url: image_url(album.and_then(|album| album.get("images"))),
 	})
 }
 
-async fn album_item(session: &Session, id: &str) -> Result<Option<Item>, &'static str> {
+fn album_item(album: &Value) -> Option<Item> {
+	let id = album.get("id").and_then(Value::as_str)?;
 	if !valid_id(id) {
-		return Err("invalid_id");
+		return None;
 	}
-	let uri = SpotifyUri::Album {
-		id: SpotifyId::from_base62(id).map_err(|_| "invalid_id")?,
-	};
-	let info = Album::get(session, &uri).await.map_err(|_| "metadata_failed")?;
-	Ok(Some(Item {
+	Some(Item {
 		id: id.to_string(),
 		kind: "album",
-		title: short(&info.name),
+		title: short(album.get("name").and_then(Value::as_str).unwrap_or("")),
+		artist: artist_names(album.get("artists")),
+		album: String::new(),
+		duration_ms: 0,
+		cover_url: image_url(album.get("images")),
+	})
+}
+
+fn playlist_item(playlist: &Value) -> Option<Item> {
+	let id = playlist.get("id").and_then(Value::as_str)?;
+	if !valid_id(id) {
+		return None;
+	}
+	Some(Item {
+		id: id.to_string(),
+		kind: "playlist",
+		title: short(playlist.get("name").and_then(Value::as_str).unwrap_or("")),
 		artist: short(
-			&info
-				.artists
-				.0
-				.iter()
-				.map(|artist| artist.name.as_str())
-				.collect::<Vec<_>>()
-				.join(", "),
+			playlist
+				.get("owner")
+				.and_then(|owner| owner.get("display_name"))
+				.and_then(Value::as_str)
+				.unwrap_or(""),
 		),
 		album: String::new(),
 		duration_ms: 0,
-		cover_url: cover(&info.covers),
-	}))
-}
-
-async fn artist_item(session: &Session, id: &str) -> Result<Option<Item>, &'static str> {
-	if !valid_id(id) {
-		return Err("invalid_id");
-	}
-	let uri = SpotifyUri::Artist {
-		id: SpotifyId::from_base62(id).map_err(|_| "invalid_id")?,
-	};
-	let info = Artist::get(session, &uri).await.map_err(|_| "metadata_failed")?;
-	Ok(Some(Item {
-		id: id.to_string(),
-		kind: "artist",
-		title: short(&info.name),
-		artist: String::new(),
-		album: String::new(),
-		duration_ms: 0,
-		cover_url: cover(&info.portraits),
-	}))
-}
-
-/// One URI from a context page, as an item. `None` for the kinds this addon
-/// does not draw -- episodes, shows, local files -- which is not an error: a
-/// playlist with a podcast in it still has to open.
-async fn item_for_uri(session: &Session, uri: &str) -> Result<Option<Item>, &'static str> {
-	// A context track may carry a query (`spotify:track:<id>?from=...`); the id
-	// is what comes before it.
-	let uri = uri.split('?').next().unwrap_or(uri);
-	if let Some(id) = uri.strip_prefix("spotify:track:") {
-		if !valid_id(id) {
-			return Ok(None);
-		}
-		let info = Track::get(
-			session,
-			&SpotifyUri::Track {
-				id: SpotifyId::from_base62(id).map_err(|_| "invalid_id")?,
-			},
-		)
-		.await
-		.map_err(|_| "metadata_failed")?;
-		return Ok(Some(track_item(id, &info)));
-	}
-	if let Some(id) = uri.strip_prefix("spotify:album:") {
-		return album_item(session, id).await;
-	}
-	if let Some(id) = uri.strip_prefix("spotify:artist:") {
-		return artist_item(session, id).await;
-	}
-	Ok(None)
-}
-
-struct Uris {
-	ids: Vec<String>,
-	/// The collection's own idea of its size, when it says: a playlist context
-	/// carries `length` in its metadata. `None` means "what the walk found".
-	length: Option<usize>,
-	more: bool,
-}
-
-/// Walks a context URI (`spotify:playlist:...`, `spotify:search:...`) until it
-/// has `want` URIs or runs out of pages, and says whether another page is
-/// still out there.
-async fn context_uris(session: &Session, uri: &str, want: usize) -> Result<Uris, &'static str> {
-	let context = session
-		.spclient()
-		.get_context(uri)
-		.await
-		.map_err(|_| "catalog_failed")?;
-
-	let length = context
-		.metadata
-		.get("length")
-		.and_then(|value| value.parse::<usize>().ok());
-
-	let mut ids: Vec<String> = Vec::new();
-	let mut next = String::new();
-	for page in context.pages {
-		if let Some(url) = page.next_page_url {
-			if !url.is_empty() {
-				next = url;
-			}
-		}
-		ids.extend(
-			page.tracks
-				.into_iter()
-				.filter_map(|track| track.uri)
-				.filter(|uri| uri.starts_with("spotify:")),
-		);
-	}
-
-	let mut walked = 0;
-	while ids.len() < want && !next.is_empty() {
-		if walked >= PAGES_MAX || ids.len() >= URIS_MAX {
-			break;
-		}
-		walked += 1;
-		let response = session
-			.spclient()
-			.get_next_page(&next)
-			.await
-			.map_err(|_| "catalog_failed")?;
-		let page: Value = serde_json::from_slice(response.as_ref()).map_err(|_| "catalog_failed")?;
-		let follow = page
-			.get("next_page_url")
-			.or_else(|| page.get("nextPageUrl"))
-			.and_then(Value::as_str)
-			.unwrap_or_default()
-			.to_string();
-		if follow == next {
-			// The same page handed back twice would be an endless walk.
-			return Err("catalog_failed");
-		}
-		next = follow;
-		if let Some(tracks) = page.get("tracks").and_then(Value::as_array) {
-			ids.extend(
-				tracks
-					.iter()
-					.filter_map(|track| track.get("uri").and_then(Value::as_str))
-					.map(str::to_string),
-			);
-		}
-	}
-
-	let more = !next.is_empty();
-	Ok(Uris {
-		ids,
-		length,
-		more,
+		cover_url: image_url(playlist.get("images")),
 	})
 }
 
-/// The window `offset..offset+limit` of a URI list, resolved into items.
-async fn window(
-	session: &Session,
-	ids: &[String],
-	offset: usize,
-	limit: usize,
-) -> Result<Vec<Item>, &'static str> {
-	let end = offset.saturating_add(limit).min(ids.len());
-	let mut items = Vec::with_capacity(end.saturating_sub(offset));
-	for uri in ids.iter().take(end).skip(offset) {
-		if let Some(item) = item_for_uri(session, uri).await? {
-			items.push(item);
-		}
-	}
-	Ok(items)
+/// The rows of a `{"items":[...]}` list, `map` applied to each entry.
+fn items_of(list: Option<&Value>, map: impl Fn(&Value) -> Option<Item>) -> Vec<Item> {
+	list.and_then(|list| list.get("items"))
+		.and_then(Value::as_array)
+		.map(|rows| rows.iter().filter_map(map).collect())
+		.unwrap_or_default()
 }
 
-pub async fn search(
-	session: &Session,
-	query: &str,
-	offset: usize,
-	limit: usize,
-) -> Result<Page, &'static str> {
-	let query = query.trim();
-	if query.is_empty() || query.chars().count() > 256 {
-		return Err("invalid query");
-	}
-	// A search URI is percent-encoded: `spotify:search:never+gonna`. Encoding
-	// everything that is not a letter or a digit keeps a colon, a slash or a
-	// percent sign in a user's query from reaching the endpoint as syntax.
-	let encoded: String = query
+fn total_of(list: Option<&Value>) -> usize {
+	list.and_then(|list| list.get("total"))
+		.and_then(Value::as_u64)
+		.unwrap_or(0) as usize
+}
+
+/// Percent-encodes everything that is not a letter or a digit: a query goes into
+/// a URL, and `&`, `#` or `+` in a title would otherwise reach Spotify as syntax.
+fn encode_query(query: &str) -> String {
+	query
 		.bytes()
 		.map(|byte| {
 			if byte.is_ascii_alphanumeric() {
@@ -338,160 +215,173 @@ pub async fn search(
 				format!("%{byte:02X}")
 			}
 		})
-		.collect();
-	let uri = format!("spotify:search:{encoded}");
-
-	let walked = context_uris(session, &uri, offset.saturating_add(limit)).await?;
-	let items = window(session, &walked.ids, offset, limit).await?;
-	let total = walked.length.unwrap_or(walked.ids.len()).max(walked.ids.len());
-	Ok(Page {
-		items,
-		total,
-		more: walked.more || offset.saturating_add(limit) < walked.ids.len(),
-	})
+		.collect()
 }
 
-pub async fn playlists(
-	session: &Session,
-	offset: usize,
-	limit: usize,
-) -> Result<Page, &'static str> {
-	let data = session
-		.spclient()
-		.get_rootlist(offset, Some(limit))
-		.await
-		.map_err(|_| "catalog_failed")?;
-	let mut list = SelectedListContent::parse_from_bytes(data.as_ref()).map_err(|_| "catalog_failed")?;
-	let length = list.length();
-	let Some(contents) = list.contents.take() else {
-		return Ok(Page {
-			items: Vec::new(),
-			total: length.max(0) as usize,
-			more: false,
-		});
-	};
+/// The catalog, as one request at a time with one token. Cheap to build: the
+/// HTTP client underneath is the one librespot already carries (rustls, proxy
+/// aware, and it retries a 429 after the service's own `retry-after`).
+pub struct Catalog {
+	client: HttpClient,
+	base: String,
+	token: String,
+}
 
-	let count = contents.items.len();
-	let mut items = Vec::with_capacity(count.min(limit));
-	for (index, entry) in contents.items.into_iter().take(limit).enumerate() {
-		let id = match SpotifyUri::from_uri(entry.uri.as_deref().unwrap_or_default()) {
-			Ok(SpotifyUri::Playlist { id, .. }) => id.to_base62().ok(),
-			_ => None,
+impl Catalog {
+	/// `proxy` is the card's own setting (`proxy` in credentials.ini): the Web
+	/// API refuses a country it does not serve, and the way around that is the
+	/// user's own egress, which this device cannot otherwise reach. An HTTP
+	/// proxy is what librespot's client speaks -- a SOCKS one has to be bridged
+	/// on the machine that hosts it.
+	pub fn new(token: String, proxy: Option<&str>) -> Self {
+		let base = std::env::var("SONIX_SPOTIFY_API").unwrap_or_else(|_| BASE_DEFAULT.to_string());
+		let proxy_url = proxy
+			.filter(|text| !text.is_empty())
+			.and_then(|text| url::Url::parse(text).ok());
+		if proxy_url.is_some() {
+			crate::log("web api: going through the proxy from credentials.ini");
+		}
+		Self {
+			client: HttpClient::new(proxy_url.as_ref()),
+			base,
+			token,
+		}
+	}
+
+	async fn get(&self, path: &str) -> Result<Value, &'static str> {
+		let uri = format!("{}{path}", self.base);
+		let request = Request::builder()
+			.method("GET")
+			.uri(&uri)
+			.header(header::ACCEPT, "application/json")
+			.header(header::AUTHORIZATION, format!("Bearer {}", self.token))
+			.body(Bytes::new());
+		let request = match request {
+			Ok(request) => request,
+			Err(error) => {
+				crate::log(format!("web api {path}: {error}"));
+				return Err("invalid request");
+			}
 		};
-		let Some(id) = id else {
-			continue;
-		};
-		// The rootlist carries the playlist's name in `meta_items`, in the same
-		// order as the entries. When it does not, one metadata request fills it
-		// in; an empty title would draw as a blank row.
-		let mut title = contents
-			.meta_items
-			.get(index)
-			.map(|meta| short(meta.attributes.get_or_default().name()))
-			.unwrap_or_default();
-		if title.is_empty() {
-			if let Ok(playlist_id) = SpotifyId::from_base62(&id) {
-				if let Ok(playlist) = Playlist::get(
-					session,
-					&SpotifyUri::Playlist {
-						user: None,
-						id: playlist_id,
-					},
-				)
-				.await
-				{
-					title = short(playlist.name());
+		match self.client.request_body(request).await {
+			Ok(body) => serde_json::from_slice(&body).map_err(|error| {
+				crate::log(format!("web api {path}: not json: {error}"));
+				"catalog_failed"
+			}),
+			Err(error) => {
+				if error.kind == ErrorKind::Unauthenticated {
+					// The token has expired (they last about an hour) or was
+					// revoked. This is the one failure the user can fix by pasting
+					// a fresh one, so it gets its own word instead of a shrug.
+					crate::log(format!("web api {path}: token refused"));
+					return Err("token_expired");
 				}
+				crate::log(format!("web api {path}: {error}"));
+				Err("catalog_failed")
 			}
 		}
-		if title.is_empty() {
-			title = "Spotify playlist".to_string();
+	}
+
+	pub async fn search(&self, query: &str, offset: usize, limit: usize) -> Result<Page, &'static str> {
+		let query = query.trim();
+		if query.is_empty() || query.chars().count() > 256 {
+			return Err("invalid query");
 		}
-		items.push(Item {
-			id,
-			kind: "playlist",
-			title,
-			album: String::new(),
-			artist: String::new(),
-			duration_ms: 0,
-			cover_url: String::new(),
-		});
+		let doc = self
+			.get(&format!(
+				"/search?q={}&type=track,album&limit={limit}&offset={offset}",
+				encode_query(query)
+			))
+			.await?;
+
+		// Tracks first, albums after: the addon's row layout draws both, and a
+		// search that answers with tracks only would hide half of what was found.
+		let tracks = doc.get("tracks");
+		let albums = doc.get("albums");
+		let mut items = items_of(tracks, |track| track_item(track, None));
+		items.extend(items_of(albums, album_item));
+		let total = total_of(tracks) + total_of(albums);
+		let more = offset + items.len() < total;
+		Ok(Page { items, total, more })
 	}
 
-	let total = (length.max(0) as usize).max(offset.saturating_add(count));
-	Ok(Page {
-		items,
-		total,
-		more: offset.saturating_add(count) < total || count >= limit,
-	})
-}
-
-pub async fn playlist_tracks(
-	session: &Session,
-	id: &str,
-	offset: usize,
-	limit: usize,
-) -> Result<Page, &'static str> {
-	if !valid_id(id) {
-		return Err("invalid_id");
-	}
-	let uri = format!("spotify:playlist:{id}");
-	let walked = context_uris(session, &uri, offset.saturating_add(limit)).await?;
-	let items = window(session, &walked.ids, offset, limit).await?;
-	let total = walked.length.unwrap_or(walked.ids.len()).max(walked.ids.len());
-	Ok(Page {
-		items,
-		total,
-		more: walked.more || offset.saturating_add(limit) < walked.ids.len(),
-	})
-}
-
-pub async fn album_tracks(
-	session: &Session,
-	id: &str,
-	offset: usize,
-	limit: usize,
-) -> Result<Page, &'static str> {
-	if !valid_id(id) {
-		return Err("invalid_id");
-	}
-	let uri = SpotifyUri::Album {
-		id: SpotifyId::from_base62(id).map_err(|_| "invalid_id")?,
-	};
-	let album = Album::get(session, &uri).await.map_err(|_| "metadata_failed")?;
-
-	let ids: VecDeque<String> = album
-		.tracks()
-		.filter_map(|uri| match uri {
-			SpotifyUri::Track { id } => id.to_base62().ok(),
-			_ => None,
+	pub async fn playlists(&self, offset: usize, limit: usize) -> Result<Page, &'static str> {
+		let doc = self
+			.get(&format!("/me/playlists?limit={limit}&offset={offset}"))
+			.await?;
+		let items = items_of(Some(&doc), playlist_item);
+		let more = offset + items.len() < total_of(Some(&doc));
+		Ok(Page {
+			items,
+			total: total_of(Some(&doc)),
+			more,
 		})
-		.collect();
-	let total = ids.len();
-
-	let end = offset.saturating_add(limit).min(total);
-	let mut items = Vec::with_capacity(end.saturating_sub(offset));
-	for id in ids.iter().take(end).skip(offset) {
-		let info = Track::get(
-			session,
-			&SpotifyUri::Track {
-				id: SpotifyId::from_base62(id).map_err(|_| "invalid_id")?,
-			},
-		)
-		.await
-		.map_err(|_| "metadata_failed")?;
-		items.push(track_item(id, &info));
 	}
 
-	Ok(Page {
-		items,
-		total,
-		more: end < total,
-	})
+	pub async fn playlist_tracks(
+		&self,
+		id: &str,
+		offset: usize,
+		limit: usize,
+	) -> Result<Page, &'static str> {
+		if !valid_id(id) {
+			return Err("invalid request");
+		}
+		let doc = self
+			.get(&format!("/playlists/{id}/tracks?limit={limit}&offset={offset}"))
+			.await?;
+		// A playlist row is `{"track":{...}}`, and a removed entry has no track.
+		let items = items_of(Some(&doc), |row| track_item(row.get("track")?, None));
+		let more = offset + items.len() < total_of(Some(&doc));
+		Ok(Page {
+			items,
+			total: total_of(Some(&doc)),
+			more,
+		})
+	}
+
+	pub async fn album_tracks(
+		&self,
+		id: &str,
+		offset: usize,
+		limit: usize,
+	) -> Result<Page, &'static str> {
+		if !valid_id(id) {
+			return Err("invalid request");
+		}
+		// The tracks of an album do not carry the album's own name or cover, and
+		// a row that shows neither is a row of "unknown" lines: one request for
+		// the album, then the page of tracks with that as their context.
+		let album = self.get(&format!("/albums/{id}")).await?;
+		let doc = self
+			.get(&format!("/albums/{id}/tracks?limit={limit}&offset={offset}"))
+			.await?;
+		let items = items_of(Some(&doc), |track| track_item(track, Some(&album)));
+		let more = offset + items.len() < total_of(Some(&doc));
+		Ok(Page {
+			items,
+			total: total_of(Some(&doc)),
+			more,
+		})
+	}
+
+	pub async fn track(&self, id: &str) -> Result<Page, &'static str> {
+		if !valid_id(id) {
+			return Err("invalid request");
+		}
+		let doc = self.get(&format!("/tracks/{id}")).await?;
+		let items: Vec<Item> = track_item(&doc, None).into_iter().collect();
+		let total = items.len();
+		Ok(Page {
+			items,
+			total,
+			more: false,
+		})
+	}
 }
 
-/// The content type the player needs for a stream of this format, or `None`
-/// for a format this player cannot decode.
+/// What librespot calls a decoded format, in the words the player's HTTP side
+/// needs (stream.rs answers `/stream/<id>` with this as its Content-Type).
 pub fn stream_type(format: AudioFileFormat) -> Option<&'static str> {
 	AudioFiles::mime_type(format)
 }
@@ -516,28 +406,87 @@ mod tests {
 	}
 
 	#[test]
-	fn a_context_uri_with_a_query_keeps_its_id() {
-		// What `item_for_uri` strips before it looks at the kind.
-		assert_eq!(
-			"spotify:track:0123456789abcdefghijkl?from=search"
-				.split('?')
-				.next(),
-			Some("spotify:track:0123456789abcdefghijkl")
-		);
+	fn a_query_is_percent_encoded_outside_letters_and_digits() {
+		assert_eq!(encode_query("never gonna: 100%"), "never%20gonna%3A%20100%25");
 	}
 
 	#[test]
-	fn a_search_uri_encodes_everything_but_letters_and_digits() {
-		let encoded: String = "never gonna: 100%"
-			.bytes()
-			.map(|byte| {
-				if byte.is_ascii_alphanumeric() {
-					(byte as char).to_string()
-				} else {
-					format!("%{byte:02X}")
-				}
-			})
-			.collect();
-		assert_eq!(encoded, "never%20gonna%3A%20100%25");
+	fn a_track_without_a_base62_id_is_dropped() {
+		let local = serde_json::json!({"id": null, "name": "a local file"});
+		assert!(track_item(&local, None).is_none());
+		let episode = serde_json::json!({"id": "0JQ5DAqbMKF", "name": "an episode"});
+		assert!(track_item(&episode, None).is_none());
+	}
+
+	#[test]
+	fn a_track_row_keeps_the_fields_the_page_draws() {
+		let track = serde_json::json!({
+			"id": "0123456789abcdefghijkl",
+			"name": "Xtal",
+			"duration_ms": 293000,
+			"artists": [{"name": "Aphex Twin"}, {"name": "Brian Eno"}],
+			"album": {
+				"name": "Selected Ambient Works",
+				"images": [
+					{"width": 640, "url": "https://i.scdn.co/image/big"},
+					{"width": 300, "url": "https://i.scdn.co/image/small"}
+				]
+			}
+		});
+		let item = track_item(&track, None).unwrap();
+		assert_eq!(item.kind, "track");
+		assert_eq!(item.title, "Xtal");
+		assert_eq!(item.artist, "Aphex Twin, Brian Eno");
+		assert_eq!(item.album, "Selected Ambient Works");
+		assert_eq!(item.duration_ms, 293000);
+		assert_eq!(item.cover_url, "https://i.scdn.co/image/small");
+	}
+
+	#[test]
+	fn a_search_reads_the_web_api_shape_over_the_wire() {
+		use std::io::{Read, Write};
+		use std::net::TcpListener;
+
+		// One request, one canned answer: this is the only way to exercise the
+		// HTTP path (headers, URL, parsing) without an account and without the
+		// real service's rate limit.
+		let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let server = std::thread::spawn(move || {
+			let (mut socket, _) = listener.accept().unwrap();
+			let mut buffer = [0u8; 2048];
+			let _ = socket.read(&mut buffer);
+			assert!(
+				String::from_utf8_lossy(&buffer).contains("authorization: Bearer test-token"),
+				"the request must carry the session's token"
+			);
+			let body = concat!(
+				r#"{"tracks":{"items":[{"id":"0123456789abcdefghijkl","name":"Xtal","duration_ms":293000,"#,
+				r#""artists":[{"name":"Aphex Twin"}],"album":{"name":"SAW","images":[{"width":300,"url":"https://i.scdn.co/image/x"}]}}],"total":1},"#,
+				r#""albums":{"items":[],"total":0}}"#
+			);
+			let response = format!(
+				"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+				body.len(),
+				body
+			);
+			let _ = socket.write_all(response.as_bytes());
+		});
+
+		std::env::set_var("SONIX_SPOTIFY_API", format!("http://127.0.0.1:{port}/v1"));
+		let catalog = Catalog::new("test-token".to_string(), None);
+		let page = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap()
+			.block_on(catalog.search("xtal", 0, 10))
+			.unwrap();
+		server.join().unwrap();
+
+		assert_eq!(page.items.len(), 1);
+		assert_eq!(page.items[0].title, "Xtal");
+		assert_eq!(page.items[0].artist, "Aphex Twin");
+		assert_eq!(page.total, 1);
+		assert!(!page.more);
 	}
 }

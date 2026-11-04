@@ -51,7 +51,28 @@ serde = { version = "1", features = ["derive"] }
 # the protocol is read by hand in the addon's C half, and a human reading
 # `probe` output should not have to re-sort it.
 serde_json = { version = "1", features = ["preserve_order"] }
+# For the logger below: librespot says why it is about to end the process through
+# `log`, and with no backend installed those lines go nowhere.
+log = "0.4"
 tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "signal"] }
+# The catalog talks to the Web API with librespot's own HTTP client, and that
+# client takes an `http::Request`: this is the crate it is built from.
+http = "1"
+# Parsing the proxy URL from credentials.ini (already in the graph).
+url = "2"
+# OAuth (PKCE): SHA-256 of the verifier, base64url of the digest, and the random
+# verifier itself. All three are already in the graph through librespot.
+sha2 = "0.10"
+base64 = "0.22"
+
+# librespot ends the whole process for an account that is not Premium
+# (Session::check_catalogue), and in this engine the process *is* the session: a
+# free login would answer `signed_in` and then die. The vendored copy keeps the
+# session alive, so a free account browses the catalogue; playback is still
+# refused by Spotify at the audio key. The diff is vendor/librespot-core.patch
+# and tools/vendor-librespot-core.sh re-creates the copy after a version bump.
+[patch.crates-io]
+librespot-core = { path = "vendor/librespot-core" }
 
 [profile.release]
 opt-level = "s"

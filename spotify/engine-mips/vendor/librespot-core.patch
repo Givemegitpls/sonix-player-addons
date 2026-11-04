@@ -1,0 +1,40 @@
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -3,8 +3,10 @@
+     future::Future,
+     io,
+     pin::Pin,
+-    process::exit,
+-    sync::{Arc, OnceLock, RwLock, Weak},
++    sync::{
++        atomic::{AtomicBool, Ordering},
++        Arc, OnceLock, RwLock, Weak,
++    },
+     task::{Context, Poll},
+     time::{Duration, SystemTime, UNIX_EPOCH},
+ };
+@@ -364,11 +366,20 @@
+     fn check_catalogue(attributes: &UserAttributes) {
+         if let Some(account_type) = attributes.get("type") {
+             if account_type != "premium" {
+-                error!("librespot does not support {account_type:?} accounts.");
++                // Sonix patch (vendor/librespot-core.patch): upstream exits the
++                // process here, which is the whole session of an embedded client
++                // that keeps librespot in a long-lived engine process -- a free
++                // login then looks like a successful sign-in followed by
++                // "not_signed_in" on every request. Keep the session instead: the
++                // catalogue (metadata, search, playlists) works for a free
++                // account, and playback is refused by the server at the audio
++                // key, which is librespot's own TODO ("logout instead of
++                // exiting", see librespot PR #1855).
++                static WARNED: AtomicBool = AtomicBool::new(false);
++                if !WARNED.swap(true, Ordering::Relaxed) {
++                    warn!("librespot does not support {account_type:?} accounts; keeping the session for the catalogue");
++                }
+                 info!("Please support Spotify and your artists and sign up for a premium account.");
+-
+-                // TODO: logout instead of exiting
+-                exit(1);
+             }
+         }
+     }

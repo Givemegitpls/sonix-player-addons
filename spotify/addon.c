@@ -114,6 +114,10 @@
 // room for a page and for its escaping.
 #define ENGINE_REPLY_MAX 16384
 #define ENGINE_REQUEST_MAX 512
+// The answers of the account ops (`status`, `login`, `logout`) are one short
+// line: state, premium, and at most one sentence of why. A buffer that size is
+// enough for the resume below, and small enough for a worker's stack.
+#define ENGINE_AUTH_REPLY_MAX 1024
 
 // The engine gives an op ten seconds (RESPONSE_TIMEOUT in engine-mips/src/
 // main.rs); a search also spends one metadata request per row. Wait a little
@@ -173,6 +177,11 @@ typedef enum {
 	// logout, then login: the cached session has to go before the file is read
 	// again, or a stale cache answers for the token the user just edited.
 	JOB_SIGN_IN,
+	// OAuth: one job asks the engine for the authorization URL (which lands in a
+	// file on the card), the other hands it the code the browser was redirected
+	// with. Two jobs and not one, because the user leaves the player in between.
+	JOB_OAUTH_START,
+	JOB_OAUTH_FINISH,
 	JOB_SEARCH,
 	JOB_PLAYLISTS,
 	JOB_PLAYLIST_TRACKS,
@@ -206,6 +215,29 @@ static volatile pid_t engine_pid;
 static volatile int engine_port;
 static char engine_socket[sizeof(((struct sockaddr_un *)0)->sun_path)];
 
+// A freshly started engine holds no session: librespot keeps one in the process,
+// and the addon stops the engine when the page is left (40 MB of RSS is not
+// something to leave behind on this device). What makes that harmless is
+// `state/credentials.json`, librespot's own cache, written by every successful
+// login; this flag says the one status job that meets a new engine should try it
+// instead of reporting "signed_out" to somebody who signed in an hour ago.
+// Cleared when that attempt is made, so a stale cache is tried once per engine,
+// not once a second.
+static volatile bool resume_pending;
+
+// An engine that still ends itself over the account: librespot calls exit(1)
+// from `Session::check_catalogue` for anything that is not a Premium account
+// (librespot-core 0.8.0, "TODO: logout instead of exiting"). This build does not:
+// vendor/librespot-core.patch keeps the session so a free account can browse the
+// catalogue. What remains here is the guard for an engine binary built before
+// that patch -- a card can carry an older one -- where a login that answered
+// `signed_in` is followed by a process that is gone, and every request after it
+// answers "not_signed_in". Nothing is resumed for such an account until the user
+// pastes another token or signs out.
+static volatile bool account_refused;
+#define ACCOUNT_REFUSED_REASON                                                                                         \
+	"this account is not Premium: Spotify ends a free account's session, and streaming needs Premium"
+
 // What the interface draws, and the last page of the catalog. A worker writes
 // these under `data_lock` and then posts itself to the UI thread; the UI thread
 // reads them only from that post or from its own timer.
@@ -213,6 +245,10 @@ static pthread_mutex_t data_lock = PTHREAD_MUTEX_INITIALIZER;
 static char engine_note[64] = "engine not built";
 static char account_state[32] = "unknown";
 static char account_error[160];
+// Reported with every status: whether the card carries an application id, and
+// whether an authorization has been done. Both are what the two OAuth rows say.
+static bool account_client_id;
+static bool account_authorized;
 // 1 premium, 0 free, -1 the engine has not said. Only a premium account can
 // stream at all, so the page has to be able to say which one this is.
 static int account_premium = -1;
@@ -255,6 +291,12 @@ static lv_obj_t *row_engine_value;
 static lv_obj_t *row_account_value;
 static lv_obj_t *row_premium_value;
 static lv_obj_t *row_token_value;
+static lv_obj_t *row_client_value;
+// Set when the authorization URL has been written and the code has not arrived:
+// the tick looks for oauth-code.txt a few times a second... no, every five
+// seconds, which is often enough for a file drop and rare enough for the card.
+static bool oauth_waiting;
+static int oauth_ticks;
 // The one sentence a free account needs: Spotify will not stream audio to it.
 // Hidden unless the engine has said premium = false.
 static lv_obj_t *account_hint;
@@ -589,6 +631,15 @@ static bool json_top_string(const char *json, const char *key, char *out, size_t
 	return json_field_string(json, json + strlen(json), key, out, size);
 }
 
+// A boolean field of a status answer: 1 true, 0 false, -1 absent.
+static int json_flag(const char *json, const char *key) {
+	const char *value = json_member(json, json + strlen(json), key, NULL);
+	if (!value) {
+		return -1;
+	}
+	return strncmp(value, "true", 4) == 0 ? 1 : 0;
+}
+
 // The account's `premium` flag: 1 for a premium account, 0 for a free one, -1
 // when the engine did not say (signed out, or Spotify answered nothing). Only a
 // premium account can stream, and the engine only puts the field in when it
@@ -715,6 +766,27 @@ static void set_account(const char *state, const char *error) {
 	pthread_mutex_unlock(&data_lock);
 }
 
+// Whether the page was last told the account is signed in. Read by the one
+// decision that needs it: an engine that died by itself right after a login.
+static bool account_is_signed_in(void) {
+	bool signed_in;
+	pthread_mutex_lock(&data_lock);
+	signed_in = strcmp(account_state, "signed_in") == 0;
+	pthread_mutex_unlock(&data_lock);
+	return signed_in;
+}
+
+// The sentence and the flags for an account librespot ended the process over
+// (account_refused, ACCOUNT_REFUSED_REASON). Called wherever the death is
+// noticed: when a later job finds the engine gone, and by the sign-in job itself
+// when the verdict arrives while it is still there to report it.
+static void mark_account_refused(void) {
+	account_refused = true;
+	resume_pending = false;
+	set_note("engine exited");
+	set_account("failed", ACCOUNT_REFUSED_REASON);
+}
+
 // fork + execv, never system(): the addon is a library inside the player, and a
 // shell in between would be a second process to reap and a command line to
 // quote. `engine_lock` is held by the caller.
@@ -794,6 +866,9 @@ static bool engine_spawn_locked(char *why, size_t why_size) {
 			snprintf(note, sizeof(note), "engine loaded (%d)", port);
 			set_note(note);
 			snprintf(why, why_size, "listening");
+			// A new process, an empty account: the first status that meets it
+			// signs it in from the cache (resume_locked).
+			resume_pending = true;
 			return true;
 		}
 		int status = 0;
@@ -836,6 +911,17 @@ static bool engine_ensure_locked(char *why, size_t why_size) {
 		engine_port = 0;
 		unlink(engine_socket);
 		set_note("engine exited");
+		// Nothing here ends the engine without asking -- every stop is an
+		// explicit SIGTERM -- so an engine that went away by itself went away
+		// inside librespot. The one place it does that is `check_catalogue`,
+		// which calls exit(1) for an account that is not Premium
+		// (librespot-core 0.8.0, "TODO: logout instead of exiting"). A second
+		// ago the page was told "signed_in", and every request after it answered
+		// "not_signed_in"; that is worth a sentence, and a sign-in that is not
+		// attempted again.
+		if (account_is_signed_in()) {
+			mark_account_refused();
+		}
 	}
 	return engine_spawn_locked(why, why_size);
 }
@@ -872,6 +958,7 @@ static void engine_stop_locked(void) {
 		engine_port = 0;
 		fprintf(stderr, "spotify: engine stopped\n");
 	}
+	resume_pending = false;
 	unlink(engine_socket);
 }
 
@@ -921,8 +1008,7 @@ static bool engine_exchange_locked(const char *request, char *reply, size_t size
 		return false;
 	}
 
-	size_t used = 0;
-	int waited_ms = 0;
+	size_t used = 0;	int waited_ms = 0;
 	for (;;) {
 		if (stopping) {
 			// stop() is on the GUI thread waiting to join this worker: give up
@@ -988,6 +1074,75 @@ static bool engine_exchange_locked(const char *request, char *reply, size_t size
 }
 
 // ---------------------------------------------------------------------------
+// The session an engine restart does not have
+//
+// librespot keeps the account in the process: stop the engine, and the session
+// goes with it. It does write `state/credentials.json` on every successful
+// login, and that file is what the next engine can sign in from without the
+// card's token -- but only if somebody asks it to. Nobody did, so leaving the
+// addon and coming back (or the engine being killed under memory pressure) left
+// a page that said "signed_out" and a search that answered "not_signed_in" to a
+// user who had signed in a minute ago.
+//
+// So: the first status a fresh engine answers is followed by one login, and a
+// catalogue request that meets a dead session is retried behind one. Both are
+// the same engine op, and both are bounded -- once per engine process, and once
+// per request.
+// ---------------------------------------------------------------------------
+
+// True when the answer carries "state":"signed_out".
+static bool reply_state_is(const char *reply, const char *state) {
+	char got[32] = "";
+	return json_top_string(reply, "state", got, sizeof(got)) && strcmp(got, state) == 0;
+}
+
+// True when the answer is a refusal whose error is exactly `error`.
+static bool reply_error_is(const char *reply, const char *error) {
+	if (json_ok(reply)) {
+		return false;
+	}
+	char got[160] = "";
+	return json_top_string(reply, "error", got, sizeof(got)) && strcmp(got, error) == 0;
+}
+
+// librespot's own cache of the last login: what `login` reads before it ever
+// looks at the card's file.
+static bool cached_login(void) {
+	if (!state_dir[0]) {
+		return false;
+	}
+	char path[sizeof(state_dir) + 20];
+	snprintf(path, sizeof(path), "%s/credentials.json", state_dir);
+	return file_readable(path);
+}
+
+// Signs the engine in from the cache, and from the card's file when the cached
+// token has gone stale (Spotify's tokens last about an hour and librespot saves
+// the one it was given; a logout is what makes it read the file again, and it
+// is safe here because the cache has just been proved useless).
+//
+// True when the engine answered at all -- `reply` then holds the last answer,
+// signed in or refused, so the page can say why. False only when there was
+// nothing to resume from, and then nothing was asked. `engine_lock` is held by
+// the caller.
+static bool resume_locked(char *reply, size_t size, char *why, size_t why_size) {
+	if (!cached_login()) {
+		return false;
+	}
+	if (!engine_exchange_locked("{\"op\":\"login\"}", reply, size, why, why_size)) {
+		return false;
+	}
+	if (reply_state_is(reply, "signed_in")) {
+		return true;
+	}
+	fprintf(stderr, "spotify: the cached login was refused, trying the card's file\n");
+	if (!engine_exchange_locked("{\"op\":\"logout\"}", reply, size, why, why_size)) {
+		return false;
+	}
+	return engine_exchange_locked("{\"op\":\"login\"}", reply, size, why, why_size);
+}
+
+// ---------------------------------------------------------------------------
 // The answers
 // ---------------------------------------------------------------------------
 
@@ -1005,10 +1160,20 @@ static void take_status(const char *reply, const char *why) {
 	if (json_top_string(reply, "state", state, sizeof(state))) {
 		json_top_string(reply, "error", error, sizeof(error));
 		int premium = json_premium(reply);
+		int client_id = json_flag(reply, "client_id");
+		int authorized = json_flag(reply, "authorized");
+		// An account librespot ended the process over stays ended: the fresh
+		// engine that replaced it answers "signed_out", and letting that replace
+		// the sentence would put back the very state this explains.
+		if (account_refused && strcmp(state, "signed_out") == 0) {
+			return;
+		}
 		pthread_mutex_lock(&data_lock);
 		copy_text(account_state, sizeof(account_state), state);
 		copy_text(account_error, sizeof(account_error), error);
 		account_premium = premium;
+		account_client_id = client_id == 1;
+		account_authorized = authorized == 1;
 		pthread_mutex_unlock(&data_lock);
 		return;
 	}
@@ -1061,6 +1226,8 @@ static const char *job_name(job_kind_t kind) {
 	case JOB_STATUS: return "status";
 	case JOB_LOGOUT: return "logout";
 	case JOB_SIGN_IN: return "sign in from the card";
+	case JOB_OAUTH_START: return "sign in with Spotify";
+	case JOB_OAUTH_FINISH: return "finish sign-in";
 	case JOB_SEARCH: return "search";
 	case JOB_PLAYLISTS: return "playlists";
 	case JOB_PLAYLIST_TRACKS: return "playlist_tracks";
@@ -1078,6 +1245,10 @@ static void *worker(void *argument) {
 	char why[160];
 	why[0] = '\0';
 	bool post = true;
+	// The sign-in below can see the engine end under a login that read
+	// `signed_in`; then the answer is stale and the page keeps the sentence that
+	// explains it (mark_account_refused).
+	bool refused = false;
 
 	if (!reply) {
 		set_account("failed", "out of memory");
@@ -1114,13 +1285,74 @@ static void *worker(void *argument) {
 		char discarded[256];
 		char why_logout[160];
 		why_logout[0] = '\0';
+		resume_pending = false;
+		// A new token, or the same one again: a new question for Spotify, and
+		// the refusal of the previous attempt must not outlive it.
+		account_refused = false;
 		if (!engine_exchange_locked("{\"op\":\"logout\"}", discarded, sizeof(discarded), why_logout,
 									sizeof(why_logout))) {
 			fprintf(stderr, "spotify: sign in: the logout before it did not answer: %s\n", why_logout);
 		}
 		answered = engine_exchange_locked(job->request, reply, ENGINE_REPLY_MAX, why, sizeof(why));
+
+		// A login that answers `signed_in` and an engine that then ends itself
+		// look the same from here for about a second: librespot ends the process,
+		// from its own dispatch task, for an account that is not Premium. So when
+		// the answer did not say premium, wait for that verdict here rather than
+		// raising a "signed in" the next status would have to take back. A
+		// Premium answer skips the wait: it is the one case librespot does not
+		// end.
+		if (answered && reply_state_is(reply, "signed_in") && json_premium(reply) != 1) {
+			int status = 0;
+			for (int i = 0; i < 15; i++) {
+				if (engine_pid > 0 && waitpid(engine_pid, &status, WNOHANG) == engine_pid) {
+					fprintf(stderr, "spotify: the engine ended right after the login (status %d)\n",
+							WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+					engine_pid = 0;
+					engine_port = 0;
+					unlink(engine_socket);
+					mark_account_refused();
+					// The login's own answer is stale now: the page keeps the
+					// sentence mark_account_refused() put in its place.
+					refused = true;
+					break;
+				}
+				usleep(100000);
+			}
+		}
 	} else if (up) {
 		answered = engine_exchange_locked(job->request, reply, ENGINE_REPLY_MAX, why, sizeof(why));
+	}
+
+	// The account, before the page is told anything: a fresh engine has no
+	// session and answers `signed_out`, which is not news to somebody who signed
+	// in already. One resume per engine process -- `resume_pending` is set by the
+	// spawn that made it fresh -- so a cache that really is stale costs one
+	// attempt, not one a second.
+	if (answered && job->kind == JOB_STATUS && resume_pending) {
+		resume_pending = false;
+		if (!account_refused && reply_state_is(reply, "signed_out")) {
+			char resumed[ENGINE_AUTH_REPLY_MAX];
+			if (resume_locked(resumed, sizeof(resumed), why, sizeof(why))) {
+				snprintf(reply, ENGINE_REPLY_MAX, "%s", resumed);
+			}
+		}
+	}
+	if (answered && job->kind == JOB_LOGOUT) {
+		// A sign-out is a decision: the next engine must not quietly sign back in.
+		resume_pending = false;
+		account_refused = false;
+	}
+
+	// A catalogue request answered by a session that died under it (the engine's
+	// connection to Spotify dropped, or a newer engine took the socket): sign in
+	// again from what is on the card and ask the same question once more. A list
+	// that says "not_signed_in" to a signed-in user is never the right answer.
+	if (answered && is_list_job(job->kind) && !account_refused && reply_error_is(reply, "not_signed_in")) {
+		char resumed[ENGINE_AUTH_REPLY_MAX];
+		if (resume_locked(resumed, sizeof(resumed), why, sizeof(why)) && reply_state_is(resumed, "signed_in")) {
+			answered = engine_exchange_locked(job->request, reply, ENGINE_REPLY_MAX, why, sizeof(why));
+		}
 	}
 	pthread_mutex_unlock(&engine_lock);
 
@@ -1138,13 +1370,36 @@ static void *worker(void *argument) {
 		} else {
 			set_account("failed", why);
 		}
-	} else if (job->kind == JOB_STATUS || job->kind == JOB_LOGOUT || job->kind == JOB_SIGN_IN) {
+	} else if (job->kind == JOB_STATUS || job->kind == JOB_LOGOUT || job->kind == JOB_SIGN_IN ||
+			   job->kind == JOB_OAUTH_FINISH) {
 		// All of these lock data_lock themselves: it is not recursive.
-		take_status(reply, why);
+		if (!refused) {
+			take_status(reply, why);
+		}
+	} else if (job->kind == JOB_OAUTH_START) {
+		// The answer is not a status: `{"ok":true,"state":"waiting_for_authorization"}`.
+		// Only a failure has something to say, and it is worth saying loudly --
+		// the usual one is a card with no `client_id` in credentials.ini.
+		if (!json_ok(reply)) {
+			char error[160] = "";
+			if (!json_top_string(reply, "error", error, sizeof(error))) {
+				copy_text(error, sizeof(error), "the engine refused");
+			}
+			set_account("failed", error);
+		}
 	} else if (is_list_job(job->kind)) {
-		pthread_mutex_lock(&data_lock);
-		take_items(reply, why, sizeof(why));
-		pthread_mutex_unlock(&data_lock);
+		if (account_refused && reply_error_is(reply, "not_signed_in")) {
+			// The list cannot say more than the account already did: an engine
+			// that was refused will answer this way to every request.
+			pthread_mutex_lock(&data_lock);
+			item_count = 0;
+			copy_text(list_error, sizeof(list_error), ACCOUNT_REFUSED_REASON);
+			pthread_mutex_unlock(&data_lock);
+		} else {
+			pthread_mutex_lock(&data_lock);
+			take_items(reply, why, sizeof(why));
+			pthread_mutex_unlock(&data_lock);
+		}
 	}
 
 finish:
@@ -1392,8 +1647,25 @@ static void list_show_message(const char *text) {
 // have it) works like it does for an internet station.
 // ---------------------------------------------------------------------------
 
+// Whether the account was last reported as premium by the engine: 1 premium, 0
+// free, -1 not said. A free account browses the catalogue (the engine keeps the
+// session, see vendor/librespot-core.patch) and cannot play anything, because
+// Spotify refuses the audio key -- so a tap has to say that rather than start a
+// stream that would only end in "the track could not be played".
+static int account_premium_now(void) {
+	int premium;
+	pthread_mutex_lock(&data_lock);
+	premium = account_premium;
+	pthread_mutex_unlock(&data_lock);
+	return premium;
+}
+
 static void play_item(int index) {
 	if (index < 0 || index >= item_count) {
+		return;
+	}
+	if (account_premium_now() == 0) {
+		gui_notify_popup("Spotify Premium is required to play");
 		return;
 	}
 	if (engine_pid <= 0 || engine_port == 0) {
@@ -1459,6 +1731,32 @@ static void row_item_cb(lv_event_t *e) {
 	play_item(index);
 }
 
+// The engine's failure codes in words a user can act on. Everything else passes
+// through as it came: a wrong sentence is worse than a code that names itself.
+static const char *error_text(const char *error) {
+	if (strcmp(error, "token_expired") == 0) {
+		return "the access_token has expired (they last about an hour): paste a new one into the token file and "
+			   "tap \"Sign in from the card\"";
+	}
+	if (strcmp(error, "catalog_failed") == 0) {
+		return "Spotify did not answer with that list";
+	}
+	if (strcmp(error, "no_client_id") == 0) {
+		return "put client_id = <your Spotify app Client ID> into Addons/spotify/credentials.ini";
+	}
+	if (strcmp(error, "no_code_file") == 0) {
+		return "no Addons/spotify/oauth-code.txt yet: authorize in the browser, then save the redirect URL "
+			   "(or just the code) into that file";
+	}
+	if (strcmp(error, "no_code_in_file") == 0 || strcmp(error, "no_login_in_progress") == 0) {
+		return "tap \"Sign in with Spotify\" first: a code only works with the URL it was issued for";
+	}
+	if (strcmp(error, "oauth_refused") == 0) {
+		return "Spotify refused the code (it lives a minute or two): tap \"Sign in with Spotify\" again";
+	}
+	return error;
+}
+
 static void list_show(void) {
 	pthread_mutex_lock(&data_lock);
 	int count = item_count;
@@ -1467,19 +1765,27 @@ static void list_show(void) {
 	pthread_mutex_unlock(&data_lock);
 
 	if (count <= 0) {
-		list_show_message(error[0] ? error : "nothing here");
+		list_show_message(error[0] ? error_text(error) : "nothing here");
 		return;
 	}
 
 	lv_obj_clean(list_container);
 	for (int i = 0; i < count; i++) {
 		char name[ROW_NAME_CHARS * 4];
-		char value[16];
+		char value[48];
 		lv_obj_t *value_label = NULL;
 		clip(name, sizeof(name), items[i].title[0] ? items[i].title : "(no title)", ROW_NAME_CHARS);
 		format_duration(value, sizeof(value), items[i].duration_ms);
+		if (!value[0] && items[i].artist[0]) {
+			// A playlist or an album has no length: the owner is what the right
+			// column can carry instead, and it is what tells two playlists apart.
+			clip(value, sizeof(value), items[i].artist, 14);
+		}
 		settingsrow_add(list_container, name, &value_label, row_item_cb, (void *)(intptr_t)i);
-		if (value_label && value[0]) {
+		// Always set, even empty: LVGL gives a fresh label the text "Text", and a
+		// playlist (which has no duration) would otherwise wear that word instead
+		// of nothing at all.
+		if (value_label) {
 			lv_label_set_text(value_label, value);
 		}
 	}
@@ -1530,6 +1836,9 @@ static void refresh_home(void) {
 		}
 		lv_label_set_text(row_account_value, value);
 	}
+	if (row_client_value) {
+		lv_label_set_text(row_client_value, account_client_id ? "set" : "not set");
+	}
 	if (row_premium_value) {
 		// Only the engine knows, and only while signed in: `premium` is in its
 		// status answer. A free account cannot stream at all (session.rs), so
@@ -1572,9 +1881,24 @@ static void job_finished(void *user) {
 	job_t *job = user;
 	if (is_list_job(job->kind)) {
 		list_show();
-	} else if (job->kind == JOB_LOGOUT || job->kind == JOB_SIGN_IN) {
+	} else if (job->kind == JOB_LOGOUT || job->kind == JOB_SIGN_IN || job->kind == JOB_OAUTH_FINISH) {
 		refresh_home();
 		popup_account();
+	} else if (job->kind == JOB_OAUTH_START) {
+		refresh_home();
+		char state[32] = "";
+		pthread_mutex_lock(&data_lock);
+		copy_text(state, sizeof(state), account_state);
+		char error[160];
+		copy_text(error, sizeof(error), account_error);
+		pthread_mutex_unlock(&data_lock);
+		if (strcmp(state, "failed") == 0 && error[0]) {
+			gui_notify_popup(error_text(error));
+		} else {
+			// The URL is far too long for a 320-pixel toast: the row that made it
+			// points at the file it went into.
+			gui_notify_popup("open the URL from Addons/spotify/oauth-url.txt");
+		}
 	} else {
 		refresh_home();
 	}
@@ -1601,15 +1925,17 @@ static void job_finished(void *user) {
 // "credentials file has no username and password" -- the honest answer for a
 // card nobody has put a token on yet.
 static const char CREDENTIALS_TEMPLATE[] =
-	"# Spotify: a username and a password no longer work.\n"
-	"# Spotify withdrew that flow for the client this addon imitates, so the\n"
-	"# engine answers LoginFailed on a real account.\n"
+	"# Spotify: two ways in, and only one of them still works.\n"
 	"#\n"
-	"# The one credential that works is an access token. Uncomment the line\n"
-	"# below (delete the leading '#') and put the token after the '='. The\n"
-	"# engine reads it on \"Sign in from the card\" and keeps the session in\n"
-	"# state/ afterwards, so this file is needed once.\n"
-	"# access_token = \n";
+	"# 1. Your own application (https://developer.spotify.com/dashboard), which is\n"
+	"#    the one that works: put its Client ID below, and set the application's\n"
+	"#    redirect URI to exactly  http://127.0.0.1:5588/login\n"
+	"#    Then use \"Sign in with Spotify\" on the page.\n"
+	"# client_id =\n"
+	"#\n"
+	"# 2. An access token copied out of the web player. Spotify's Web API answers\n"
+	"#    429 to those since 2025-12-15, so the lists will not load; playback may.\n"
+	"# access_token =\n";
 
 // O_EXCL, so a card that already has a token in it is never overwritten by a
 // page open, and stop()/init() in one process cannot truncate what the user
@@ -1646,6 +1972,22 @@ static void write_credentials_template(void) {
 
 // Both ways in are one row each: there is nothing to type, only a file to read
 // (Sign in from the card) and an engine op to drop the session (Sign out).
+// The two halves of the OAuth sign-in. The first writes the authorization URL
+// into a file on the card (it cannot be shown, let alone typed, on this screen);
+// the second hands the engine whatever code that browser left behind.
+static void oauth_start_cb(lv_event_t *e) {
+	(void)e;
+	oauth_waiting = true;
+	oauth_ticks = 0;
+	start_job(JOB_OAUTH_START, "{\"op\":\"oauth_start\"}", "Sign in with Spotify");
+}
+
+static void oauth_finish_cb(lv_event_t *e) {
+	(void)e;
+	oauth_waiting = false;
+	start_job(JOB_OAUTH_FINISH, "{\"op\":\"oauth_finish\"}", "Finish sign-in");
+}
+
 static void sign_in_from_card_cb(lv_event_t *e) {
 	(void)e;
 	// The row says "authenticating" for the length of the engine's attempt: a
@@ -1757,6 +2099,7 @@ static void home_build(void) {
 	// withdrew that flow, so the only way in is a token in the file below.
 	settingsrow_add(home_page, "Account", &row_account_value, NULL, NULL);
 	settingsrow_add(home_page, "Premium", &row_premium_value, NULL, NULL);
+	settingsrow_add(home_page, "Client ID", &row_client_value, NULL, NULL);
 	account_hint = lv_label_create(home_page);
 	lv_label_set_long_mode(account_hint, LV_LABEL_LONG_WRAP);
 	lv_obj_set_width(account_hint, lv_pct(100));
@@ -1767,6 +2110,8 @@ static void home_build(void) {
 	token_row_build(home_page);
 
 	settingsrow_action(home_page, "Sign in from the card", sign_in_from_card_cb, NULL);
+	settingsrow_action(home_page, "Sign in with Spotify", oauth_start_cb, NULL);
+	settingsrow_action(home_page, "Finish sign-in", oauth_finish_cb, NULL);
 	settingsrow_action(home_page, "Search", search_cb, NULL);
 	settingsrow_action(home_page, "Playlists", playlists_cb, NULL);
 	settingsrow_action(home_page, "Sign out", sign_out_cb, NULL);
@@ -1846,6 +2191,20 @@ static void tick_cb(lv_timer_t *timer) {
 	pthread_mutex_unlock(&job_lock);
 	if (busy) {
 		return;
+	}
+	// An authorization URL is out: look for the file the browser's redirect was
+	// meant to leave behind. Every fifth tick -- a file drop is picked up within
+	// seconds, and the card is not read once a second for a file that may never
+	// come.
+	if (oauth_waiting && ++oauth_ticks >= 5) {
+		oauth_ticks = 0;
+		char path[ADDON_PATH_MAX + 16];
+		lv_snprintf(path, sizeof(path), "%s/oauth-code.txt", addon_dir);
+		if (access(path, F_OK) == 0) {
+			oauth_waiting = false;
+			start_job(JOB_OAUTH_FINISH, "{\"op\":\"oauth_finish\"}", "Finish sign-in");
+			return;
+		}
 	}
 	if (addon_on_screen()) {
 		// The status op is also what starts the engine if it is not running:
