@@ -26,7 +26,7 @@ first — it is the reference. This skill is the checklist.
 - `sonix-player/rockbox-toolchain` is built inside the submodule (20-60 minutes,
   once) or mounted from outside with `ROCKBOX_TOOLCHAIN_DIR`.
 - The player publishes a **checked-in** list of symbols,
-  `sonix-player/src/addon/exports.list`, linked with `-Wl,--dynamic-list`. It is
+  `sonix-player/sonix-player/src/addon/exports.list`, linked with `-Wl,--dynamic-list`. It is
   not generated here: growing it is a change in the player's repository
   (`tools/addon_exports.sh`), and `make checks` says when an addon has outgrown it.
 - `make checks` answers the two questions that otherwise show up as a
@@ -92,7 +92,7 @@ addon_cache_dir(host, cache, sizeof cache);               // <addon>/cache, crea
    (`icon.png` is used when the key is absent). A service also declares
    `"service": true`, `owns_paths` and `cache_path` (see "Where an addon keeps
    its files").
-   The tile itself: draw it with `sonix-player/tools/make_icon.py` rather than
+   The tile itself: draw it with `sonix-player/sonix-player/tools/make_icon.py` rather than
    by hand — see the `sonix-icons` skill. It reads at 74 px on this panel, and
    the loader keeps alpha, so the tile's own card shows through a transparent
    corner.
@@ -278,7 +278,7 @@ examples, in `gearboy` and `flappybird`.
 
 - Do not add `-rdynamic` to the target link: it keeps everything `--gc-sections`
   drops, 7.3 MB → 8.9 MB, and the rootfs volume has ~2 MB of room.
-- Do not put addon sources under `sonix-player/src/` — `APP_SRCS` is
+- Do not put addon sources under `sonix-player/sonix-player/src/` — `APP_SRCS` is
   `find src -name '*.c'` and they would be compiled into the player.
 - Do not translate addon strings with `tr()`: the language files are on the
   read-only rootfs and cannot know about a card.

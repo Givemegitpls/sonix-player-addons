@@ -1,7 +1,9 @@
 # Rules for agents working in this repository
 
 The addons for the Sonix Player (TempoTec V3 Analog, Ingenic X1000, 320x480 SLCD,
-AK4493). The player is the `sonix-player/` submodule. The documentation lives in
+AK4493). The player is the `sonix-player/` submodule: the repository, whose own
+source tree (headers, ABI, toolchain, image) sits at `sonix-player/sonix-player/`.
+The documentation lives in
 `docs/ADDONS.md` — one copy, here, and the player's repository only points at it.
 
 ## Build and verify
@@ -13,11 +15,11 @@ AK4493). The player is the `sonix-player/` submodule. The documentation lives in
   builds the toolchain on the first run.
 - `make host` needs SDL2, FreeType, opusfile, wavpack and ALSA on the machine.
 - `make check-abi` after a build; `make check-exports` additionally needs the
-  player binary (`sonix-player/sonix_player`), so it runs on a machine that has
+  player binary (`sonix-player/sonix-player/sonix_player`), so it runs on a machine that has
   built the player, not on a fresh clone.
 - Every addon links against symbols the player exports from
-  `sonix-player/src/addon/exports.list`. A new symbol is a change in the player's
-  repository (`sonix-player/tools/addon_exports.sh`), never a change here.
+  `sonix-player/sonix-player/src/addon/exports.list`. A new symbol is a change in the player's
+  repository (`sonix-player/sonix-player/tools/addon_exports.sh`), never a change here.
 
 ## What the CI builds
 
@@ -39,7 +41,7 @@ add an addon to the whitelist without a device run to point at — `docs/ADDONS.
   registrations, and registers every screen it creates with
   `sonix_addon_own_screen()`.
 - The interface is written at 480x720 and compiled at 320x480: every pixel size
-  or position goes through `SC()` (`sonix-player/src/gui/shell/scale.h`).
+  or position goes through `SC()` (`sonix-player/sonix-player/src/gui/shell/scale.h`).
   `tools/scale_gui.py` in the player's repository finds bare literals in layout
   calls; the `#define`d sizes at the top of a page have to be wrapped by hand.
 - `lv_*` only on the UI thread; network and card work on a worker, then

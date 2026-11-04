@@ -16,7 +16,8 @@ The player itself is a separate repository, and here it is a submodule:
 ## Layout
 
 ```
-sonix-player/       the player, as a submodule: headers, ABI, toolchain, image
+sonix-player/       the player's repository, as a submodule; its source tree
+                    (headers, ABI, toolchain, image) is sonix-player/sonix-player/
 common/             compiled into every addon (store, addonfs, listrow, gunzip)
 dino/               the Chrome offline game
 flappybird/         the game from the More page
@@ -42,7 +43,7 @@ make                             # build/target/<id>.so, all of them
 make host                        # build/host/<id>.so, for the SDL simulator
 make pack                        # build/Addons/<id>/ -- copy to <card>/Addons
 make checks                      # ABI and export checks: needs a built player
-                                 # (sonix-player/sonix_player) for the second one
+                                 # (sonix-player/sonix-player/sonix_player) for the second one
 ```
 
 With nothing but docker installed, `docker/build.sh` builds the cross toolchain

@@ -29,10 +29,14 @@ jobs:
         with:
           submodules: recursive
 
+      # buildx with its container driver: the default docker driver cannot
+      # export the gha cache below, and the image is the slowest step here.
+      - uses: docker/setup-buildx-action@v3
+
       - name: The image the addons are built in, from the player's Dockerfile
         uses: docker/build-push-action@v6
         with:
-          context: sonix-player/docker
+          context: sonix-player/sonix-player/docker
           tags: ${{ env.IMAGE }}
           load: true
           cache-from: type=gha,scope=player-image
@@ -46,14 +50,14 @@ jobs:
         id: toolchain
         uses: actions/cache@v4
         with:
-          path: sonix-player/rockbox-toolchain
-          key: rockbox-toolchain-${{ hashFiles('sonix-player/docker/Dockerfile', 'sonix-player/rockboxdev/**') }}
+          path: sonix-player/sonix-player/rockbox-toolchain
+          key: rockbox-toolchain-${{ hashFiles('sonix-player/sonix-player/docker/Dockerfile', 'sonix-player/sonix-player/rockboxdev/**') }}
 
       - name: Build the cross toolchain
         if: steps.toolchain.outputs.cache-hit != 'true'
         run: |
           docker run --rm \
-            -v "$PWD:$PWD" -w "$PWD/sonix-player" \
+            -v "$PWD:$PWD" -w "$PWD/sonix-player/sonix-player" \
             --user "$(id -u):$(id -g)" -e HOME=/tmp \
             "$IMAGE" \
             make rockbox-toolchain/bin/mipsel-rockbox-linux-gnu-gcc

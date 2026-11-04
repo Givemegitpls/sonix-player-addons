@@ -27,7 +27,7 @@ $ make clean
 
 ## The command
 
-From this directory, in the image `sonix-player/docker/Dockerfile` builds
+From this directory, in the image `sonix-player/sonix-player/docker/Dockerfile` builds
 (`docker build -t tempotec-player-build sonix-player/docker`):
 
 ```sh

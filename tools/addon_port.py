@@ -619,7 +619,7 @@ def scaffold(tree: Path, report: Report, addon_id: str, sources: list[Path], sec
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Report what moving a page or module into an addon involves.",
-        epilog="Run from sonix-player/ (or pass --tree). See docs/ADDONS.md, .opencode/skills/sonix-addon-port.")
+        epilog="Run from sonix-player/sonix-player/ (or pass --tree). See docs/ADDONS.md, .opencode/skills/sonix-addon-port.")
     parser.add_argument("id", help="the addon's id: its folder name under addons/, lower case")
     parser.add_argument("--src", action="append", required=True, metavar="PATH",
                         help="a source file or a whole directory, relative to the tree; repeatable")

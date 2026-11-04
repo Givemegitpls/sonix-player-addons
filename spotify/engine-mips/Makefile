@@ -11,7 +11,7 @@
 # source (-Z build-std, nightly, rust-src), and that the link needs the musl
 # cross compiler from the image instead of rustc's own start files.
 #
-# The docker invocation mirrors sonix-player/docker/build.sh: the tree mounted
+# The docker invocation mirrors sonix-player/sonix-player/docker/build.sh: the tree mounted
 # at its own absolute path, the calling user, HOME=/tmp. Nothing is written
 # outside the tree, and nothing in the tree ends up owned by root. The registry
 # cache lives in the image's /opt/cargo and is lost with the container, so a

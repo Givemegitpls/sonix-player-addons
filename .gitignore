@@ -1,9 +1,6 @@
 # Build output
 build/
 
-# The player, as a submodule
-/sonix-player
-
 # A toolchain symlinked or built in place (the submodule carries its own)
 rockbox-toolchain/
 

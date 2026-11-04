@@ -9,7 +9,7 @@
 #
 # There is no image of its own. An addon is compiled by the player's cross
 # toolchain, against the player's headers, and the player's image
-# (sonix-player/docker/Dockerfile, in the submodule) carries that toolchain's
+# (sonix-player/sonix-player/docker/Dockerfile, in the submodule) carries that toolchain's
 # sources, make and python3 -- everything `make` here asks for. The image is
 # built from the submodule, so the same Dockerfile, the same Ubuntu pin and the
 # same Rust nightly as the player's own builds.
@@ -19,7 +19,7 @@
 # carry, so `make host` runs on the machine -- docs/ADDONS.md, "Building".
 #
 # The toolchain lives inside the submodule when it has been built there
-# (sonix-player/rockbox-toolchain) and is built by this script on the first run:
+# (sonix-player/sonix-player/rockbox-toolchain) and is built by this script on the first run:
 # 20-60 minutes, once. A toolchain that already exists elsewhere is reused
 # rather than rebuilt: set ROCKBOX_TOOLCHAIN_DIR and it is mounted read-only.
 set -euo pipefail
@@ -28,7 +28,7 @@ IMAGE="${IMAGE:-tempotec-player-build}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 REPO="$(dirname "$HERE")"
-PLAYER_DIR="$REPO/sonix-player"
+PLAYER_DIR="${PLAYER_DIR:-$REPO/sonix-player/sonix-player}"
 TOOLCHAIN_TARGET="rockbox-toolchain/bin/mipsel-rockbox-linux-gnu-gcc"
 
 [ -f "$PLAYER_DIR/src/addon/addon.h" ] || {
@@ -44,7 +44,7 @@ command -v docker >/dev/null 2>&1 || {
 # Asked every run, not only when the image is missing: docker reuses the layers
 # of an unchanged Dockerfile in a second, and an edit to it would otherwise be
 # silently left out.
-echo "build.sh: the image $IMAGE from sonix-player/docker (cached layers)"
+echo "build.sh: the image $IMAGE from $PLAYER_DIR/docker (cached layers)"
 docker build -t "$IMAGE" "$PLAYER_DIR/docker"
 
 RUN_EXTRA=()

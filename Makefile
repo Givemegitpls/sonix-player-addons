@@ -3,11 +3,11 @@
 # Each directory here is one addon: <id>/addon.json says what it is and where
 # its tile goes, <id>/*.c is its code, and `make` here produces <id>.so -- a
 # MIPS32 shared library the player opens with dlopen() when the tile is tapped.
-# The interface between the two halves is sonix-player/src/addon/addon.h.
+# The interface between the two halves is sonix-player/sonix-player/src/addon/addon.h.
 #
 # This repository is the addons on their own; the player is a submodule at
 # sonix-player/ and supplies the headers, the toolchain rule and the ABI
-# (sonix-player/src/addon/addon.h). Build from here:
+# (sonix-player/sonix-player/src/addon/addon.h). Build from here:
 #
 #   make                   # the target libraries, into build/target/
 #   make ADDON_IDS="dino qobuz"   # only these (CI's whitelist does this)
@@ -26,11 +26,13 @@
 # small, -ffunction-sections and --gc-sections drop the ones a given addon does
 # not use, and RTLD_LOCAL keeps two addons' copies from meeting.
 
-# The player, as a submodule: its headers are what the addons compile against,
-# its rockboxdev.sh is what builds the cross toolchain, and its docker image is
-# what the CI uses. A checkout without the submodule is a checkout that cannot
-# build: docs/ADDONS.md, "Building".
-PLAYER_DIR ?= $(firstword $(wildcard $(CURDIR)/sonix-player $(CURDIR)/../sonix-player))
+# The player's source tree: its headers are what the addons compile against, its
+# rockboxdev.sh is what builds the cross toolchain, and its docker image is what
+# the CI uses. It is a submodule -- sonix-player/ is the player's repository, and
+# the tree is one level down inside it (the repository also carries the docs,
+# patches and the packer). A checkout without the submodule is a checkout that
+# cannot build: docs/ADDONS.md, "Building".
+PLAYER_DIR ?= $(firstword $(wildcard $(CURDIR)/sonix-player/sonix-player $(CURDIR)/../sonix-player))
 ifeq ($(strip $(PLAYER_DIR)),)
 $(error no player checkout: run `git submodule update --init`, or set PLAYER_DIR)
 endif
@@ -61,7 +63,7 @@ BUILD_DIR = $(CURDIR)/build
 # ---------------------------------------------------------------------------
 # What the addons are compiled against
 #
-# The same board defines the player itself is built with (sonix-player/Makefile,
+# The same board defines the player itself is built with (sonix-player/sonix-player/Makefile,
 # "The board this binary is built for"): SC() in src/gui/shell/scale.h turns
 # every size in the interface into panel pixels at compile time, so an addon that
 # did not get BOARD would lay itself out for another screen.
@@ -113,7 +115,7 @@ HOST_LDFLAGS = -shared -Wl,--gc-sections $(ADDON_LIBS)
 #
 # The addons include lvgl.h and a handful of its private headers, exactly as the
 # player's interface does, from $(LVGL_DIR). The player's own Makefile clones the
-# pinned tag into sonix-player/lvgl when it is missing; this is the same clone,
+# pinned tag into sonix-player/sonix-player/lvgl when it is missing; this is the same clone,
 # so that an addons-only checkout needs nothing more than the submodule.
 # ---------------------------------------------------------------------------
 .PHONY: lvgl
@@ -237,8 +239,8 @@ $(BUILD_DIR)/host/common/%.o: $(CURDIR)/common/%.c
 # loaded, the executable included -- but only through the dynamic symbol table,
 # and the player exports almost nothing by itself (libgcc and libstdc++). Its
 # link therefore takes --dynamic-list with a checked-in list,
-# sonix-player/src/addon/exports.list, which the player's own repository
-# generates from its objects (sonix-player/tools/addon_exports.sh).
+# sonix-player/sonix-player/src/addon/exports.list, which the player's own repository
+# generates from its objects (sonix-player/sonix-player/tools/addon_exports.sh).
 #
 # That list is not generated here, and deliberately so: the player links with it
 # whether or not this repository is checked out, and an addon built against a

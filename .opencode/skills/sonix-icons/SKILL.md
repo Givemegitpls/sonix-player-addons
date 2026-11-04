@@ -1,6 +1,6 @@
 ---
 name: sonix-icons
-description: Use when drawing, replacing or reviewing a tile icon for an addon or a compiled-in page of the Sonix Player on the TempoTec V3 Analog — a PNG tile in the player's own style (an upright rounded card with a white glyph over a rotated saturated one). Covers `sonix-player/tools/make_icon.py`, the brand glyph sources in `assets/icons/brand/`, the loader's limits (SC(111) = 74 px, alpha kept, 4 MB, 4096²), the difference between an addon's runtime tile and a compiled-in menu icon, and pushing the result to the card. Trigger keywords: иконка аддона, плитка, icon.png, tile icon, make_icon, brand glyph, potrace, логотип сервиса, spotify icon, yandex music icon, zvuk icon, dino icon, иконка в стиле меню, ADDON_ICON_BOX, SC(111), icons_small, svg_to_lvgl.
+description: Use when drawing, replacing or reviewing a tile icon for an addon or a compiled-in page of the Sonix Player on the TempoTec V3 Analog — a PNG tile in the player's own style (an upright rounded card with a white glyph over a rotated saturated one). Covers `sonix-player/sonix-player/tools/make_icon.py`, the brand glyph sources in `assets/icons/brand/`, the loader's limits (SC(111) = 74 px, alpha kept, 4 MB, 4096²), the difference between an addon's runtime tile and a compiled-in menu icon, and pushing the result to the card. Trigger keywords: иконка аддона, плитка, icon.png, tile icon, make_icon, brand glyph, potrace, логотип сервиса, spotify icon, yandex music icon, zvuk icon, dino icon, иконка в стиле меню, ADDON_ICON_BOX, SC(111), icons_small, svg_to_lvgl.
 ---
 
 # Tile icons
@@ -25,7 +25,7 @@ image model reproduces a brand mark or a legible glyph at 74 px.
 ## Making one
 
 ```sh
-cd sonix-player
+cd sonix-player/sonix-player
 python3 tools/make_icon.py --glyph assets/icons/brand/zvuk.svg --hue 100 \
     --out ../zvuk/icon.png --preview /tmp/p.png
 ```

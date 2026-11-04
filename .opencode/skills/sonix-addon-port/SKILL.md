@@ -40,7 +40,7 @@ python3 tools/addon_port.py <id> \
 |---|---|
 | Size | сколько кода и сколько из него C++. C++ работает, но `.so` повезёт свой libstdc++ |
 | It drags these along | `#include` вне набора: что уже публикует плеер (заголовки shell/fonts/core/net/image/audio/library/playback/device и `lvgl/`) и что придётся тащить в аддон |
-| Symbols | «in the published base» — ничего не делать; «outside that base» — экспортируется автоматически (`sonix-player/src/addon/exports.list`), нужен только `make && make target`; «defined nowhere in the player» — **блокер**, код надо собрать внутрь аддона |
+| Symbols | «in the published base» — ничего не делать; «outside that base» — экспортируется автоматически (`sonix-player/sonix-player/src/addon/exports.list`), нужен только `make && make target`; «defined nowhere in the player» — **блокер**, код надо собрать внутрь аддона |
 | State it keeps | ключи `device_config.ini` → на карту; `streamkeys_*` → токен пользователя; абсолютные `/data`-пути |
 | Audio | `radio_play` переносим; `audio_play(file)`/`play_file` — нет (нужен кэш и очередь); `audio_external_*` — игры, работает |
 | Lifecycle | `switch_screen`, `SCREEN_LOADED`, `pthread_create`, и `*_clear_on_exit`/`deinit` — у аддона **нет deinit** |

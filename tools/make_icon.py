@@ -8,7 +8,7 @@ degrees off and translucent, so the two read as one stacked object. The colour
 is a diagonal gradient of one hue; the glyph is monochrome and comes from any
 SVG (Lucide, simple-icons, a traced logo) or from a PNG.
 
-    python3 tools/make_icon.py --glyph sonix-player/assets/icons/brand/spotify.svg \
+    python3 tools/make_icon.py --glyph sonix-player/sonix-player/assets/icons/brand/spotify.svg \
         --hue 141 --out spotify/icon.png
 
 Nothing here runs during a build: an addon's tile is a 140x140 PNG on the card,
