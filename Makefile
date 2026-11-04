@@ -5,14 +5,20 @@
 # MIPS32 shared library the player opens with dlopen() when the tile is tapped.
 # The interface between the two halves is sonix-player/src/addon/addon.h.
 #
-# Run it through the player's Makefile, which hands over the toolchain:
+# This repository is the addons on their own; the player is a submodule at
+# sonix-player/ and supplies the headers, the toolchain rule and the ABI
+# (sonix-player/src/addon/addon.h). Build from here:
 #
-#   make addons            # the target libraries, into build/target/
-#   make addons host       # the same addons for the SDL simulator, build/host/
-#   make addons pack       # build/Addons/, the folder to copy to a card
+#   make                   # the target libraries, into build/target/
+#   make ADDON_IDS="dino qobuz"   # only these (CI's whitelist does this)
+#   make host              # the same addons for the SDL simulator, build/host/
+#   make pack              # build/Addons/, the folder to copy to a card
+#   make checks            # ABI and export checks
 #
 # The host build is what makes an addon testable without the device: the same
 # sources, the same headers, the same dlopen(), on x86.
+#
+# Adding an addon: `new.sh <id>`, then docs/ADDONS.md, "Building".
 #
 # EVERYTHING in `common/` is compiled into every addon. That is deliberate: an
 # addon is a self-contained package on a card, and a shared libcommon.so would
@@ -20,17 +26,34 @@
 # small, -ffunction-sections and --gc-sections drop the ones a given addon does
 # not use, and RTLD_LOCAL keeps two addons' copies from meeting.
 
-PLAYER_DIR ?= $(abspath $(CURDIR)/..)
-# Defaults so that `make` here works on its own, without the player's Makefile
-# handing the toolchain over: the in-tree toolchain first, the one symlinked
-# from outside the tree second.
+# The player, as a submodule: its headers are what the addons compile against,
+# its rockboxdev.sh is what builds the cross toolchain, and its docker image is
+# what the CI uses. A checkout without the submodule is a checkout that cannot
+# build: docs/ADDONS.md, "Building".
+PLAYER_DIR ?= $(firstword $(wildcard $(CURDIR)/sonix-player $(CURDIR)/../sonix-player))
+ifeq ($(strip $(PLAYER_DIR)),)
+$(error no player checkout: run `git submodule update --init`, or set PLAYER_DIR)
+endif
+# Defaults so that `make` here works on its own: the toolchain built inside the
+# submodule first, the one symlinked from outside the tree second, the one named
+# by ROCKBOX_TOOLCHAIN_DIR (through CROSS_CC in the environment) last.
 CROSS_CC ?= $(firstword $(wildcard $(PLAYER_DIR)/rockbox-toolchain/bin/mipsel-rockbox-linux-gnu-gcc \
 			  $(PLAYER_DIR)/rockbox-toolchain/rockbox-dev/bin/mipsel-rockbox-linux-gnu-gcc))
 CROSS_CXX ?= $(firstword $(wildcard $(PLAYER_DIR)/rockbox-toolchain/bin/mipsel-rockbox-linux-gnu-g++ \
 			   $(PLAYER_DIR)/rockbox-toolchain/rockbox-dev/bin/mipsel-rockbox-linux-gnu-g++))
 CROSS_READELF ?= $(dir $(CROSS_CC))mipsel-rockbox-linux-gnu-readelf
 CROSS_STRIP ?= $(dir $(CROSS_CC))mipsel-rockbox-linux-gnu-strip
+# LVGL is not in the player's git either: its Makefile clones it on the first
+# build. Here it is cloned by the `lvgl` goal, which `target` and `host` depend
+# on, into the place the player's Makefile expects it.
 LVGL_DIR ?= $(PLAYER_DIR)/lvgl
+LVGL_VER := 9.6.0
+
+# The device's glibc, for check-abi: 2.16 (the toolchain builds against 2.27).
+# The player's Makefile has the same two numbers; here they default rather than
+# being handed over, because this repository builds on its own.
+DEVICE_GLIBC_MAJOR ?= 2
+DEVICE_GLIBC_MINOR ?= 16
 BOARD ?= tempotec_v3
 
 BUILD_DIR = $(CURDIR)/build
@@ -86,17 +109,46 @@ TARGET_LDFLAGS = -shared -Wl,--gc-sections $(ADDON_LIBS)
 HOST_LDFLAGS = -shared -Wl,--gc-sections $(ADDON_LIBS)
 
 # ---------------------------------------------------------------------------
-# The addons themselves
+# LVGL
+#
+# The addons include lvgl.h and a handful of its private headers, exactly as the
+# player's interface does, from $(LVGL_DIR). The player's own Makefile clones the
+# pinned tag into sonix-player/lvgl when it is missing; this is the same clone,
+# so that an addons-only checkout needs nothing more than the submodule.
 # ---------------------------------------------------------------------------
-ADDONS := $(sort $(notdir $(patsubst %/addon.json,%,$(wildcard $(CURDIR)/*/addon.json))))
+.PHONY: lvgl
+lvgl:
+	@if [ ! -f "$(LVGL_DIR)/lvgl.h" ]; then \
+		echo "Cloning LVGL v$(LVGL_VER) into $(LVGL_DIR)..."; \
+		git clone --depth 1 -b v$(LVGL_VER) https://github.com/lvgl/lvgl.git "$(LVGL_DIR)"; \
+	fi
+
+# ---------------------------------------------------------------------------
+# The addons themselves
+#
+# ADDON_IDS names the ones a build makes. Empty means all of them, which is what
+# a developer wants; the CI passes the whitelist instead, because three addons
+# are not verified on a device yet (docs/ADDONS.md, "What is built, and what is
+# not"). A name in ADDON_IDS that has no directory is a mistake and stops the
+# build rather than being compiled away.
+# ---------------------------------------------------------------------------
+ALL_ADDONS := $(sort $(notdir $(patsubst %/addon.json,%,$(wildcard $(CURDIR)/*/addon.json))))
+ADDON_IDS ?=
+ADDONS := $(if $(strip $(ADDON_IDS)),$(strip $(ADDON_IDS)),$(ALL_ADDONS))
+UNKNOWN := $(filter-out $(ALL_ADDONS),$(ADDONS))
+ifneq ($(strip $(UNKNOWN)),)
+$(error ADDON_IDS names $(UNKNOWN), which $(if $(filter 1,$(words $(UNKNOWN))),has,have) no addon.json here)
+endif
 # hello is the example, not a product: it is built with the rest (it is the cheap
 # compile that proves the SDK still compiles) but it is not put in the folder
-# that goes on a card. `make addons-pack PACK_EXCLUDE=` packs it too.
+# that goes on a card. `make pack PACK_EXCLUDE=` packs it too.
 PACK_EXCLUDE ?= hello
 PACK_ADDONS := $(filter-out $(PACK_EXCLUDE),$(ADDONS))
 COMMON_SRCS := $(wildcard $(CURDIR)/common/*.c)
 
+target: | lvgl
 target: $(addprefix $(BUILD_DIR)/target/,$(addsuffix .so,$(ADDONS)))
+host: | lvgl
 host: $(addprefix $(BUILD_DIR)/host/,$(addsuffix .so,$(ADDONS)))
 
 # One rule shape for both halves. The toolchain, the flags and the output
@@ -179,60 +231,26 @@ $(BUILD_DIR)/host/common/%.o: $(CURDIR)/common/%.c
 	$(ADDON_CC) $(ADDON_CFLAGS) -c $< -o $@
 
 # ---------------------------------------------------------------------------
-# exports: what the player has to publish for these addons
+# exports: the player's side of the promise
 #
-# A dlopen()ed library resolves its undefined symbols against the objects
-# already loaded, the executable included -- but only through the dynamic symbol
-# table, and the player exports almost nothing by itself (libgcc and libstdc++).
-# The player's link therefore takes --dynamic-list with this file.
+# A dlopen()ed library resolves its undefined symbols against the objects already
+# loaded, the executable included -- but only through the dynamic symbol table,
+# and the player exports almost nothing by itself (libgcc and libstdc++). Its
+# link therefore takes --dynamic-list with a checked-in list,
+# sonix-player/src/addon/exports.list, which the player's own repository
+# generates from its objects (sonix-player/tools/addon_exports.sh).
 #
-# The list has two halves:
+# That list is not generated here, and deliberately so: the player links with it
+# whether or not this repository is checked out, and an addon built against a
+# symbol the list does not carry fails at dlopen() with "undefined symbol" -- on
+# a device whose user has no console. `make checks` is what catches it earlier:
+# check-exports compares this build's undefined symbols with the player binary's
+# exported ones.
 #
-#   exports.base       every symbol of the modules an addon is meant to use, and
-#                      of LVGL's public widgets (exports-base.sh writes it). This
-#                      is what makes an addon a card-only affair: a new one,
-#                      written against the documented headers, finds what it
-#                      calls already exported and needs no new firmware image.
-#   the addons' UND    whatever this tree's addons call on top of that, so an
-#                      addon may reach a symbol the base left out without the
-#                      base having to grow for it.
-#
-# The base costs 365 KB of binary (measured against a list built from the addons
-# alone): exported symbols are roots for --gc-sections, so the widgets nothing
-# calls stay. That is the price of not touching the image again.
-#
-# A superset is harmless: a name the player does not define is ignored, and the
-# libc names an addon imports are in the list too and do nothing.
-#
-# Rewritten only when its contents change: it is a prerequisite of the player's
-# link, and touching it on every build would relink the player on every build.
+# Growing the list for a new addon is a change in the player's repository:
+# tools/addon_exports.sh, then `make target` there. docs/ADDONS.md, "What an
+# addon may call", says what may and may not go in it.
 # ---------------------------------------------------------------------------
-EXPORTS = $(BUILD_DIR)/exports.list
-
-BASE_EXPORTS = $(CURDIR)/exports.base
-
-# Regenerating the base needs the player's objects, so it is a step of its own
-# and not part of `exports`: see exports-base.sh.
-.PHONY: exports-base
-exports-base:
-	@$(CURDIR)/exports-base.sh
-
-.PHONY: exports
-exports: $(BASE_EXPORTS) target
-	@mkdir -p $(BUILD_DIR)
-	@libs="$(wildcard $(BUILD_DIR)/target/*.so)"; \
-	tmp=$(EXPORTS).tmp; \
-	{ \
-		echo "/* Generated by addons/Makefile: exports.base plus what these addons call. */"; \
-		echo "{"; \
-		sed 's/^/  /; s/$$/;/' $(BASE_EXPORTS); \
-		for lib in $$libs; do \
-			$(CROSS_READELF) --dyn-syms -W $$lib 2>/dev/null; \
-		done | awk '$$7 == "UND" { sub(/@.*/, "", $$8); print $$8 }' | sort -u \
-			| grep -Ev '^$$' | sed 's/^/  /; s/$$/;/'; \
-		echo "};"; \
-	} > $$tmp; \
-	if cmp -s $$tmp $(EXPORTS); then rm -f $$tmp; else mv $$tmp $(EXPORTS); echo "exports: $$(grep -c ';' $(EXPORTS)) names for the player to publish"; fi
 
 # ---------------------------------------------------------------------------
 # The checks

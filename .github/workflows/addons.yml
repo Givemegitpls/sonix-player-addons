@@ -1,0 +1,81 @@
+name: addons
+
+# Builds the whitelist, checks the ABI, and uploads the folder that goes on a
+# card. Why a whitelist and not everything with an addon.json: docs/ADDONS.md,
+# "What is built, and what is not" -- zvuk, tidal and spotify compile but have
+# never been verified on a device, and an artifact is not the place to find out.
+#
+# check-exports is not here on purpose: it compares the addons' undefined
+# symbols with the player binary's dynamic symbol table, so it needs a built
+# player (a full build, plus its static FreeType and audio libraries). A machine
+# that has one runs `make checks`; the CI would be building the whole player to
+# check the addons.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  IMAGE: tempotec-player-build:ci
+  ADDON_IDS: dino flappybird gearboy hello qobuz subsonic yandex
+
+jobs:
+  addons:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: The image the addons are built in, from the player's Dockerfile
+        uses: docker/build-push-action@v6
+        with:
+          context: sonix-player/docker
+          tags: ${{ env.IMAGE }}
+          load: true
+          cache-from: type=gha,scope=player-image
+          cache-to: type=gha,scope=player-image,mode=max
+
+      # The cross toolchain is the expensive half of a build (20-60 minutes in
+      # the player's own runs). It is a directory in the submodule, so it can be
+      # cached: keyed by what decides its contents, the Dockerfile's package list
+      # and rockboxdev's own sources and patches.
+      - name: Cache the cross toolchain
+        id: toolchain
+        uses: actions/cache@v4
+        with:
+          path: sonix-player/rockbox-toolchain
+          key: rockbox-toolchain-${{ hashFiles('sonix-player/docker/Dockerfile', 'sonix-player/rockboxdev/**') }}
+
+      - name: Build the cross toolchain
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        run: |
+          docker run --rm \
+            -v "$PWD:$PWD" -w "$PWD/sonix-player" \
+            --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            "$IMAGE" \
+            make rockbox-toolchain/bin/mipsel-rockbox-linux-gnu-gcc
+
+      # The addons include LVGL's headers as the player's interface does. The
+      # player's Makefile clones the pinned tag; this repository does the same,
+      # through the `lvgl` goal.
+      - name: LVGL
+        run: make lvgl
+
+      - name: Build the whitelist
+        run: make target
+
+      - name: ABI check (nothing newer than glibc 2.16)
+        run: make check-abi
+
+      - name: Pack
+        run: make pack
+
+      - name: Upload the card folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: addons
+          path: build/Addons
+          if-no-files-found: error

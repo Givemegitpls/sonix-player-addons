@@ -1,0 +1,3 @@
+[submodule "sonix-player"]
+	path = sonix-player
+	url = git@github.com:Givemegitpls/sonix-player-tempotec-v3-analog.git

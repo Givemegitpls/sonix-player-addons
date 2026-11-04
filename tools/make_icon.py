@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""Composes a tile icon in the player's own style, for an addon that has none
+of its own (or one that does not fit).
+
+The tile is the drawing every compiled-in menu tile is: an upright rounded
+square carrying a white glyph, and behind it, on top, the same square a few
+degrees off and translucent, so the two read as one stacked object. The colour
+is a diagonal gradient of one hue; the glyph is monochrome and comes from any
+SVG (Lucide, simple-icons, a traced logo) or from a PNG.
+
+    python3 tools/make_icon.py --glyph sonix-player/assets/icons/brand/spotify.svg \
+        --hue 141 --out spotify/icon.png
+
+Nothing here runs during a build: an addon's tile is a 140x140 PNG on the card,
+loaded at scan time by icon_load() in the player's src/addon/addon.c and scaled into
+SC(111) -- 74 px on the 320x480 panel. That box is the number that matters, so
+--preview draws the result at both sizes, beside tiles that already exist.
+
+Rasterising goes through whichever of cairosvg, rsvg-convert or ImageMagick is
+present; none of them is needed to build the player.
+"""
+
+import argparse
+import base64
+import io
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+# Geometry of the tile, as fractions of the side. Measured off the tiles that
+# are already in the player's icon set (tidal, gearboy, flappy-bird): the upright card
+# carries the glyph and is the translucent of the two, the rotated one lies
+# over it, opaque, which is what makes the seam read.
+CARD = 0.72  # side of one card
+RADIUS = 0.25  # corner radius, as a fraction of the card's side
+FRONT = (0.455, 0.555)  # centre of the upright card
+BACK = (0.575, 0.445)  # centre of the rotated one
+BACK_ROT = 13.0  # its rotation, degrees
+FRONT_ALPHA = 0.94  # the upright card, so the two read as one object
+GLYPH_BOX = 0.54  # the glyph's longest side, as a fraction of the card
+
+# Gradient stops, light at the top left and dark at the bottom right. Two pairs:
+# the upright card is the washed-out face, the rotated one the saturated face,
+# which is the pairing the checked-in tiles use (see gearboy, ebook, flappy).
+LIGHT_TOP, LIGHT_BOTTOM = 0.84, 0.68
+SAT_LIGHT, SAT_DARK = 0.62, 0.66
+BACK_LIGHT_TOP, BACK_LIGHT_BOTTOM = 0.80, 0.55
+BACK_SAT_TOP, BACK_SAT_BOTTOM = 0.90, 0.88
+
+
+def hsl_to_rgb(h, s, lightness):
+    """HSL -> '#rrggbb'. h in degrees, s and l in 0..1."""
+    import colorsys
+
+    r, g, b = colorsys.hls_to_rgb((h % 360) / 360.0, lightness, s)
+    return "#%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
+
+
+# ---------------------------------------------------------------------------
+# The glyph
+# ---------------------------------------------------------------------------
+
+
+def _root_attrs(svg):
+    """The opening <svg ...> tag's attributes, minus the ones that place it."""
+    m = re.search(r"<svg\b([^>]*)>", svg, re.S)
+    if not m:
+        sys.exit("not an SVG: no <svg> element")
+    attrs = {}
+    for name, value in re.findall(r'([\w:-]+)\s*=\s*"([^"]*)"', m.group(1)):
+        attrs[name] = value
+    return attrs
+
+
+def _inner(svg):
+    """Everything inside the root <svg> element."""
+    start = svg.find(">", re.search(r"<svg\b", svg).start()) + 1
+    end = svg.rfind("</svg>")
+    body = svg[start:end]
+    # A <title>/<desc> is metadata, and librsvg would draw nothing for it; drop
+    # it so the wrapper's fill does not apply to a stray element.
+    body = re.sub(r"<title\b.*?</title>", "", body, flags=re.S)
+    body = re.sub(r"<desc\b.*?</desc>", "", body, flags=re.S)
+    # potrace writes its one fill as an explicit black on an inner <g>, which
+    # would win over the wrapper's colour and paint the glyph's box black.
+    body = re.sub(r'(fill|stroke)="#000000"', r'\1="currentColor"', body)
+    body = re.sub(r"(fill|stroke):\s*#000000", r"\1:currentColor", body)
+    return body
+
+
+def _viewbox(attrs, fallback=(0, 0, 24, 24)):
+    vb = attrs.get("viewBox") or attrs.get("viewbox")
+    if vb:
+        parts = [float(p) for p in re.split(r"[\s,]+", vb.strip())]
+        if len(parts) == 4:
+            return tuple(parts)
+    try:
+        return (0.0, 0.0, float(attrs["width"]), float(attrs["height"]))
+    except (KeyError, ValueError):
+        return fallback
+
+
+def _glyph_markup(path, colour):
+    """The glyph as a <g>, in its own units, centred on its viewBox.
+
+    The SVG's own root attributes are carried onto the wrapper, which is what
+    keeps a Lucide icon a stroke drawing (fill="none" stroke="currentColor"
+    stroke-width="2") and a simple-icons one a filled path. Sizing is not done
+    here: potrace output, a Lucide glyph and a hand-made one all leave a
+    different amount of empty margin around the ink, so the scale comes from a
+    measured bounding box (fit_glyph).
+    """
+    if path.lower().endswith(".png"):
+        img_data = base64.b64encode(open(path, "rb").read()).decode("ascii")
+        from PIL import Image  # only needed for PNG glyphs
+
+        w, h = Image.open(path).size
+        return (
+            '<g transform="translate(%f %f)">'
+            '<image x="0" y="0" width="%d" height="%d" href="data:image/png;base64,%s"'
+            ' style="image-rendering:pixelated"/></g>'
+        ) % (-w / 2.0, -h / 2.0, w, h, img_data)
+
+    svg = open(path, "r", encoding="utf-8").read()
+    attrs = _root_attrs(svg)
+    vx, vy, vw, vh = _viewbox(attrs)
+
+    carry = []
+    for name in (
+        "fill",
+        "stroke",
+        "stroke-width",
+        "stroke-linecap",
+        "stroke-linejoin",
+        "stroke-miterlimit",
+    ):
+        if name in attrs:
+            carry.append('%s="%s"' % (name, attrs[name]))
+    # currentColor, and the case of an icon with no fill of its own (a filled
+    # path, simple-icons' shape), both have to end up `colour`.
+    carry.append('color="%s" style="color:%s"' % (colour, colour))
+    if not any(c.startswith("fill=") for c in carry):
+        carry.append('fill="%s"' % colour)
+
+    return '<g transform="translate(%f %f)" %s>%s</g>' % (
+        -vx - vw / 2.0,
+        -vy - vh / 2.0,
+        " ".join(carry),
+        _inner(svg),
+    )
+
+
+def fit_glyph(path, box, colour, scale=1.0):
+    """The glyph, scaled so its ink fills `box` px, centred on (0,0).
+
+    The ink's bounding box is measured, not assumed: the glyph is drawn once on
+    a probe canvas and its alpha read back, which is the only way to make a
+    traced logo and a Lucide icon come out the same size on the tile.
+    """
+    markup = _glyph_markup(path, colour)
+    probe_size = 512
+    probe = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d">'
+        '<g transform="translate(%f %f)">%s</g></svg>'
+        % (
+            probe_size,
+            probe_size,
+            probe_size,
+            probe_size,
+            probe_size / 2.0,
+            probe_size / 2.0,
+            markup,
+        )
+    )
+    png = rasterise(probe, probe_size)
+
+    from PIL import Image
+
+    alpha = Image.open(io.BytesIO(png)).convert("RGBA").getchannel("A")
+    bbox = alpha.point(lambda v: 255 if v > 8 else 0).getbbox()
+    if not bbox:
+        sys.exit("the glyph draws nothing: %s" % path)
+
+    x0, y0, x1, y1 = bbox
+    mid = probe_size / 2.0
+    cx, cy = (x0 + x1) / 2.0 - mid, (y0 + y1) / 2.0 - mid
+    k = box * scale / max(x1 - x0, y1 - y0)
+    return '<g transform="scale(%f) translate(%f %f)">%s</g>' % (k, -cx, -cy, markup)
+
+
+# ---------------------------------------------------------------------------
+# The tile
+# ---------------------------------------------------------------------------
+
+
+def tile_svg(size, hue, glyph, colour="#ffffff", mono=False, glyph_scale=1.0, rim=0.22):
+    """The whole tile as one SVG document."""
+    a = size * CARD
+    r = a * RADIUS
+    fcx, fcy = FRONT[0] * size, FRONT[1] * size
+    bcx, bcy = BACK[0] * size, BACK[1] * size
+    box = a * GLYPH_BOX
+
+    if mono:
+        top, bottom = "#4a4a52", "#232329"
+        back_top, back_bottom = "#61616b", "#1b1b20"
+    else:
+        top = hsl_to_rgb(hue, SAT_LIGHT, LIGHT_TOP)
+        bottom = hsl_to_rgb(hue, SAT_DARK, LIGHT_BOTTOM)
+        back_top = hsl_to_rgb(hue, BACK_SAT_TOP, BACK_LIGHT_TOP)
+        back_bottom = hsl_to_rgb(hue, BACK_SAT_BOTTOM, BACK_LIGHT_BOTTOM)
+
+    def card(cx, cy, gradient, rot=0.0, opacity=1.0):
+        return (
+            '<g transform="translate(%f %f) rotate(%f)" opacity="%f">'
+            '<rect x="%f" y="%f" width="%f" height="%f" rx="%f" fill="url(#%s)"/>'
+            "</g>" % (cx, cy, rot, opacity, -a / 2, -a / 2, a, a, r, gradient)
+        )
+
+    return """<svg xmlns="http://www.w3.org/2000/svg" width="{s}" height="{s}" viewBox="0 0 {s} {s}">
+<defs>
+ <linearGradient id="front" x1="0" y1="0" x2="1" y2="1">
+  <stop offset="0" stop-color="{top}"/><stop offset="1" stop-color="{bottom}"/>
+ </linearGradient>
+ <linearGradient id="backg" x1="0" y1="0" x2="1" y2="1">
+  <stop offset="0" stop-color="{back_top}"/><stop offset="1" stop-color="{back_bottom}"/>
+ </linearGradient>
+ <filter id="shine" x="-20%" y="-20%" width="140%" height="140%">
+  <feDropShadow dx="0" dy="{shadow}" stdDeviation="{blur}" flood-color="#000" flood-opacity="0.30"/>
+ </filter>
+</defs>
+<g filter="url(#shine)">
+ {back}
+ {front}
+ <rect x="{rim_x}" y="{rim_y}" width="{rim_w}" height="{rim_h}" rx="{r}" fill="none"
+       stroke="#fff" stroke-opacity="{rim_opacity}" stroke-width="{rim_sw}"/>
+</g>
+<g transform="translate({gcx} {gcy})">{glyph}</g>
+</svg>
+""".format(
+        s=size,
+        top=top,
+        bottom=bottom,
+        back_top=back_top,
+        back_bottom=back_bottom,
+        shadow=size * 0.012,
+        blur=size * 0.018,
+        # The upright card first, translucent, then the rotated one over it:
+        # the order the checked-in tiles use, and the reason the seam reads as
+        # two faces of one object rather than as a shadow.
+        front=card(fcx, fcy, "front", 0.0, FRONT_ALPHA),
+        back=card(bcx, bcy, "backg", BACK_ROT, 1.0),
+        rim_x=fcx - a / 2,
+        rim_y=fcy - a / 2,
+        rim_w=a,
+        rim_h=a,
+        rim_sw=max(1.0, size * 0.011),
+        rim_opacity=rim,
+        r=r,
+        gcx=fcx,
+        gcy=fcy,
+        glyph=fit_glyph(glyph, box, colour, glyph_scale),
+    )
+
+
+def rasterise(svg_text, size):
+    """SVG text -> PNG bytes, through whatever is installed."""
+    try:
+        import cairosvg
+    except ImportError:
+        pass
+    else:
+        return cairosvg.svg2png(
+            bytestring=svg_text.encode("utf-8"), output_width=size, output_height=size
+        )
+
+    if shutil.which("rsvg-convert"):
+        return subprocess.run(
+            ["rsvg-convert", "-w", str(size), "-h", str(size)],
+            input=svg_text.encode("utf-8"),
+            stdout=subprocess.PIPE,
+            check=True,
+        ).stdout
+
+    magick = shutil.which("magick") or shutil.which("convert")
+    if magick:
+        cmd = [
+            magick,
+            "-background",
+            "none",
+            "-density",
+            "96",
+            "svg:-",
+            "-resize",
+            "%dx%d" % (size, size),
+            "png:-",
+        ]
+        return subprocess.run(
+            cmd, input=svg_text.encode("utf-8"), stdout=subprocess.PIPE, check=True
+        ).stdout
+
+    sys.exit("needs one of cairosvg, rsvg-convert or ImageMagick")
+
+
+def preview(png, size, sheet):
+    """Write the icon at the size it is drawn and at SC(111), in a strip."""
+    from PIL import Image
+
+    icon = Image.open(io.BytesIO(png)).convert("RGBA")
+    small = round(size * 2 / 3)
+    icon_small = icon.resize((small, small), Image.LANCZOS)
+    pad = 8
+    sheet_img = Image.new(
+        "RGBA", (size + small + pad * 3, size + pad * 2), (32, 32, 36, 255)
+    )
+    sheet_img.alpha_composite(icon, (pad, pad))
+    sheet_img.alpha_composite(icon_small, (size + pad * 2, pad + (size - small) // 2))
+    sheet_img.save(sheet)
+    return sheet
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--glyph", required=True, help="SVG or PNG to draw on the tile")
+    ap.add_argument("--out", help="PNG to write; omitted with --svg-only")
+    ap.add_argument(
+        "--size",
+        type=int,
+        default=140,
+        help="side in pixels (default 140, the size the check-in tiles are)",
+    )
+    ap.add_argument("--hue", type=float, default=205.0, help="hue of the tile, degrees")
+    ap.add_argument("--mono", action="store_true", help="the dark grey tile (tidal's)")
+    ap.add_argument("--glyph-colour", default="#ffffff", help="colour of the glyph")
+    ap.add_argument(
+        "--glyph-scale",
+        type=float,
+        default=1.0,
+        help="multiply the glyph's fitted size (default 1.0)",
+    )
+    ap.add_argument(
+        "--rim",
+        type=float,
+        default=0.22,
+        help="brightness of the card's light edge, 0..1 (default 0.22)",
+    )
+    ap.add_argument(
+        "--preview", help="also write this sheet: the tile at size and at SC(111)"
+    )
+    ap.add_argument(
+        "--svg-only", action="store_true", help="print the tile's SVG, write nothing"
+    )
+    args = ap.parse_args()
+
+    if not os.path.exists(args.glyph):
+        sys.exit("no such glyph: %s" % args.glyph)
+
+    svg_text = tile_svg(
+        args.size,
+        args.hue,
+        args.glyph,
+        colour=args.glyph_colour,
+        mono=args.mono,
+        glyph_scale=args.glyph_scale,
+        rim=args.rim,
+    )
+
+    if args.svg_only:
+        print(svg_text)
+        return
+
+    png = rasterise(svg_text, args.size)
+    if not args.out:
+        sys.exit("--out is required unless --svg-only is given")
+    out = os.path.abspath(args.out)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "wb") as f:
+        f.write(png)
+    print("wrote %s (%d bytes)" % (out, len(png)))
+
+    if args.preview:
+        print("preview: %s" % preview(png, args.size, args.preview))
+
+
+if __name__ == "__main__":
+    main()

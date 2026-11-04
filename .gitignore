@@ -1,0 +1,17 @@
+# Build output
+build/
+
+# The player, as a submodule
+/sonix-player
+
+# A toolchain symlinked or built in place (the submodule carries its own)
+rockbox-toolchain/
+
+# The Spotify engine: built, never committed. addon.mk copies the device binary
+# into spotify/assets/, and the simulator's into build/host/.
+spotify/assets/
+spotify/engine-mips/target/
+
+# Caches and local noise
+.ruff_cache/
+.DS_Store

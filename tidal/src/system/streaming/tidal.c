@@ -101,6 +101,9 @@ static char client_secret[128];
 // reason tidalapi does not: they are kept out of `strings` of an unpacked
 // image. The two halves are base64 of base64, decoded at startup. A pair the
 // addon's own settings.ini names overrides them (see tidalconf.h).
+//
+// Where they come from, how to check that, and what to do when Tidal withdraws
+// them: tidal/README.md, "The application pair".
 #define TIDAL_CLIENT_ID_A "WmxneVNuaGtiVzUw"
 #define TIDAL_CLIENT_ID_B "V2xkTE1HbDRWQT09"
 #define TIDAL_CLIENT_SECRET_A "TVU1dU9VRm1SRUZxZUhKblNrWktZa3RPVjB4bFFY"

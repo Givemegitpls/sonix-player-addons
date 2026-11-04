@@ -2,9 +2,9 @@
 #
 # A new addon, ready to compile.
 #
-#   addons/new.sh <id> [streaming|more]
+#   ./new.sh <id> [streaming|more]
 #
-# Writes addons/<id>/addon.json and addons/<id>/<id>.c from the hello example,
+# Writes <id>/addon.json and <id>/<id>.c from the hello example,
 # with the id and the tile's caption filled in, and says what to do next. The
 # code it writes is the smallest addon there is: one screen, one row per host
 # fact. Read docs/ADDONS.md before going further.
@@ -36,7 +36,7 @@ streaming | more) ;;
 esac
 
 if [ -e "$here/$id" ]; then
-	echo "$0: addons/$id is already there" >&2
+	echo "$0: $id is already there" >&2
 	exit 1
 fi
 
@@ -58,12 +58,12 @@ sed -e "s/\"Hello\"/\"$title\"/g" -e "s/hello/$id/g" "$here/hello/hello.c" >"$he
 
 cat <<EOF
 
-addons/$id/ written.
+$id/ written.
 
-  1. the screen and the rows are in addons/$id/$id.c
-  2. make addons addons-host      # target and simulator libraries
-  3. make addons-pack             # build/Addons/ -- copy to <card>/Addons
-  4. make addons-checks           # after make target: ABI and exports
+  1. the screen and the rows are in $id/$id.c
+  2. make; make host             # target and simulator libraries
+  3. make pack                    # build/Addons/ -- copy to <card>/Addons
+  4. make checks                  # after the player is built: ABI and exports
 
 The icon is optional: drop an icon.png next to addon.json and the tile uses it,
 otherwise the addon gets the menu's "more" glyph.
