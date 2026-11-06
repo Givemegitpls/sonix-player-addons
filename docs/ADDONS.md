@@ -42,16 +42,25 @@ Addons/
     addon.json        what it is and where its tile goes
     addon.so          MIPS32 little-endian, built by `make`
     icon.png          optional; 140x140 or any size, scaled down
+    README.txt        the addon's own instructions, packed as it lies there
   flappybird/
     addon.json
     addon.so
     icon.png
+    README.txt
     assets/           whatever else the addon brought: 63 PNGs and 5 OGGs here
 ```
 
 `addon.so` is the fixed name; the loader does not read it from the manifest.
+`README.txt` is not read by anything either: `make pack` copies an addon's
+`*.txt`, `*.png` and `*.ini` along, so the instructions ride in the release zip
+(and on the card beside the code) without the loader knowing about them.
 `assets/` is not a keyword either — Flappy Bird asks `host->dir` for it because
 that is where `make pack` put it; an addon may call its folder anything.
+
+The user's side of this — unzipping a release into `<card>/Addons/<id>/`, and the
+sign-in of each service — is [`SETUP.md`](SETUP.md), kept apart so that this file
+can stay about the interface.
 
 ### addon.json
 
@@ -626,9 +635,13 @@ The rule that follows:
 - **Pace the writes.** A lossless track is 25–45 MB; arriving at network speed
   that is 2–4 MB/s of dirty pages, and that is what kills the card. 1 MB/s is
   enough: the download is a track ahead of playback, so a 40 s download costs
-  nothing anybody hears. The reference implementation is `pace_to_card()` in
-  `yandex/src/system/streaming/yandexcache.c`, called from `note_written()` so
-  every write path (raw, unwrapped and detached saves) is paced.
+  nothing anybody hears. The reference implementation is `common/cardpace.h` /
+  `common/cardpace.c` — `cardpace_reset()` before a download, then
+  `cardpace_note(&d->pace, bytes_written_so_far)` after every write of track
+  audio (never for covers). In `yandex/src/system/streaming/yandexcache.c` it is
+  called from `note_written()` so every write path (raw, unwrapped and detached
+  saves) is paced; qobuz, tidal, zvuk and subsonic call it from their own write
+  choke points.
 - **Never delete tens of megabytes in one go while something plays.** That is
   why the periodic "clear the whole cache every N tracks" sweep was removed
   (`YANDEXCACHE_CLEAR_EVERY 0`): the ceiling's `prune()` deletes one track's
@@ -639,9 +652,21 @@ The rule that follows:
   what the addons' stores do; an fsync per chunk, or a synchronous file write
   per second, is the same problem from the other side.
 
-As of 2026-11-06 only the Yandex addon paces; `qobuzcache.c`, `tidalcache.c`,
-`zvukcache.c` and `subsoniccache.c` write at whatever rate the network gives and
-have the same exposure.
+As of 2026-11-07 all six download caches pace: `yandexcache.c`,
+`qobuzcache.c`, `tidalcache.c` (both the FILE and the DASH shape),
+`zvukcache.c`, `subsoniccache.c` and piped's `pplay.c` (a whole muxed MP4, so
+the largest writes in the tree). `spotify` fetches through its own Rust engine,
+which is a separate job.
+
+The rate is only half of it. A `dd` matrix on the device (2026-11-07, the table
+is in `.opencode/NOTES.md`) shows the card does not stall on writes at all: 4
+MB/s of unpaced writes with playback-rate reads produced no `jzmmc` timeout,
+while a writer racing an *unthrottled* reader that reads in 512 KB requests
+produced five. So pacing bounds the addon's share of the queue, and the rest of
+the stall comes from the read side — decode readahead, thumbnails, a library
+scan — which no cache can pace. Do not answer a freeze by lowering the rate
+further without evidence: measure with `dmesg | grep -c "timeout 3000ms"`
+before and after, the way that matrix did.
 
 ### Keys and sessions
 
@@ -728,6 +753,7 @@ this is the state behind it:
 | `zvuk` | no | ported, never checked on a device — a state screen stands in for its page |
 | `tidal` | no | the device-code sign-in and playback were never checked on a device; `tidal/README.md` says what is unverified |
 | `spotify` | no | the C half builds, but the addon means nothing without its Rust engine, and the engine's session was never checked on a device |
+| `piped` | no | checked in the simulator and on a device against a live Piped instance; what it depends on is a third party (see `### piped`) |
 
 A plain `make` still builds all of them, and that is deliberate: a developer's
 machine is where the unverified ones are supposed to be tried. What the whitelist
@@ -1249,6 +1275,59 @@ in credentials.ini` for the withdrawn pair, and `the access_token was refused
 (it may have expired)` for librespot's `Bad credentials`. The OAuth half answers
 `no_client_id`, `no_code_file`, `no_code_in_file`, `no_login_in_progress` and
 `oauth_refused`, and the page turns each into a sentence.
+
+### piped
+
+`piped/` – audio from YouTube, as a client of a Piped instance.
+
+The tile keeps the YouTube mark, and that is deliberate: what the addon plays is
+YouTube's catalogue, and the tile should say what will be heard rather than which
+relay carries it.
+
+**Why an instance and not YouTube.** Measured on 2026-11-05 from the player's
+own network: `www.youtube.com`, `music.youtube.com` and `youtubei.googleapis.com`
+complete the TCP connection and then say nothing for fifteen seconds, and every
+`googlevideo.com` host — the media itself — does the same. So there is nothing
+to extract on the device: a Piped instance ([TeamPiped](https://github.com/TeamPiped/Piped))
+reaches YouTube from its own address and hands back a media URL on its own
+`/videoplayback` proxy, which is reachable. Two instances answered that day:
+`api.piped.private.coffee` and `pipedapi.ducks.party`. The other fifteen from the
+projects' public lists were dead, unresolvable or 502.
+
+**What the instances serve today.** `/search?q=&filter=music_songs` is complete:
+title, id, duration, uploader, proxied thumbnail. `/suggestions` and `/config`
+work. `/streams/{id}` works and carries `relatedStreams` (20) — but
+`audioStreams` is empty on both, and only **itag 18** (muxed MP4 with an AAC
+track, `moov` ahead of `mdat`) is offered; the player has no WebM demuxer, so
+Opus-only formats would be useless anyway. `/playlists/{id}` and `/channel/{id}`
+answer 200 with `nextpage: null` and an empty `relatedStreams`: the extractor
+behind them is broken, so the addon does not offer playlists or channels at all
+rather than open empty pages.
+
+**The client** (`src/system/gw/pgw.c`) keeps a built-in list and an optional
+pinned instance in `Addons/piped/settings.ini` (`common/store`), probes with
+`/config`, fails over on every call, and remembers 404 and 500 separately: "the
+video is gone", "YouTube blocked the instance" and "nothing answered" are three
+different sentences.
+
+**Playback** goes through the queue, like Zvuk's: a track is one more `/streams`
+call and a download into `<card>/Addons/piped/cache/<videoId>.mp4`, announced
+with `growfile_announce/progress/finish` so the decoder opens it while it is
+still arriving, guarded by a `<videoId>.mp4.part` marker so a download cut by a
+card pull is never mistaken for a complete track. `<videoId>.mp4.tags` carries
+the title and the artist (`metadata.c` reads that sidecar), and `<videoId>.jpg`
+the cover — only when the instance's image proxy hands back JPEG, PNG or GIF,
+because it answers WebP and the player decodes neither WebP nor AVIF.
+`device_state_add_prepare_cb` fetches the next track, and the
+`sonix_addon_service_entry` table makes the star, the sleep timer and a factory
+reset know the cache.
+
+**What it does not do:** video, playlists, channels, history, an account, or
+lifting the instance's IP block. That last one is not a bug here: the instances
+answer 500 with
+`SignInConfirmNotBotException: YouTube probably temporarily blocked anonymous access from this IP`
+for every video they have not cached, and the addon says "The instance could not
+get this from YouTube". It passes when YouTube lets them through again.
 
 ## Covers on the rows of a list
 

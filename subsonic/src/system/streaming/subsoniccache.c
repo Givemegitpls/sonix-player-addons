@@ -11,6 +11,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "common/cardpace.h"
+
 #include "src/system/core/lang.h"
 #include "src/system/core/utils.h"
 #include "src/system/decode/growfile.h"
@@ -59,6 +61,10 @@ typedef struct {
 
 	http_stream_t st;
 	bool st_open;
+
+	// Card pacing: the clock cardpace_note() holds this download to -- see
+	// common/cardpace.h.
+	cardpace_t pace;
 } download_t;
 
 static download_t *current;
@@ -320,6 +326,9 @@ static void note_written(download_t *d, long written) {
 	pthread_cond_broadcast(&changed);
 	pthread_mutex_unlock(&lock);
 	growfile_progress(d->path, written);
+	// The one place a download's byte count moves, so the one place the card
+	// rate is held to; covers are a few tens of KB and are not paced.
+	cardpace_note(&d->pace, written);
 }
 
 static bool transfer(download_t *d, const char *url) {
@@ -333,6 +342,8 @@ static bool transfer(download_t *d, const char *url) {
 	}
 	long written = 0;
 	bool ok = true;
+	// Before the first write: the first cardpace_note() below starts the clock.
+	cardpace_reset(&d->pace);
 	for (;;) {
 		long got = src_read(d, buf, BUF_SIZE);
 		if (got == 0) {
@@ -391,6 +402,11 @@ static void *download_main(void *arg) {
 																									   : tr("download_failed"));
 	} else {
 		printf("subsonic: %s complete (%ld bytes)\n", d->song_id, d->written);
+		long took_ms = cardpace_elapsed_ms(&d->pace);
+		if (took_ms > 0 && d->written > 0) {
+			printf("subsonic: %s took %ld s, %ld KB/s (the card is paced to %ld KB/s)\n", d->song_id, took_ms / 1000,
+				   d->written / 1024 * 1000 / took_ms, CARDPACE_BYTES_PER_SEC / 1024);
+		}
 	}
 	remove(d->marker);
 	growfile_finish(d->path, ok);

@@ -11,6 +11,8 @@
 
 #include <pthread.h>
 
+#include "common/cardpace.h"
+
 #include "src/system/decode/growfile.h"
 #include "src/system/net/http.h"
 #include "src/system/library/mp4flac.h"
@@ -657,6 +659,10 @@ typedef struct {
 	// DASH
 	mp4flac_t unwrap;
 	int next_segment; // the next one to request, in Tidal's numbering
+
+	// Card pacing: the clock cardpace_note() holds this download to -- see
+	// common/cardpace.h.
+	cardpace_t pace;
 } download_t;
 
 static unsigned generation = 1;
@@ -772,6 +778,11 @@ static void download_end(download_t *d, bool ok) {
 	if (ok) {
 		remove(d->marker); // complete now
 		printf("tidalcache: %ld complete (%ld KB)\n", d->track_id, d->done / 1024);
+		long took_ms = cardpace_elapsed_ms(&d->pace);
+		if (took_ms > 0 && d->done > 0) {
+			printf("tidalcache: %ld took %ld s, %ld KB/s (the card is paced to %ld KB/s)\n", d->track_id, took_ms / 1000,
+				   d->done / 1024 * 1000 / took_ms, CARDPACE_BYTES_PER_SEC / 1024);
+		}
 	} else {
 		// The marker is left in place: next time round the track counts as
 		// incomplete and is downloaded again instead of playing half of it.
@@ -817,6 +828,8 @@ static bool pump_file(download_t *d, long until, bool *finished) {
 		fflush(d->f);
 		d->done += n;
 		growfile_progress(d->path, d->done);
+		// See common/cardpace.h: the card times out under faster writes.
+		cardpace_note(&d->pace, d->done);
 	}
 	return true;
 }
@@ -873,6 +886,10 @@ static bool pump_dash(download_t *d, int count, bool *finished) {
 		fflush(d->f);
 		d->done = d->unwrap.written;
 		growfile_progress(d->path, d->done);
+		// Per segment, not per write: the bytes go to the card inside
+		// mp4flac_segment(), which has no hook, and a segment is a few hundred
+		// KB -- a fine enough grain for the clock (common/cardpace.h).
+		cardpace_note(&d->pace, d->done);
 
 		d->next_segment++;
 		done_now++;
@@ -915,6 +932,9 @@ static bool open_output(download_t *d) {
 		set_error(errno == ENOSPC ? tr("card_full") : tr("card_write_failed"));
 		return false;
 	}
+	// Both shapes come through here before their first write of track audio:
+	// the clock starts with that byte (common/cardpace.h).
+	cardpace_reset(&d->pace);
 	return true;
 }
 

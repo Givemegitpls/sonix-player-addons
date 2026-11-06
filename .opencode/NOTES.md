@@ -28,6 +28,40 @@ end_request: I/O error, dev mmcblk0, sector 21762
 FAT-fs (mmcblk0p1): FAT read failed (blocknr 19714)
 ```
 
+**2026-11-07: the write rate is not what stalls the card; read/write
+interleaving is.** Measured on the device with the player idle (`dd` models,
+`dmesg | grep -c "timeout 3000ms"` before/after, 60 s each):
+
+| writer | reader | timeouts |
+|---|---|---|
+| 32 KB every 30 ms (1 MB/s) | same file, 32 KB blocks, unthrottled | 0 |
+| 64 KB every 62 ms (1 MB/s) | same file, 64 KB, unthrottled | 0 |
+| 512 KB every 0.5 s (1 MB/s) | same file, 512 KB, unthrottled | **5** |
+| 64 KB every 62 / 125 / 250 ms | ~300 KB/s (playback rate) | 0 |
+| 2 writers, 64 KB every 62 ms (2 MB/s total) | ~300 KB/s | 0 |
+| 64 KB every 15.5 ms (4 MB/s, unpaced) | ~300 KB/s | 0 |
+| 64 KB every 62 ms + log-like appends every 50 ms | ~300 KB/s | 0 |
+| none | 512 KB or 64 KB blocks, unthrottled | 0 |
+| 32 KB every 30 ms | none | 0 |
+
+So neither the rate nor the grain is the trigger on its own: writes alone are
+clean at 4 MB/s, reads alone are clean, and writes plus playback-rate reads are
+clean at every rate tried. The one configuration that stalls is a writer racing
+an *unthrottled* reader that reads in 512 KB requests — large read bursts keep
+the queue busy and a multi-block write is not serviced within the driver's 3 s.
+On the real device that can only come from the player's own read bursts (decode
+readahead, thumbnail or library scan), not from the addon's writes.
+
+The card is healthy: 100 MB `dd … conv=fsync` through a USB reader on the host
+25.8 MB/s, on the device 5.4 MB/s, both with zero timeouts.
+
+Also fixed on 2026-11-07: the original `pace_to_card()` computed
+`written * 1000L` in a 32-bit `long`, which overflows at 2.1 MB on mipsel — the
+deadline wrapped into the past, the pause stopped, and the rest of every file
+went to the card at network speed (a 39 MB track reported 2035 KB/s against a
+1024 KB/s limit). `common/cardpace.c` now uses `long long`, and a real qobuz
+download reports exactly 1023 KB/s.
+
 The download writes a 25–45 MB lossless track as fast as the network gives it
 (2–4 MB/s of dirty pages); with `MemFree` around 1 MB the kernel throttles the
 writer, every `fsync` in the player waits for the pages, and a read that lands
@@ -35,9 +69,12 @@ on a page being written back waits too. It can last minutes and then recover by
 itself, which is why the same thing has been reported both as a freeze and as
 "the player died with the panel dark".
 
-Fix in this repository: `pace_to_card()` in
-`yandex/src/system/streaming/yandexcache.c`, 1 MB/s, called from
-`note_written()` so raw, unwrapped and detached-save writes are all paced. The
+Fix in this repository: `common/cardpace.h` / `common/cardpace.c`, 1 MB/s, one
+`cardpace_t` per download — `cardpace_reset()` before it starts writing, then
+`cardpace_note(&d->pace, bytes_so_far)` after every write of track audio. In
+`yandexcache.c` it is called from `note_written()` so raw, unwrapped and
+detached-save writes are all paced; qobuz, tidal (FILE and DASH), zvuk and
+subsonic call it from their own write choke points. The
 log line `took N s, M KB/s (the card is paced to 1024 KB/s)` confirms it. The
 periodic "clear the whole cache every 10 tracks" sweep was removed as well
 (`YANDEXCACHE_CLEAR_EVERY 0`) — deleting tens of megabytes in a burst is the
@@ -117,3 +154,108 @@ mid-transfer, which is why the addons CI used to fail at that layer.
 
 `sonix-player/sonix-player/rockbox-toolchain` builds in 20-60 minutes; CI caches
 it keyed on `sonix-player/sonix-player/docker/Dockerfile` + `rockboxdev/**`.
+
+## Docs
+
+- `docs/SETUP.md` is the user-facing side (install + per-service sign-in),
+  bilingual: every section is English first, then the same in Russian. Keep the
+  two halves in step; `docs/ADDONS.md` stays English and is for internals.
+- Release zips are `qobuz subsonic yandex gearboy flappybird dino`; `hello` is
+  built by CI but `PACK_EXCLUDE ?= hello` keeps it out of `build/Addons`, so
+  there is no `hello.zip`. The archive holds the addon folder's contents at its
+  root (`addon.json`, `addon.so`, `icon.png`, optional `assets/`).
+- Qobuz token for `Addons/qobuz/token.txt`: the web player sends it as the
+  `x-user-auth-token` request header on `POST play.qobuz.com/api.json/0.2/user/login`
+  (Network tab); the same value is in Local Storage under `user_auth_token`.
+- Yandex addon's canonical sign-in is the OAuth device flow it runs itself: the
+  page's **Code** row shows the eight characters, **Where** the address
+  (`ya.ru/device`, scheme stripped), **Waiting** the countdown. `token.txt` is a
+  legacy import only (no refresh token) — docs must not present it as a way to
+  type a token in.
+- Each released addon carries its own `<id>/README.txt` (English + Russian, link
+  to `docs/SETUP.md#<n>-<slug>`): `make pack` copies `*.txt`/`*.png`/`*.ini` and
+  `assets/` from the addon folder, so the file lands at the root of the release
+  zip and on the card. It is not read by the loader; keep it short.
+
+## Building without docker (this machine, 2026-11-06)
+
+- The root `Makefile`'s default goal is `lvgl`, not `target`: a bare `make` only
+  checks LVGL and exits. Use `make target ADDON_IDS=...` / `make host ...`.
+- `docker/build.sh` passes the toolchain target relatively
+  (`make -C <player> rockbox-toolchain/bin/...`) while the rule is written with
+  the absolute `$(CROSS_CC)`; the first run therefore fails with "No rule to make
+  target". Build it directly:
+  `docker run --rm -v $PWD:$PWD -w $PWD --user $(id -u):$(id -g) -e HOME=/tmp tempotec-player-build make -C $PWD/sonix-player/sonix-player $PWD/sonix-player/sonix-player/rockbox-toolchain/bin/mipsel-rockbox-linux-gnu-gcc`
+- LVGL 9.6.0 does not clone reliably here (git: "early EOF" on the host and in
+  the container). The tarball does:
+  `curl -L -o lvgl.tgz https://codeload.github.com/lvgl/lvgl/tar.gz/refs/tags/v9.6.0`
+  then `tar -xzf lvgl.tgz -C sonix-player/sonix-player/lvgl --strip-components=1`.
+  The player's Makefile reads the version from `lvgl/include/lvgl/lv_version.h`.
+- `make host` in the player tree builds `sonix_player_host`; SDL2, FreeType,
+  opusfile, wavpack and ALSA are installed on this machine. Audio output is not:
+  the simulator logs `Cannot open PCM device 'hw:0,0'` and every track "ends"
+  immediately, so playback cannot be heard here — decode startup is still
+  visible in the log (`aac: libfdk-aac loaded`, `growfile: following ...`).
+
+## Piped (the YouTube addon's backend), measured 2026-11-05/06
+
+- Working API instances: `https://api.piped.private.coffee` and
+  `https://pipedapi.ducks.party`. Every other host from the projects' public
+  lists was dead, unresolvable, 403 or 502.
+- **2026-11-07: both instances answer `/config` and `/search`, but
+  `/streams/{id}` returns HTTP 500 with
+  `SignInConfirmNotBotException … LOGIN_REQUIRED: "Sign in to confirm that you're
+  not a bot"`** — YouTube blocks the instances' IPs, so nothing plays. A video
+  the instance has already fetched (`dQw4w9WgXcQ`) still answers 200, so it is
+  per-video upstream blocking, not a dead mirror. Nothing to fix on the addon
+  side; retry when the instance owners rotate their extraction.
+- Both serve `/search`, `/config`, `/suggestions`, and `/streams/{id}` with a
+  media URL on their own `/videoplayback` proxy (Range works). `audioStreams` is
+  empty; only **itag 18** (muxed MP4, moov before mdat) exists. `/playlists/{id}`
+  and `/channel/{id}` return 200 with `nextpage: null` and empty
+  `relatedStreams` — do not build a UI on them.
+- Fresh videos answer 500 with `SignInConfirmNotBotException: YouTube probably
+  temporarily blocked anonymous access from this IP`; already-cached ones (e.g.
+  `dQw4w9WgXcQ`) still work. That is the instances' IPs, not the player's.
+- Thumbnails through the instance's image proxy come back as **WebP**, which the
+  player's stb_image path does not decode — the Piped addon (formerly `youtube/`) skips those covers.
+
+## On the device (2026-11-06)
+
+- Card: `/mnt/sd_0` (vfat), addons under `/mnt/sd_0/Addons/<id>/`; player is
+  `/usr/bin/sonix_player`, started by `/usr/bin/sonix_launch`. Killing the player
+  makes the launcher **reboot** the device (~40 s), which is the only way to
+  force a fresh addon scan; changing the files of a loaded addon is noticed on
+  the next tile tap ("addon: <id> changed on the card, reloading").
+- Log: `/mnt/sd_0/.local/sonix_player.log` (enabled by `[system] log_to_sd = 1`
+  in `/data/device_config.ini`).
+- Screenshot without the player's own feature: `adb shell 'dd if=/dev/fb0
+  of=/tmp/fb.raw bs=614400 count=1'` then pull; 320x480 **BGRA**, stride 1280.
+  `adb exec-out cat /dev/fb0` returns nothing on this adbd.
+- Touch injection: `/dev/input/event2` is the GT9XX panel (INPUT_PROP_DIRECT);
+  write `ABS_MT_TRACKING_ID`, `ABS_MT_POSITION_X/Y`, `BTN_TOUCH` + SYN_REPORT with
+  a tiny static MIPS binary (source kept at `/tmp/oc/touch.c`, pushed as
+  `/tmp/touch`, subcommands `tap X Y` / `drag X1 Y1 X2 Y2`). Coordinates are panel
+  coordinates, identical to the simulator's: on-screen keyboard rows at
+  y 275/326/377/428, columns q..p 18,49,80,112,143,175,206,238,269,301, OK 288,450.
+- The card is found at boot only; `killall sonix_player` is the reboot switch.
+
+## Diagnosing a freeze on the V3 (2026-11-06)
+
+- The player's `watchdog` thread (`src/main.c`) writes to `<card>/.local/sonix_player.log`
+  a full thread dump (`tid`, `comm`, `state`, kernel `wchan`) after 5 s without a UI
+  heartbeat, and `watchdog: UI recovered after ~N s` when it comes back. So a freeze
+  usually needs no external profiler: pull the log. `log_to_sd = 1` in
+  `/data/device_config.ini`; `/data/sonix-launch.log` says who restarted the player.
+- `adb shell` is root on this device, `/proc/<pid>/task/*/stack` is readable, and
+  `strace 4.8` plus `timeout` are in the image — a host-side probe can snapshot
+  everything (this session's: `/tmp/opencode/hang-probe.sh`, watches the log's tail
+  and dumps thread stacks + 5 s of strace on the watchdog line).
+- Freezes blamed on a streaming addon correlate with `jzmmc_v1.2: timeout 3000ms
+  op:25 w sz:524288 ... blks:19/1024` — multi-block card writes stalling for seconds
+  while the UI waits for a cover and the decoder for its frames (UI stall first,
+  sound after). Seen with yandex, subsonic and radio; it is the write path, not the
+  addon's locks. `yandexcache.c` therefore paces its writes (PACE_PIECE_BYTES/PACE_PAUSE_US,
+  64 KB then 20 ms) and logs `complete (N bytes, M ms of card pacing)`.
+- A `MemFree` of ~1 MB is normal here (MemTotal 57816 kB) and is not by itself
+  evidence of a leak; check `available` in the audio profile lines instead.

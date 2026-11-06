@@ -11,6 +11,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "common/cardpace.h"
+
 #include "src/system/core/lang.h"
 #include "src/system/core/utils.h"
 #include "src/system/decode/growfile.h"
@@ -69,10 +71,9 @@ typedef struct {
 	void *progress_user;
 	uint64_t samples; // flac-mp4: the length counted while unwrapping
 
-	// Card pacing: when this download started writing, and how much it has
-	// written -- see pace_to_card().
-	long started_ms;
-	long pace_at_ms;
+	// Card pacing: the clock cardpace_note() holds this download to -- see
+	// common/cardpace.h.
+	cardpace_t pace;
 } download_t;
 
 static download_t *current;	 // the one download in flight, or NULL
@@ -427,43 +428,15 @@ static bool src_read_full(download_t *d, uint8_t *buf, long n) {
 // log, the library journal) waits behind it, and the playback thread waits on a
 // page that is being written back -- the whole process in D state, which reads
 // as a freeze. A 25-45 MB lossless track arriving at network speed is 2-4 MB/s
-// of dirty pages; the rate below is what the card has been seen to take.
-//
-// Playback is a track ahead, so a slower download costs nothing anybody hears:
-// a 40 MB track at 1 MB/s is 40 s, and the track it precedes plays for minutes.
-#define CARD_WRITE_BYTES_PER_SEC (1024L * 1024L)
-
-static long mono_ms(void) {
-	struct timespec now;
-	clock_gettime(CLOCK_MONOTONIC, &now);
-	return (long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
-}
-
-// Holds a download to the card's rate: `written` is the whole file so far, so
-// the sleep is whatever is left of the time that much data should have taken.
-// The first chunk starts the clock and is not delayed.
-static void pace_to_card(download_t *d, long written) {
-	if (CARD_WRITE_BYTES_PER_SEC <= 0 || written <= 0) {
-		return;
-	}
-	long now = mono_ms();
-	if (d->pace_at_ms == 0) {
-		d->pace_at_ms = now;
-		return;
-	}
-	long due = d->pace_at_ms + written * 1000L / CARD_WRITE_BYTES_PER_SEC;
-	if (due > now) {
-		usleep((useconds_t)(due - now) * 1000);
-	}
-}
-
+// of dirty pages; common/cardpace.h holds every download in the tree to what
+// the card has been seen to take.
 static void note_written(download_t *d, long written) {
 	if (d->detached) {
 		d->written = written;
 		if (d->progress) {
 			d->progress(written, d->src_total, d->progress_user);
 		}
-		pace_to_card(d, written);
+		cardpace_note(&d->pace, written);
 		return;
 	}
 	pthread_mutex_lock(&lock);
@@ -471,7 +444,7 @@ static void note_written(download_t *d, long written) {
 	pthread_cond_broadcast(&changed);
 	pthread_mutex_unlock(&lock);
 	growfile_progress(d->part[0] && d->whole ? d->part : d->path, written);
-	pace_to_card(d, written);
+	cardpace_note(&d->pace, written);
 }
 
 static void write_error(download_t *d) {
@@ -695,7 +668,7 @@ static void *download_main(void *arg) {
 	// class like a sync thread, because playback is reading this file as it
 	// grows and an idle thread gets almost nothing while music plays.
 	thread_be_low_priority("yandex download");
-	d->started_ms = mono_ms();
+	cardpace_reset(&d->pace);
 	streamturn_acquire();
 	bool ok = !d->abandon && (d->unwrap ? unwrap_mp4(d) : copy_raw(d));
 	streamturn_release();
@@ -724,10 +697,10 @@ static void *download_main(void *arg) {
 			printf("yandex: %s is %llu samples long\n", d->track_id, (unsigned long long)d->samples);
 		}
 		printf("yandex: %s complete (%ld bytes)\n", d->track_id, d->written);
-		long took_ms = mono_ms() - d->started_ms;
+		long took_ms = cardpace_elapsed_ms(&d->pace);
 		if (took_ms > 0 && d->written > 0) {
 			printf("yandex: %s took %ld s, %ld KB/s (the card is paced to %ld KB/s)\n", d->track_id, took_ms / 1000,
-				   d->written / 1024 * 1000 / took_ms, CARD_WRITE_BYTES_PER_SEC / 1024);
+				   d->written / 1024 * 1000 / took_ms, CARDPACE_BYTES_PER_SEC / 1024);
 		}
 	}
 	growfile_finish(growing, ok);

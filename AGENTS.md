@@ -54,9 +54,11 @@ add an addon to the whitelist without a device run to point at — `docs/ADDONS.
   speed (2–4 MB/s) makes this device's card time out (`jzmmc … 3000ms`, then
   `end_request: I/O error`), and the whole player — interface, log, library
   journal — goes into `D` state behind it; that is what the "hangs after a few
-  tracks" reports are. `pace_to_card()` in `yandexcache.c` is the reference,
-  1 MB/s. Do not add a sweep that deletes the cache in bursts, and do not add
-  fsync loops. `docs/ADDONS.md`, "The card is the slowest thing in the player".
+  tracks" reports are. `common/cardpace.h` is the reference, 1 MB/s: a
+  `cardpace_t` per download, `cardpace_reset()` before it, `cardpace_note()`
+  after every write of track audio (never for covers). Do not add a sweep that
+  deletes the cache in bursts, and do not add fsync loops. `docs/ADDONS.md`,
+  "The card is the slowest thing in the player".
 - `spotify/engine-mips/` is a Rust crate whose device build needs its own docker
   image (`spotify/engine-mips/docker/`: musl cross compiler, pinned nightly), not
   the player's; its `target/` is not in git

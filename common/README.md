@@ -11,6 +11,11 @@ two addons' copies never meet.
 
 What is here:
 
+- `cardpace.{h,c}` — the rate a download may fill the card at (1 MB/s). Writing a
+  track at network speed makes this device's card time out and stalls the whole
+  player in `D` state; a `cardpace_t` per download plus `cardpace_note()` after
+  every write of track audio is what keeps the backlog short. The long story is
+  `docs/ADDONS.md`, "The card is the slowest thing in the player".
 - `gunzip.{h,c}` — a small inflate for the `Content-Encoding: gzip` a proxy in
   front of a server may add whatever the request asked for.
 - `store.{h,c}` — an addon's own `key = value` settings file on the card, written

@@ -10,6 +10,8 @@
 
 #include <pthread.h>
 
+#include "common/cardpace.h"
+
 #include "src/system/decode/growfile.h"
 #include "src/system/net/http.h"
 #include "src/system/streaming/streamturn.h"
@@ -548,6 +550,9 @@ typedef struct {
 	long done;
 	long total;
 	unsigned generation;
+	// Card pacing: the clock cardpace_note() holds this download to -- see
+	// common/cardpace.h.
+	cardpace_t pace;
 } download_t;
 
 // Changing track bumps this counter; threads downloading something else notice
@@ -680,6 +685,13 @@ static void download_end(download_t *d, bool ok) {
 	if (ok) {
 		remove(d->marker); // complete now
 		printf("qobuzcache: %ld complete (%ld KB)\n", d->track_id, d->done / 1024);
+		// Guarded like the yandex one: a file that fit in one chunk can be done
+		// before a whole millisecond has passed, and that is no rate.
+		long took_ms = cardpace_elapsed_ms(&d->pace);
+		if (took_ms > 0 && d->done > 0) {
+			printf("qobuzcache: %ld took %ld s, %ld KB/s (the card is paced to %ld KB/s)\n", d->track_id, took_ms / 1000,
+				   d->done / 1024 * 1000 / took_ms, CARDPACE_BYTES_PER_SEC / 1024);
+		}
 	} else {
 		// The marker stays: next time qobuzcache_has() says no and the track
 		// is downloaded again instead of playing half of it.
@@ -724,6 +736,12 @@ static bool download_pump(download_t *d, long until, bool *finished) {
 		fflush(d->f);
 		d->done += n;
 		growfile_progress(d->path, d->done);
+
+		// The one choke point for track bytes (covers do not come through
+		// here): hold the download to what the card retires, or the writeback
+		// backs up and everything the player writes waits behind it. See
+		// common/cardpace.h.
+		cardpace_note(&d->pace, d->done);
 
 		if (until == 0 && *finished) {
 			break;
@@ -885,6 +903,10 @@ bool qobuzcache_start(long track_id, const char *url, const char *mime, int dura
 	pthread_mutex_unlock(&active_lock);
 
 	growfile_announce(d->path, d->total);
+
+	// Before the prebuffer, which is the first write: the clock has to start at
+	// the first paced chunk, not at the call that opened the file.
+	cardpace_reset(&d->pace);
 
 	// --- prebuffer, measured rather than guessed -----------------------------
 	//

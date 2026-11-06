@@ -13,6 +13,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "common/cardpace.h"
+
 #include "src/system/core/lang.h"
 #include "src/system/core/utils.h"
 #include "src/system/decode/growfile.h"
@@ -61,6 +63,10 @@ typedef struct {
 	void (*progress)(long written, long total, void *user);
 	void *progress_user;
 	uint64_t samples;
+
+	// Card pacing: the clock cardpace_note() holds this download to -- see
+	// common/cardpace.h.
+	cardpace_t pace;
 } download_t;
 
 static download_t *current;
@@ -360,12 +366,23 @@ static bool src_seek(download_t *d, long pos, uint8_t *buf) {
 // writing
 // ---------------------------------------------------------------------------
 
+// The card this device writes through times out (jzmmc, 3 s) when the page
+// cache is pushed at it faster than it retires the pages: the download thread
+// then sits in balance_dirty_pages_ratelimited, every fsync in the player (the
+// log, the library journal) waits behind it, and the playback thread waits on a
+// page that is being written back -- the whole process in D state, which reads
+// as a freeze. A 25-45 MB lossless track arriving at network speed is 2-4 MB/s
+// of dirty pages; common/cardpace.h holds every download in the tree to what
+// the card has been seen to take. Every track write goes through here, the
+// copy_raw() chunks and the FLAC frames the mp4 unwrapper hands to mp4flac;
+// cover images are stored by streamcover and never pass through this clock.
 static void note_written(download_t *d, long written) {
 	if (d->detached) {
 		d->written = written;
 		if (d->progress) {
 			d->progress(written, d->src_total, d->progress_user);
 		}
+		cardpace_note(&d->pace, written);
 		return;
 	}
 	pthread_mutex_lock(&lock);
@@ -373,6 +390,7 @@ static void note_written(download_t *d, long written) {
 	pthread_cond_broadcast(&changed);
 	pthread_mutex_unlock(&lock);
 	growfile_progress(d->path, written);
+	cardpace_note(&d->pace, written);
 }
 
 static void write_error(download_t *d) {
@@ -397,6 +415,9 @@ static bool copy_raw(download_t *d, uint8_t *buf, const uint8_t *lead, long lead
 			return false;
 		}
 		written = lead_len;
+		// Directly, not through note_written(): the lead is part of the track,
+		// but an 8-byte progress event to the caller is not.
+		cardpace_note(&d->pace, written);
 	}
 	for (;;) {
 		long got = src_read(d, buf, BUF_SIZE);
@@ -576,6 +597,9 @@ static bool unwrap_mp4(download_t *d, uint8_t *buf, const uint8_t *lead) {
 // What the file is decides how it is written: native FLAC and MP3 as they
 // come, FLAC in MP4 unwrapped.
 static bool transfer(download_t *d) {
+	// Before the first write: both entries (the cache's thread and
+	// zvukcache_fetch) go through here.
+	cardpace_reset(&d->pace);
 	uint8_t *buf = malloc(BUF_SIZE);
 	if (!buf) {
 		return false;
@@ -618,6 +642,11 @@ static void *download_main(void *arg) {
 			printf("zvuk: %s is %llu samples long\n", d->track_id, (unsigned long long)d->samples);
 		}
 		printf("zvuk: %s complete (%ld bytes from %ld)\n", d->track_id, d->written, d->src_pos);
+		long took_ms = cardpace_elapsed_ms(&d->pace);
+		if (took_ms > 0 && d->written > 0) {
+			printf("zvuk: %s took %ld s, %ld KB/s (the card is paced to %ld KB/s)\n", d->track_id, took_ms / 1000,
+				   d->written / 1024 * 1000 / took_ms, CARDPACE_BYTES_PER_SEC / 1024);
+		}
 	}
 	remove(d->marker);
 	growfile_finish(d->path, ok);
