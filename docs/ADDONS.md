@@ -580,6 +580,69 @@ service's", export it over USB correctly and wipe only caches on a factory reset
 Paths are relative to the card root, no leading slash. `cache_path` is what a
 factory reset empties; settings are never in it.
 
+### The card is the slowest thing in the player
+
+An addon that downloads a track and hands the player its path is writing tens of
+megabytes to an SD card that this device's driver cannot always keep up with, on
+a machine with about a megabyte of free RAM. That combination is not a
+performance detail: it stalls the whole player, and it was measured on the
+hardware (2026-11-06).
+
+What the kernel says when it happens, from `dmesg`:
+
+```
+jzmmc_v1.2: timeout 3000ms op:25 w sz:37888   ... blks:19/74
+jzmmc_v1.2: timeout 3000ms op:25 w sz:524288  ... blks:19/1024
+mmcblk0: unknown error -5 sending read/write command, card status 0x900
+end_request: I/O error, dev mmcblk0, sector 21762
+FAT-fs (mmcblk0p1): FAT read failed (blocknr 19714)
+```
+
+and what the process looks like at the same moment, from
+`/proc/<pid>/task/*/stack`:
+
+- the **interface thread** is in `do_fsync → fat_file_fsync → filemap_write_and_wait_range`
+  (it commits the library database, journal included);
+- **`logwriter`** is in the same `fsync` (the log is on the card);
+- **`playback`** is in `generic_file_aio_read → __lock_page_killable`, waiting for
+  a page that is being written back;
+- the **download thread** is in `balance_dirty_pages_ratelimited` — the kernel
+  itself throttling the writer because too many pages are dirty.
+
+`MemFree` sits around 1 MB and `Writeback` around 3 MB. Everything waits behind
+the card, the interface included, and it reads as a freeze; on this device it
+can last minutes and then recover on its own once the backlog drains, which is
+why the same bug has been reported as "hangs after a few tracks" and as "the
+player died with the panel dark".
+
+What limits it is the board's path to the card (`jzmmc`), not the card: the same
+card through a good USB reader is several times faster, and the player's own USB
+export is slower still. So measure the ceiling **on the device** (`dd` to
+`/mnt/sd_0` with `conv=fsync`) before choosing a pacing rate — a host card
+reader's number says nothing about what an addon can write here.
+
+The rule that follows:
+
+- **Pace the writes.** A lossless track is 25–45 MB; arriving at network speed
+  that is 2–4 MB/s of dirty pages, and that is what kills the card. 1 MB/s is
+  enough: the download is a track ahead of playback, so a 40 s download costs
+  nothing anybody hears. The reference implementation is `pace_to_card()` in
+  `yandex/src/system/streaming/yandexcache.c`, called from `note_written()` so
+  every write path (raw, unwrapped and detached saves) is paced.
+- **Never delete tens of megabytes in one go while something plays.** That is
+  why the periodic "clear the whole cache every N tracks" sweep was removed
+  (`YANDEXCACHE_CLEAR_EVERY 0`): the ceiling's `prune()` deletes one track's
+  worth when the ceiling is actually reached, which is the same bytes spread
+  over the tracks that make them. A user-requested clear or the shutdown clear
+  is fine — nothing is playing then.
+- **Do not add fsync loops.** One `fsync` per file at the end of a write is
+  what the addons' stores do; an fsync per chunk, or a synchronous file write
+  per second, is the same problem from the other side.
+
+As of 2026-11-06 only the Yandex addon paces; `qobuzcache.c`, `tidalcache.c`,
+`zvukcache.c` and `subsoniccache.c` write at whatever rate the network gives and
+have the same exposure.
+
 ### Keys and sessions
 
 A service's credentials are the addon's, and they live next to it on the card.
@@ -1337,3 +1400,26 @@ addon: dlopen …/addon.so: undefined symbol: lv_obj_create
                                             ← the player does not export it
 addon: subsonic init() gave no screen       ← init() returned NULL
 ```
+
+### When the player freezes on the device
+
+Before touching the power button, take the state — it survives only while the
+process does:
+
+```sh
+adb shell 'dmesg | tail -40'
+adb shell 'PID=$(pidof sonix_player); for t in /proc/$PID/task/*/; do \
+  echo "$(basename $t) $(cut -d" " -f3 $t/stat) $(cat $t/comm) $(cat $t/wchan)"; done'
+adb shell 'pidof sonix_player' | while read p; do cat /proc/$p/task/*/stack; done
+adb shell 'grep -E "^(MemFree|Dirty|Writeback|Cached)" /proc/meminfo'
+```
+
+A freeze that is not a crash shows as threads in **`D`** state, and the answer
+is in `dmesg`: `jzmmc … timeout 3000ms` and `end_request: I/O error, dev
+mmcblk0` mean the card, not the code (see "The card is the slowest thing in the
+player", above). A hang that recovers by itself after a minute or two is the
+same thing: the backlog drains.
+
+Reading the log **while** the card is stalled will hang the shell too — the log
+lives on the card. Take `dmesg` and the stacks first, and pull the log after
+the reboot.

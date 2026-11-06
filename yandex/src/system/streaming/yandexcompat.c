@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "src/gui/shell/gui.h"
@@ -25,6 +26,20 @@ int yandex_playlist_replace_path(const char *old_path, const char *new_path) {
 	if (count <= 0) {
 		return 0;
 	}
+	// Whether the name is in the queue at all: answered without the copy below,
+	// which is one strdup per entry. On this device the heap is what the card's
+	// writeback fights over, and the answer is usually "no" -- a queue built
+	// with another guess, or an entry this fetch has already renamed.
+	bool holds = false;
+	for (int i = 0; i < count && !holds; i++) {
+		char path[YANDEXCOMPAT_PATH_MAX];
+		holds = playlist_path_at(i, path, sizeof(path)) && strcmp(path, old_path) == 0;
+	}
+	if (!holds) {
+		return 0;
+	}
+	struct timespec began;
+	clock_gettime(CLOCK_MONOTONIC, &began);
 	char **paths = calloc((size_t)count, sizeof(*paths));
 	if (!paths) {
 		return 0;
@@ -55,7 +70,18 @@ int yandex_playlist_replace_path(const char *old_path, const char *new_path) {
 		free(paths[i]);
 	}
 	free(paths);
-	return rebuilt ? changed : 0;
+	if (!rebuilt) {
+		return 0;
+	}
+	// One line, because this is the whole queue rebuilt on the interface thread:
+	// how long it takes and how often it happens is what says whether the guess
+	// in yandexplay.c (guess_ext) is doing its job.
+	struct timespec done;
+	clock_gettime(CLOCK_MONOTONIC, &done);
+	long ms = (done.tv_sec - began.tv_sec) * 1000L + (done.tv_nsec - began.tv_nsec) / 1000000L;
+	const char *was = strrchr(old_path, '/'), *now = strrchr(new_path, '/');
+	printf("yandex: queue renamed %s -> %s (%d entries, %ld ms)\n", was ? was + 1 : old_path, now ? now + 1 : new_path, kept, ms);
+	return changed;
 }
 
 void yandex_device_state_note_metadata_available(const char *path) {

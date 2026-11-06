@@ -68,6 +68,11 @@ typedef struct {
 	void (*progress)(long written, long total, void *user);
 	void *progress_user;
 	uint64_t samples; // flac-mp4: the length counted while unwrapping
+
+	// Card pacing: when this download started writing, and how much it has
+	// written -- see pace_to_card().
+	long started_ms;
+	long pace_at_ms;
 } download_t;
 
 static download_t *current;	 // the one download in flight, or NULL
@@ -416,12 +421,49 @@ static bool src_read_full(download_t *d, uint8_t *buf, long n) {
 // the download thread
 // ---------------------------------------------------------------------------
 
+// The card this device writes through times out (jzmmc, 3 s) when the page
+// cache is pushed at it faster than it retires the pages: the download thread
+// then sits in balance_dirty_pages_ratelimited, every fsync in the player (the
+// log, the library journal) waits behind it, and the playback thread waits on a
+// page that is being written back -- the whole process in D state, which reads
+// as a freeze. A 25-45 MB lossless track arriving at network speed is 2-4 MB/s
+// of dirty pages; the rate below is what the card has been seen to take.
+//
+// Playback is a track ahead, so a slower download costs nothing anybody hears:
+// a 40 MB track at 1 MB/s is 40 s, and the track it precedes plays for minutes.
+#define CARD_WRITE_BYTES_PER_SEC (1024L * 1024L)
+
+static long mono_ms(void) {
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	return (long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+// Holds a download to the card's rate: `written` is the whole file so far, so
+// the sleep is whatever is left of the time that much data should have taken.
+// The first chunk starts the clock and is not delayed.
+static void pace_to_card(download_t *d, long written) {
+	if (CARD_WRITE_BYTES_PER_SEC <= 0 || written <= 0) {
+		return;
+	}
+	long now = mono_ms();
+	if (d->pace_at_ms == 0) {
+		d->pace_at_ms = now;
+		return;
+	}
+	long due = d->pace_at_ms + written * 1000L / CARD_WRITE_BYTES_PER_SEC;
+	if (due > now) {
+		usleep((useconds_t)(due - now) * 1000);
+	}
+}
+
 static void note_written(download_t *d, long written) {
 	if (d->detached) {
 		d->written = written;
 		if (d->progress) {
 			d->progress(written, d->src_total, d->progress_user);
 		}
+		pace_to_card(d, written);
 		return;
 	}
 	pthread_mutex_lock(&lock);
@@ -429,6 +471,7 @@ static void note_written(download_t *d, long written) {
 	pthread_cond_broadcast(&changed);
 	pthread_mutex_unlock(&lock);
 	growfile_progress(d->part[0] && d->whole ? d->part : d->path, written);
+	pace_to_card(d, written);
 }
 
 static void write_error(download_t *d) {
@@ -652,6 +695,7 @@ static void *download_main(void *arg) {
 	// class like a sync thread, because playback is reading this file as it
 	// grows and an idle thread gets almost nothing while music plays.
 	thread_be_low_priority("yandex download");
+	d->started_ms = mono_ms();
 	streamturn_acquire();
 	bool ok = !d->abandon && (d->unwrap ? unwrap_mp4(d) : copy_raw(d));
 	streamturn_release();
@@ -680,6 +724,11 @@ static void *download_main(void *arg) {
 			printf("yandex: %s is %llu samples long\n", d->track_id, (unsigned long long)d->samples);
 		}
 		printf("yandex: %s complete (%ld bytes)\n", d->track_id, d->written);
+		long took_ms = mono_ms() - d->started_ms;
+		if (took_ms > 0 && d->written > 0) {
+			printf("yandex: %s took %ld s, %ld KB/s (the card is paced to %ld KB/s)\n", d->track_id, took_ms / 1000,
+				   d->written / 1024 * 1000 / took_ms, CARD_WRITE_BYTES_PER_SEC / 1024);
+		}
 	}
 	growfile_finish(growing, ok);
 
@@ -914,12 +963,20 @@ bool yandexcache_start(const yandex_track_t *track, const yandex_file_t *file, c
 // keeping the cache in bounds
 //
 // The Qobuz policy (qobuzcache.c), for the same reasons: the cache is a
-// waypoint on the user's card, in a directory they never see, so it is swept
-// every YANDEXCACHE_CLEAR_EVERY tracks and on the way out, and held under
-// YANDEXCACHE_MAX_BYTES in between. What the queue still expects (the track
-// playing and those after it), what was fetched a moment ago and is about to
-// be queued, and what is coming down right now are never touched by the
-// automatic passes.
+// waypoint on the user's card, in a directory they never see, so it is held
+// under YANDEXCACHE_MAX_BYTES and emptied on the way out. What the queue still
+// expects (the track playing and those after it), what was fetched a moment
+// ago and is about to be queued, and what is coming down right now are never
+// touched by the automatic passes.
+//
+// There used to be a sweep here as well -- the whole cache cleared every
+// YANDEXCACHE_CLEAR_EVERY tracks -- and it is off (0) now, on purpose. This
+// device has about a megabyte of free RAM and a card whose writes can take
+// seconds: deleting tens of megabytes in one burst, from the thread that is
+// also feeding playback, puts the writeback of the whole system behind a card
+// that is bad at it. The ceiling already bounds the directory, one track's
+// worth at a time, and clear_on_exit() and the Downloads page still empty it
+// when that is what is wanted.
 // ---------------------------------------------------------------------------
 
 static pthread_mutex_t keep_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -931,7 +988,6 @@ static int protected_count;
 #define RECENT_MAX 8
 static char recent_paths[RECENT_MAX][512];
 static int recent_next;
-static int played_since_clear;
 
 void yandexcache_set_protected(const char *const *paths, int count) {
 	pthread_mutex_lock(&keep_lock);
@@ -1027,6 +1083,7 @@ static void prune(long room) {
 	}
 	long total;
 	int count = scan(entries, PRUNE_MAX_ENTRIES, &total, is_kept_stem);
+	bool announced = false;
 	for (int i = 0; i < count && total + room > YANDEXCACHE_MAX_BYTES; i++) {
 		int oldest = i;
 		for (int k = i + 1; k < count; k++) {
@@ -1040,6 +1097,11 @@ static void prune(long room) {
 		char path[640];
 		snprintf(path, sizeof(path), "%s/%s", cache_dir, entries[i].name);
 		if (remove(path) == 0) {
+			if (!announced) {
+				announced = true;
+				printf("yandexcache: %ld MB over the %ld MB ceiling, the oldest tracks go\n",
+					   (total + room - YANDEXCACHE_MAX_BYTES) / (1024 * 1024), YANDEXCACHE_MAX_BYTES / (1024 * 1024));
+			}
 			total -= entries[i].size;
 			printf("yandexcache: removed %s (%ld KB)\n", entries[i].name, entries[i].size / 1024);
 		}
@@ -1074,15 +1136,7 @@ void yandexcache_note_played(const char *path) {
 	pthread_mutex_lock(&keep_lock);
 	snprintf(recent_paths[recent_next], sizeof(recent_paths[0]), "%s", path);
 	recent_next = (recent_next + 1) % RECENT_MAX;
-	bool sweep = ++played_since_clear >= YANDEXCACHE_CLEAR_EVERY;
-	if (sweep) {
-		played_since_clear = 0;
-	}
 	pthread_mutex_unlock(&keep_lock);
-	if (sweep) {
-		printf("yandexcache: %d tracks since the last sweep, cleaning up\n", YANDEXCACHE_CLEAR_EVERY);
-		clear_files(is_kept_stem);
-	}
 }
 
 // What a clear the user asks for spares: only the file coming down right now.
@@ -1143,7 +1197,6 @@ bool yandexcache_stop(void) {
 	memset(protected_paths, 0, sizeof(protected_paths));
 	memset(recent_paths, 0, sizeof(recent_paths));
 	recent_next = 0;
-	played_since_clear = 0;
 	pthread_mutex_unlock(&keep_lock);
 	return safe;
 }

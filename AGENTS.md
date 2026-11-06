@@ -50,6 +50,13 @@ add an addon to the whitelist without a device run to point at — `docs/ADDONS.
   player's `device_config.ini`.
 - The tile icon is `icon.png` next to `addon.json`, 74 px box (SC(111)) on this
   panel; `tools/make_icon.py` draws one in the player's style.
+- **A download cache paces its writes to the card.** 25–45 MB written at network
+  speed (2–4 MB/s) makes this device's card time out (`jzmmc … 3000ms`, then
+  `end_request: I/O error`), and the whole player — interface, log, library
+  journal — goes into `D` state behind it; that is what the "hangs after a few
+  tracks" reports are. `pace_to_card()` in `yandexcache.c` is the reference,
+  1 MB/s. Do not add a sweep that deletes the cache in bursts, and do not add
+  fsync loops. `docs/ADDONS.md`, "The card is the slowest thing in the player".
 - `spotify/engine-mips/` is a Rust crate whose device build needs its own docker
   image (`spotify/engine-mips/docker/`: musl cross compiler, pinned nightly), not
   the player's; its `target/` is not in git

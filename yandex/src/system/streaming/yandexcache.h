@@ -105,14 +105,21 @@ bool yandexcache_network_wanted(void);
 // --- keeping it in bounds: the Qobuz policy (qobuzcache.h) ---------------
 
 // The ceiling, the free space a new download makes sure of first, and how
-// many tracks between sweeps.
-#define YANDEXCACHE_MAX_BYTES (1024L * 1024L * 1024L)
-#define YANDEXCACHE_PRUNE_HEADROOM (96L * 1024 * 1024)
-#define YANDEXCACHE_CLEAR_EVERY 10
+// many tracks between sweeps (0 = no periodic sweep, see yandexcache.c).
+//
+// 150 MB with no headroom, for the device test of the deletion path: the cache
+// fills to the ceiling after a handful of lossless tracks, and from then on
+// every new track's download start deletes the oldest track still on the card
+// -- one track's worth at a time, the way the sweep used to do it in a burst.
+// Restore 1 GB / 96 MB with the sweep back at 0 when the test is over.
+#define YANDEXCACHE_MAX_BYTES (150L * 1024 * 1024)
+#define YANDEXCACHE_PRUNE_HEADROOM 0L
+#define YANDEXCACHE_CLEAR_EVERY 0
 #define YANDEXCACHE_PROTECTED_MAX 64
 
-// Every track fetched, with its path: counts towards the next sweep and is
-// spared by it for a while (the queue may not know about it yet).
+// Every track fetched, with its path: spared by the ceiling's prune for a
+// while (the queue may not know about it yet). Also the place a periodic sweep
+// would be counted, were one wanted -- see YANDEXCACHE_CLEAR_EVERY.
 void yandexcache_note_played(const char *path);
 // The tracks the queue still expects: the current one and those after it. The
 // sweep and the ceiling skip them. GUI thread.

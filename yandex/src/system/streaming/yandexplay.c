@@ -102,15 +102,24 @@ bool yandexplay_peek_metadata(const char *path, song_metadata_t *out) {
 
 // The file a track plays from: the saved one when the index has it and it can
 // be read; else the cache's -- under its real name when it is complete and
-// `look` (a stat per extension, so only for the few that matter now), a
-// guess at ".flac" otherwise, put right when it is fetched
+// `look` (a stat per extension, so only for the few that matter now), a guess
+// under `guess_ext` otherwise, put right when it is fetched
 // (yandex_playlist_replace_path). True for a saved file.
+//
+// The guess used to be ".flac" always, and every non-FLAC download then had to
+// have its name replaced in the player's queue -- a full rebuild of the whole
+// queue, on the GUI thread, once per track. Learning the extension from the
+// first get-file-info makes the guess the file's real name for an account whose
+// catalogue answers with one codec, and the replacement then costs one strcmp.
+// Mixed catalogues still fall back to the replacement, for that track only.
+static char guess_ext[8] = "flac";
+
 static bool track_path_known(const char *id, bool look, bool any_saved, char *out, size_t size) {
 	if (any_saved && yandexsaved_has(id) && yandexsaved_local(id, out, size)) {
 		return true;
 	}
 	if (!look || !yandexcache_find(id, out, size)) {
-		yandexcache_path(id, "flac", out, size);
+		yandexcache_path(id, guess_ext, out, size);
 	}
 	return false;
 }
@@ -256,7 +265,8 @@ typedef struct {
 	bool ok;
 	bool waiting;
 	char id[YANDEX_ID_MAX];
-	char path[512];
+	char path[512]; // the file fetched, or the path the metadata was asked for
+	char want[512]; // the queue entry the fetch was asked for (see fetch_done_async)
 	char error[256];
 } job_result_t;
 
@@ -292,12 +302,15 @@ static bool fetch_track(const yandex_track_t *t, char *path, size_t size, char *
 		streamerr_describe("yandex", yandex_last_error(), error, error_size);
 		return false;
 	}
+	// What the rest of the queue should guess: the same account and quality
+	// answer with one codec for almost every track.
+	snprintf(guess_ext, sizeof(guess_ext), "%s", yandexcache_extension(file.codec));
 	if (!yandexcache_start(t, &file, path, size)) {
 		streamerr_describe("yandex", yandexcache_last_error(), error, error_size);
 		return false;
 	}
 	yandexcache_write_sidecars(t, path);
-	// Counts towards the next sweep and is spared by it until the queue knows.
+	// Spared by the ceiling's prune until the queue knows about it.
 	yandexcache_note_played(path);
 	return true;
 }
@@ -376,6 +389,12 @@ static void *worker_main(void *arg) {
 			snprintf(r->path, sizeof(r->path), "%s", job.path);
 			r->ok = t.title[0] != '\0';
 		} else {
+			// The queue entry the caller asked about: the fetch replaces that
+			// one, not "the name this id would have had a moment ago". A queue
+			// built with a different guess (another codec, another run) would
+			// otherwise keep a name that never exists, and playback would ask
+			// for the same track again, forever.
+			snprintf(r->want, sizeof(r->want), "%s", job.path);
 			r->ok = fetch_track(&t, r->path, sizeof(r->path), r->error, sizeof(r->error));
 		}
 		if (!r->ok && job.kind != JOB_METADATA) {
@@ -631,15 +650,22 @@ static void fetch_done_async(void *user) {
 		free(r);
 		return;
 	}
-	char guess[512], now[YANDEX_ID_MAX];
+	char now[YANDEX_ID_MAX];
 	current_id(now, sizeof(now));
 	bool waited_for = strcmp(now, r->id) == 0 && r->sleep_serial == yandex_sleeptimer_expiration_serial();
 	device_state_t state;
 	device_state_get(&state);
 	if (r->ok) {
 		bool was_ours = queue_is_ours();
-		yandexcache_path(r->id, "flac", guess, sizeof(guess));
-		if (yandex_playlist_replace_path(guess, r->path) > 0) {
+		// The entry asked about is the one to rename. Falling back to the
+		// current guess covers a fetch submitted without a path.
+		char guess[512];
+		const char *old_name = r->want[0] ? r->want : NULL;
+		if (!old_name) {
+			yandexcache_path(r->id, guess_ext, guess, sizeof(guess));
+			old_name = guess;
+		}
+		if (yandex_playlist_replace_path(old_name, r->path) > 0) {
 			note_own_change(was_ours);
 		}
 		yandex_device_state_note_metadata_available(r->path);
@@ -703,7 +729,7 @@ static void fetch_ahead(void) {
 		return; // another queue's entry, or one the player kept over a restart: fetched when reached
 	}
 	yandexcache_set_network_wanted(true);
-	submit(JOB_FETCH, id, false, NULL);
+	submit(JOB_FETCH, id, false, path);
 }
 
 // ---------------------------------------------------------------------------
@@ -818,7 +844,7 @@ bool yandexplay_prepare_track(const char *path) {
 	// yandexcache_network_wanted().
 	yandexcache_set_network_wanted(true);
 	device_state_stop();
-	submit(JOB_FETCH, id, true, NULL);
+	submit(JOB_FETCH, id, true, path);
 	gui_post(downloading_note_async, NULL);
 	return false;
 }
@@ -956,6 +982,7 @@ bool yandexplay_stop(void) {
 	ours_revision = 0;
 	metadata_requested[0] = '\0';
 	metadata_requested_generation = 0;
+	snprintf(guess_ext, sizeof(guess_ext), "%s", "flac"); // learned again from the first file-info
 	running_kind = JOB_NONE;
 	running_id[0] = '\0';
 	worker_started = false; // it has returned: the next init() starts a fresh one
