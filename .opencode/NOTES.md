@@ -62,6 +62,14 @@ went to the card at network speed (a 39 MB track reported 2035 KB/s against a
 1024 KB/s limit). `common/cardpace.c` now uses `long long`, and a real qobuz
 download reports exactly 1023 KB/s.
 
+**Verified on the device, 2026-11-07 02:23–02:39:** fifteen minutes of 96/24
+playback, six track changes and five complete downloads (73, 45, 72, 54 and
+105 s, every one `1023 KB/s`, about 350 MB written) with
+`dmesg | grep -c "timeout 3000ms"` staying at 5 and
+`grep -c "write error"` staying at 94 — not one stall, every stats line
+`0 write recoveries`. So the fix holds; the single timeout seen at 01:19:15 was
+before this and has not come back.
+
 The download writes a 25–45 MB lossless track as fast as the network gives it
 (2–4 MB/s of dirty pages); with `MemFree` around 1 MB the kernel throttles the
 writer, every `fsync` in the player waits for the pages, and a read that lands
