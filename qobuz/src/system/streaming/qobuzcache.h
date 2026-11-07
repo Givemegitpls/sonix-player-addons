@@ -169,18 +169,19 @@ const char *qobuzcache_last_error(void);
 // database.
 long qobuzcache_track_id(const char *path);
 
-// How many tracks between automatic cache sweeps. Ten is about three quarters
-// of an hour of listening: enough not to re-download constantly, small enough
-// not to leave half the card occupied by transient files.
-#define QOBUZCACHE_CLEAR_EVERY 10
+// How many tracks between automatic cache sweeps. 0 = no periodic sweep: the
+// ceiling's prune deletes one track's worth when the ceiling is actually
+// reached, which is the same bytes spread over the tracks that make them, and
+// the shutdown clear and the Downloads page still empty the directory on
+// request. Deleting tens of megabytes in one burst, from the thread that also
+// feeds playback, is what puts this device's card (jzmmc) into its 3 s timeouts.
+#define QOBUZCACHE_CLEAR_EVERY 0
 
-// Call for every track that enters the cache, with its path. Sweeps every
-// QOBUZCACHE_CLEAR_EVERY calls.
-//
-// The path serves two purposes: counting, and keeping a ring of recently
-// downloaded files. Those are never dropped, because an instant passes between
-// the download and the track appearing in the queue, and in that instant a
-// sweep would have deleted them, stopping playback at the following track.
+// Call for every track that enters the cache, with its path. Keeps a ring of
+// recently downloaded files; those are never dropped by the ceiling's prune,
+// because an instant passes between the download and the track appearing in the
+// queue, and in that instant a prune would have deleted them, stopping playback
+// at the following track.
 void qobuzcache_note_played(const char *path);
 
 // How many paths can be protected from the automatic sweep.

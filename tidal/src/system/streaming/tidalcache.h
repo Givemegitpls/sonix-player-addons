@@ -158,10 +158,15 @@ const char *tidalcache_last_error(void);
 // playlists reach the account, and the Tidal badge appear on the cover.
 long tidalcache_track_id(const char *path);
 
-// How many tracks between automatic cache sweeps.
-#define TIDALCACHE_CLEAR_EVERY 10
+// How many tracks between automatic cache sweeps. 0 = none: the ceiling's prune
+// deletes one track at a time when the ceiling is reached, and the shutdown
+// clear and the Downloads page still empty the directory on request. A burst of
+// tens of megabytes from the thread that also feeds playback is what puts this
+// device's card (jzmmc) into its 3 s timeouts.
+#define TIDALCACHE_CLEAR_EVERY 0
 
-// Call for every track that enters the cache, with its path.
+// Call for every track that enters the cache, with its path: it keeps the ring
+// of recently downloaded files, which the ceiling's prune spares.
 void tidalcache_note_played(const char *path);
 
 #define TIDALCACHE_PROTECTED_MAX 64

@@ -70,6 +70,19 @@ playback, six track changes and five complete downloads (73, 45, 72, 54 and
 `0 write recoveries`. So the fix holds; the single timeout seen at 01:19:15 was
 before this and has not come back.
 
+**The other sweep.** Qobuz still ran the "clear the whole cache every ten
+tracks" pass, and the log caught it in the act on 2026-11-07:
+`02:46:27 qobuzcache: 10 tracks since the last sweep, cleaning up` followed by
+`cleared (15 files)` — tens of megabytes deleted in one burst, from the thread
+that also feeds playback, while the next track was downloading. That is exactly
+what was removed from the Yandex cache. `QOBUZCACHE_CLEAR_EVERY`,
+`TIDALCACHE_CLEAR_EVERY`, `ZVUKCACHE_CLEAR_EVERY` and `SUBSONICACHE_CLEAR_EVERY`
+are now 0 too; the ceiling's prune, `clear()` and `clear_on_exit()` are
+untouched. A `jzmmc` timeout at 02:44 happened with no download running at all
+(previous one finished at 02:42:36, the next started at 02:46:25), which is the
+same story from the other side: the card stalls on something other than the
+addon's writes.
+
 The download writes a 25–45 MB lossless track as fast as the network gives it
 (2–4 MB/s of dirty pages); with `MemFree` around 1 MB the kernel throttles the
 writer, every `fsync` in the player waits for the pages, and a read that lands

@@ -643,11 +643,15 @@ The rule that follows:
   saves) is paced; qobuz, tidal, zvuk and subsonic call it from their own write
   choke points.
 - **Never delete tens of megabytes in one go while something plays.** That is
-  why the periodic "clear the whole cache every N tracks" sweep was removed
-  (`YANDEXCACHE_CLEAR_EVERY 0`): the ceiling's `prune()` deletes one track's
-  worth when the ceiling is actually reached, which is the same bytes spread
-  over the tracks that make them. A user-requested clear or the shutdown clear
-  is fine — nothing is playing then.
+  why the periodic "clear the whole cache every N tracks" sweep is off in every
+  cache (`YANDEXCACHE_CLEAR_EVERY`, `QOBUZCACHE_CLEAR_EVERY`,
+  `TIDALCACHE_CLEAR_EVERY`, `ZVUKCACHE_CLEAR_EVERY`, `SUBSONICCACHE_CLEAR_EVERY`
+  are all 0): the ceiling's `prune()` deletes one track's worth when the ceiling
+  is actually reached, which is the same bytes spread over the tracks that make
+  them. A user-requested clear or the shutdown clear is fine — nothing is
+  playing then. The evidence is a Qobuz log line from 2026-11-07:
+  `10 tracks since the last sweep, cleaning up` → `cleared (15 files)` while the
+  next track was downloading.
 - **Do not add fsync loops.** One `fsync` per file at the end of a write is
   what the addons' stores do; an fsync per chunk, or a synchronous file write
   per second, is the same problem from the other side.

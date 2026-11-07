@@ -31,9 +31,13 @@
 // Thread contract: zvukcache_start() blocks for the prebuffer and must run
 // on a worker thread; the rest is cheap and callable from anywhere.
 
+// The ceiling, the free space a new download makes sure of first, and how many
+// tracks between sweeps (0 = no periodic sweep, on purpose: the ceiling prunes
+// one track at a time, and a burst of tens of megabytes from the thread that
+// also feeds playback is what puts this device's card into its 3 s timeouts).
 #define ZVUKCACHE_MAX_BYTES (1024L * 1024L * 1024L)
 #define ZVUKCACHE_PRUNE_HEADROOM (96L * 1024 * 1024)
-#define ZVUKCACHE_CLEAR_EVERY 10
+#define ZVUKCACHE_CLEAR_EVERY 0
 #define ZVUKCACHE_PROTECTED_MAX 64
 
 // The cache's directory, "<addon>/cache", as addon_cache_dir() made it. NULL or

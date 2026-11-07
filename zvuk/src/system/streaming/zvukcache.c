@@ -859,7 +859,6 @@ static int protected_count;
 #define RECENT_MAX 8
 static char recent_paths[RECENT_MAX][512];
 static int recent_next;
-static int played_since_clear;
 
 void zvukcache_set_protected(const char *const *paths, int count) {
 	pthread_mutex_lock(&keep_lock);
@@ -992,14 +991,7 @@ void zvukcache_note_played(const char *path) {
 	pthread_mutex_lock(&keep_lock);
 	snprintf(recent_paths[recent_next], sizeof(recent_paths[0]), "%s", path);
 	recent_next = (recent_next + 1) % RECENT_MAX;
-	bool sweep = ++played_since_clear >= ZVUKCACHE_CLEAR_EVERY;
-	if (sweep) {
-		played_since_clear = 0;
-	}
 	pthread_mutex_unlock(&keep_lock);
-	if (sweep) {
-		clear_files(is_kept_stem);
-	}
 }
 
 static bool is_growing_stem(const char *stem) { return growfile_prefix_is_growing(stem); }
@@ -1154,7 +1146,6 @@ bool zvukcache_stop(void) {
 	pthread_mutex_lock(&keep_lock);
 	protected_count = 0;
 	recent_next = 0;
-	played_since_clear = 0;
 	pthread_mutex_unlock(&keep_lock);
 	return true;
 }

@@ -407,17 +407,21 @@ void qobuzcache_clear(void) { clear_files(false); }
 //
 // The cache is a waypoint, not a library. Keeping everything ever listened to
 // fills the user's card with files they did not put there and will never see
-// (it lives in a hidden directory), and the one-gigabyte ceiling alone is not
-// enough: it is reached and then stays reached.
+// (it lives in a hidden directory), so it is held under QOBUZCACHE_MAX_BYTES
+// and emptied on the way out. Whatever is coming down at that moment is spared,
+// otherwise the clear would delete the track being played.
 //
-// So there are two moments: every QOBUZCACHE_CLEAR_EVERY tracks started, and
-// at program exit (which on this device means shutdown or restart --
-// /usr/bin/hiby_player.sh restarts as soon as the process exits). Whatever is
-// coming down at that moment is spared, otherwise the clear would delete the
-// track being played.
+// There used to be a sweep here as well -- the whole cache cleared every
+// QOBUZCACHE_CLEAR_EVERY tracks -- and it is off (0) now, on purpose. This
+// device has about a megabyte of free RAM and a card whose writes can take
+// seconds: deleting tens of megabytes in one burst, from the thread that is
+// also feeding playback, puts the writeback of the whole system behind a card
+// that is bad at it. The ceiling already bounds the directory, one track's
+// worth at a time, and clear_on_exit() and the Downloads page still empty it
+// when that is what is wanted. The same decision was taken for the Yandex cache
+// (yandexcache.c) after "cleared (15 files)" was seen in a log while a download
+// was running.
 // ---------------------------------------------------------------------------
-
-static int played_since_clear;
 
 // Ring of the most recently downloaded tracks. Deliberately small: it is a
 // safety net for the window between "the file exists" and "the queue knows
@@ -449,14 +453,6 @@ void qobuzcache_note_played(const char *path) {
 		recent_next = (recent_next + 1) % RECENT_MAX;
 		pthread_mutex_unlock(&recent_lock);
 	}
-
-	played_since_clear++;
-	if (played_since_clear < QOBUZCACHE_CLEAR_EVERY) {
-		return;
-	}
-	played_since_clear = 0;
-	printf("qobuzcache: %d tracks since the last sweep, cleaning up\n", QOBUZCACHE_CLEAR_EVERY);
-	clear_files(true);
 }
 
 void qobuzcache_clear_on_exit(void) {
@@ -1084,7 +1080,6 @@ bool qobuzcache_stop(void) {
 	memset(recent_paths, 0, sizeof(recent_paths));
 	recent_next = 0;
 	pthread_mutex_unlock(&recent_lock);
-	played_since_clear = 0;
 
 	network_wanted = false;
 

@@ -417,9 +417,14 @@ void tidalcache_clear(void) { clear_files(false); }
 
 // ---------------------------------------------------------------------------
 // the periodic clear
+//
+// Off (TIDALCACHE_CLEAR_EVERY 0), on purpose: the ceiling's prune deletes one
+// track's worth when the ceiling is reached, the shutdown clear and the
+// Downloads page still empty the directory on request, and a burst of tens of
+// megabytes from the thread that also feeds playback is what puts this device's
+// card (jzmmc) into its 3 s timeouts. Same decision as the Yandex and Qobuz
+// caches.
 // ---------------------------------------------------------------------------
-
-static int played_since_clear;
 
 #define RECENT_MAX 8
 static pthread_mutex_t recent_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -448,14 +453,6 @@ void tidalcache_note_played(const char *path) {
 		recent_next = (recent_next + 1) % RECENT_MAX;
 		pthread_mutex_unlock(&recent_lock);
 	}
-
-	played_since_clear++;
-	if (played_since_clear < TIDALCACHE_CLEAR_EVERY) {
-		return;
-	}
-	played_since_clear = 0;
-	printf("tidalcache: %d tracks since the last sweep, cleaning up\n", TIDALCACHE_CLEAR_EVERY);
-	clear_files(true);
 }
 
 void tidalcache_clear_on_exit(void) {
