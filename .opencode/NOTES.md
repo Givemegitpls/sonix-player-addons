@@ -181,7 +181,7 @@ it keyed on `sonix-player/sonix-player/docker/Dockerfile` + `rockboxdev/**`.
 - `docs/SETUP.md` is the user-facing side (install + per-service sign-in),
   bilingual: every section is English first, then the same in Russian. Keep the
   two halves in step; `docs/ADDONS.md` stays English and is for internals.
-- Release zips are `qobuz subsonic yandex gearboy flappybird dino`; `hello` is
+- Release zips are `qobuz subsonic yandex gearboy flappybird dino cassette`; `hello` is
   built by CI but `PACK_EXCLUDE ?= hello` keeps it out of `build/Addons`, so
   there is no `hello.zip`. The archive holds the addon folder's contents at its
   root (`addon.json`, `addon.so`, `icon.png`, optional `assets/`).
@@ -280,3 +280,85 @@ it keyed on `sonix-player/sonix-player/docker/Dockerfile` + `rockboxdev/**`.
   64 KB then 20 ms) and logs `complete (N bytes, M ms of card pacing)`.
 - A `MemFree` of ~1 MB is normal here (MemTotal 57816 kB) and is not by itself
   evidence of a leak; check `available` in the audio profile lines instead.
+
+## The simulator as an addon test bench (2026-11-08)
+
+- Run: `SDL_VIDEODRIVER=offscreen SONIX_SD_ROOT=<card> SONIX_PANEL=320x480
+  SONIX_CONFIG=<card>/device_config.ini ./sonix_player_host` from the player
+  tree. Addons are read from `<card>/Addons/<id>/` and must be the **host**
+  build (`make host`). Touches go in as `printf 'x y' > /tmp/sonix/tap` (or
+  `drag x1 y1 x2 y2`), screenshots come back in `<card>/Screenshots/` after
+  `touch /tmp/sonix/shot`.
+- Put `[power]\nscreen_off_seconds = 0` in the config: the panel blanks after
+  30 s and the first tap after that only wakes it, which looks like "input does
+  not work".
+- The date/time setup is shown on every run (the clock cannot be set without
+  permission, so it never counts as set): drag up on the right edge, then
+  `160 450` confirms.
+- **Reloading an addon crashes the host build.** `addon: <id> changed on the
+  card, reloading` is followed by `SIGSEGV` — reproduced with `hello`, so it is
+  the player's dlclose path, not the addon. Copy a new `.so` and restart the
+  player instead of re-tapping the tile.
+- The card is reported read-only when `/mnt/sd_0` is not a real mount, and then
+  the library scan finds nothing (`0 tracks indexed`) — the file browser still
+  browses `<card>`, but a row tap does not start playback, so "the addon with a
+  track playing" cannot be checked this way.
+- `LV_USE_LINE` is 0 in the player's `lv_conf.h`: `lv_line_*` does not exist in
+  the build (and is not exported). Animate with plain objects (positions/sizes)
+  or a static transform; a transform layer per frame is too much for this CPU.
+- `stop()` runs **before** the shell deletes the addon's screens, so a FreeType
+  face created by the addon must be handed back with
+  `lv_obj_set_style_text_font(obj, &font_ui_XX, 0)` before
+  `lv_freetype_font_delete()`; otherwise LVGL touches a freed face while the
+  page is torn down.
+- The host build has no usable ALSA output here (`default` resolves to dmix and
+  fails: `snd_pcm_dmix_open: unable to open slave`), so every track "ends" the
+  moment it starts and `device_state` comes back STOPPED with no file. An addon
+  that animates "only while playing" therefore looks frozen in the simulator;
+  the cassette addon spins while `status != PAUSED` for exactly that reason.
+
+## The cassette addon draws the owner's Blender render (2026-11-08)
+
+- The design comes from a flat Blender render at **480x320**, and the page is
+  that drawing turned 90° clockwise to fill the 320x480 panel. So the render's
+  numbers are used as they are: `lrect()`/`lcircle()` in `cassette/cpage.c` do
+  the turn (`px = 320 - (ly + lh), py = lx`), and nothing in the file is in
+  panel coordinates that came from the drawing.
+- `tools/svg_to_lvgl_image.py` turns one of the drawing's SVG layers into an
+  `lv_image_dsc_t` compiled into the addon (ARGB8888, **B,G,R,A** byte order on
+  little-endian — getting that wrong draws a coloured square). The hub is such
+  a layer and is rotated at run time with `lv_image_set_rotation` (50-60 px, so
+  the transform layer is cheap); the window and the plate are 1:1 crops of the
+  render, pre-rotated in the generator, with the shell colour made transparent.
+- The shell itself stays an object: it has to take the sleeve's colour. Its
+  radius is 20 (drawing units, `SC(20)` on the panel), the drawing's outer edge
+  is `10,20 → 469,300`. The page behind it is black.
+- The label (`33,47 → 446,217`) is square at one end and **chamfered 22.5 px at
+  the other**; LVGL has no polygon, so two diamonds of the shell's colour cover
+  the corners, and they are repainted with the palette.
+- The baked reflection is a white image whose alpha is how much the render lifts
+  the shell (`(px - shell) / (255 - shell)`, only the paper excluded). It is very
+  subtle by nature: ~13 % at the strongest.
+- Cost of doing it this way: the addon's `.so` is ~930 KB, most of it the
+  full-screen reflection and the plate crop. On the card that is free; if RAM
+  ever matters, the reflection can go and nothing else changes.
+
+## Cassette addon: sprites instead of compiled images (2026-11-09)
+
+- The owner draws the cassette in Blender and exports both layers (SVG/PNG) and a
+  flat render. `tools/addon_assets.py` turns those into five PNGs in
+  `cassette/assets/`, already **turned to the page** (the drawing is 480x320, the
+  page is that rotated clockwise): `hub` (from `tape_roller.svg`, 59 px),
+  `window` and `plate` (crops of the render), `sticker` and `reflection` (his own
+  PNGs). The `.so` is 48 KB and the sprites are decoded once at init with
+  `stbi_load_from_memory` (exported) into `LV_COLOR_FORMAT_ARGB8888`.
+- stb hands back R,G,B,A and LVGL wants **B,G,R,A** on this machine; the loader in
+  `cpage.c` swizzles, and the pixels are freed in `stop()`.
+- Colours come from the player, not from a sampler of our own:
+  `cover_page_tone()` + `cover_tone_stretched()` on the buffer the player already
+  has. Nothing is mixed into the hue; only brightness is capped --
+  `BODY_MAX_VALUE 0.50` and `BODY_MAX_LUMA 120` (the paper label is ~194, and a
+  shell as bright as the label reads as glowing on this panel).
+- Crops of the render carry the shell's colour at their edges; when a crop must
+  show only its dark parts, drop the pixels that are blue-ish (`b - r > 18`) as
+  well as the bright ones, or a cyan fringe shows around the holes.

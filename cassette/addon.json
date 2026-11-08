@@ -1,0 +1,9 @@
+{
+	"api": 1,
+	"title": "Cassette",
+	"titles": { "Russian": "Кассета", "Italiano": "Cassetta" },
+	"section": "more",
+	"order": 8,
+	"version": "0.1",
+	"icon": "icon.png"
+}

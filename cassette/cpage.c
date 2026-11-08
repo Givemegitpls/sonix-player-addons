@@ -1,0 +1,716 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "src/system/image/stb_image_decl.h"
+
+#include "cpage.h"
+
+// The owner's drawing, as sprites on the card (tools/addon_assets.py writes
+// them already turned to the page). They are decoded once, at init, into ARGB
+// images the page keeps for as long as it is open.
+static lv_image_dsc_t spr_hub, spr_window, spr_plate, spr_sticker, spr_reflection;
+static void *spr_pixels[5];
+
+static bool sprite_load(const char *dir, const char *name, lv_image_dsc_t *dsc, void **keep) {
+	char path[512];
+	snprintf(path, sizeof(path), "%s/assets/%s", dir, name);
+	FILE *f = fopen(path, "rb");
+	if (f == NULL) {
+		return false;
+	}
+	fseek(f, 0, SEEK_END);
+	long len = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	if (len <= 0) {
+		fclose(f);
+		return false;
+	}
+	uint8_t *buf = malloc((size_t)len);
+	if (buf == NULL || fread(buf, 1, (size_t)len, f) != (size_t)len) {
+		free(buf);
+		fclose(f);
+		return false;
+	}
+	fclose(f);
+
+	int w = 0, h = 0, n = 0;
+	uint8_t *px = stbi_load_from_memory(buf, (int)len, &w, &h, &n, 4);
+	free(buf);
+	if (px == NULL || w <= 0 || h <= 0) {
+		stbi_image_free(px);
+		return false;
+	}
+	// stb gives R,G,B,A; LVGL's ARGB8888 is B,G,R,A on this machine.
+	for (int i = 0; i < w * h; i++) {
+		uint8_t r = px[i * 4 + 0], g = px[i * 4 + 1], b = px[i * 4 + 2];
+		px[i * 4 + 0] = b;
+		px[i * 4 + 1] = g;
+		px[i * 4 + 2] = r;
+	}
+
+	memset(dsc, 0, sizeof(*dsc));
+	dsc->header.magic = LV_IMAGE_HEADER_MAGIC;
+	dsc->header.cf = LV_COLOR_FORMAT_ARGB8888;
+	dsc->header.w = (uint32_t)w;
+	dsc->header.h = (uint32_t)h;
+	dsc->header.stride = (uint32_t)w * 4;
+	dsc->data = px;
+	dsc->data_size = (uint32_t)(w * h * 4);
+	*keep = px;
+	return true;
+}
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "cpal.h"
+
+#include "src/system/image/stb_image_decl.h"
+
+#include "src/gui/nowplaying/player.h"
+#include "src/gui/fonts/fonts.h"
+#include "src/gui/shell/scale.h"
+#include "src/gui/shell/switcher.h"
+#include "src/gui/shell/topbar.h"
+#include "src/system/library/metadata.h"
+#include "src/system/playback/device_state.h"
+#include "src/system/device/power.h"
+
+#include "lvgl/lvgl.h"
+
+// ---------------------------------------------------------------------------
+// The page
+// ---------------------------------------------------------------------------
+//
+// One cassette, filling the panel, and nothing else on it: no title row, no
+// status bar, no chevron, no time readout. The tape itself is the interface --
+// the hubs turn while something is playing and stand still when it is paused,
+// and the wound tape moves from the supply hub to the take-up hub as the track
+// runs. A tap is play/pause, up and down are the next and the previous track,
+// and a rightward swipe goes back (see the gestures below).
+//
+// The cassette lies on its side: turned ninety degrees, so its long axis is the
+// panel's, which is the only way it fills a portrait screen. The label then runs
+// down one edge with its writing turned with it, exactly as it would be on a
+// cassette standing on its short end -- the reference the owner picked.
+//
+// Everything the page draws is a handful of LVGL objects whose colours are set
+// once per track: only the six studs of each hub are moved on every frame,
+// which is what keeps this affordable on a MIPS without a GPU.
+
+// Font faces, in panel pixels. The label is written on by hand, so it is
+// Caveat, brought in the addon's assets/; the player's own face stands in when
+// the file is not there (a card with the library only).
+#define FONT_FILE "assets/Caveat.ttf"
+
+// One step per LVGL refresh pass (LV_DEF_REFR_PERIOD is 16 ms here): the hubs
+// are moved by how much time has passed, not by a fixed angle, so a late timer
+// is a slightly longer step rather than a stutter.
+#define ANIM_PERIOD_MS 16
+#define ANIM_DEG_PER_S 120.0f
+#define POLL_PERIOD_MS 500
+
+// The gesture thresholds, in panel pixels and milliseconds.
+#define SWIPE_MIN (SC(42))
+#define SWIPE_RATIO 1.25f
+#define TAP_SLOP (SC(20))
+#define TAP_MS 600
+
+#define DEG2RAD 0.017453292f
+
+typedef struct {
+	lv_obj_t *image; // the hub, from the owner's drawing (assets/hub.c)
+	int32_t cx, cy;
+	int32_t r;
+} reel_t;
+
+static void reel_turn(reel_t *r, float deg);
+
+static const gui_config_t *cfg;
+static lv_obj_t *screen;
+static lv_obj_t *body;
+static lv_obj_t *shell;
+static lv_obj_t *panel;
+static lv_obj_t *label_panel;
+static lv_obj_t *label_block;
+static lv_obj_t *artist_label;
+static lv_obj_t *note_label;
+static lv_obj_t *head_strip;
+static lv_obj_t *insert_strip;
+static lv_obj_t *screws[4];
+static reel_t reels[2];
+
+static lv_font_t *font_artist;
+static lv_font_t *font_note;
+static bool font_artist_owned;
+static bool font_note_owned;
+
+static lv_timer_t *anim_timer;
+static lv_timer_t *poll_timer;
+
+static cpal_t pal;
+
+static float angle_deg;
+static uint32_t anim_last_ms;
+
+// What the page is showing, so a poll can tell whether anything changed.
+static char shown_key[520];
+static const void *shown_cover;
+static bool shown_playing;
+static bool shown_live;
+
+static void apply_palette(void);
+
+// ---------------------------------------------------------------------------
+// the cassette
+// ---------------------------------------------------------------------------
+
+static lv_obj_t *circle(lv_obj_t *parent, int32_t d, lv_color_t fill, int32_t border) {
+	lv_obj_t *o = lv_obj_create(parent);
+	lv_obj_remove_style_all(o);
+	lv_obj_set_size(o, d, d);
+	lv_obj_set_style_radius(o, LV_RADIUS_CIRCLE, 0);
+	lv_obj_set_style_bg_color(o, fill, 0);
+	lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+	if (border > 0) {
+		lv_obj_set_style_border_color(o, pal.ink, 0);
+		lv_obj_set_style_border_width(o, border, 0);
+	}
+	lv_obj_set_clickable(o, false);
+	lv_obj_set_scrollable(o, false);
+	return o;
+}
+
+static lv_obj_t *plate(lv_obj_t *parent, lv_color_t fill, int32_t border) {
+	lv_obj_t *o = lv_obj_create(parent);
+	lv_obj_remove_style_all(o);
+	lv_obj_set_style_bg_color(o, fill, 0);
+	lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
+	if (border > 0) {
+		lv_obj_set_style_border_color(o, pal.ink, 0);
+		lv_obj_set_style_border_width(o, border, 0);
+	}
+	lv_obj_set_clickable(o, false);
+	lv_obj_set_scrollable(o, false);
+	return o;
+}
+
+// ---------------------------------------------------------------------------
+// the drawing's coordinates
+// ---------------------------------------------------------------------------
+//
+// The cassette is the owner's flat render, drawn at 480x320, and the page is
+// that drawing turned ninety degrees clockwise to fill the panel (320x480):
+// the render's numbers go in here as they are, and lrect()/lcircle() do the
+// turn. Nothing in this file is in panel coordinates when it came from there.
+
+#define MOCK_H 320
+
+static void lrect(int32_t lx, int32_t ly, int32_t lw, int32_t lh, int32_t *x, int32_t *y, int32_t *w, int32_t *h) {
+	*x = MOCK_H - (ly + lh);
+	*y = lx;
+	*w = lh;
+	*h = lw;
+}
+
+static lv_obj_t *lplate(lv_obj_t *parent, int32_t lx, int32_t ly, int32_t lw, int32_t lh, lv_color_t fill, int32_t radius,
+						int32_t border) {
+	int32_t x, y, w, h;
+	lrect(lx, ly, lw, lh, &x, &y, &w, &h);
+	lv_obj_t *o = plate(parent, fill, border);
+	lv_obj_set_pos(o, x, y);
+	lv_obj_set_size(o, w, h);
+	lv_obj_set_style_radius(o, radius, 0);
+	return o;
+}
+
+static lv_obj_t *lcircle(lv_obj_t *parent, int32_t lcx, int32_t lcy, int32_t r, lv_color_t fill, int32_t border) {
+	lv_obj_t *o = circle(parent, r * 2, fill, border);
+	lv_obj_set_pos(o, MOCK_H - lcy - r, lcx - r);
+	return o;
+}
+
+// One step of the tape: the hub picture turns. It is 50 pixels square, so the
+// transform LVGL spends on it every frame is a fraction of a full-screen one.
+static void reel_turn(reel_t *r, float deg) {
+	if (r->image) {
+		lv_image_set_rotation(r->image, (int32_t)(deg * 10.0f));
+	}
+}
+
+static void build_cassette(void) {
+	int32_t W = (int32_t)cfg->screen_width;
+	int32_t H = (int32_t)cfg->screen_height;
+
+	// The page is black; the cassette is the rounded rectangle of the owner's
+	// body, and everything else sits on it in the drawing's coordinates.
+	body = plate(screen, lv_color_black(), 0);
+	lv_obj_set_pos(body, 0, 0);
+	lv_obj_set_size(body, W, H);
+
+	shell = lplate(body, 10, 20, 459, 279, pal.body, SC(20), 0);
+
+	// The paper label: a long field down one side, the writing turned with it.
+	// The baked reflection, white over the shell's colour: it is the owner's
+	// drawing of the light on the body, and it has to come before everything
+	// that is not the body.
+	lv_obj_t *cast = lv_image_create(body);
+	lv_image_set_src(cast, &spr_reflection);
+	{
+		int32_t x, y, w, h;
+		lrect(94, 224, 291, 67, &x, &y, &w, &h);
+		lv_obj_set_pos(cast, x, y);
+	}
+
+	// The paper label is the owner's sticker, as drawn: chamfers, corners and all.
+	{
+		int32_t x, y, w, h;
+		lrect(32, 47, 415, 170, &x, &y, &w, &h);
+		lv_obj_t *sticker = lv_image_create(body);
+		lv_image_set_src(sticker, &spr_sticker);
+		lv_obj_set_pos(sticker, x, y);
+	}
+
+	// The writing goes on the part of the label the insert does not cover: in
+	// the drawing that is the band left of the strip (33..107 across), which
+	// turns into a horizontal band across the top of the page.
+	int32_t bw = 300;                 // along the label; a wider rotated layer is dropped
+	int32_t bh = 54;                  // across it: the label column left of the insert
+	// Centre of the free column of the label (the insert covers the middle of
+	// it): x 217..273, y 33..446 on the page.
+	label_block = plate(body, pal.label, 0);
+	lv_obj_set_size(label_block, bw, bh);
+	lv_obj_set_pos(label_block, 245 - bw / 2, 239 - bh / 2);
+	lv_obj_set_style_transform_pivot_x(label_block, lv_pct(50), 0);
+	lv_obj_set_style_transform_pivot_y(label_block, lv_pct(50), 0);
+	lv_obj_set_style_transform_rotation(label_block, 900, 0);
+	lv_obj_set_flex_flow(label_block, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_flex_align(label_block, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_style_pad_row(label_block, 0, 0);
+
+	artist_label = lv_label_create(label_block);
+	lv_obj_set_width(artist_label, lv_pct(100));
+	lv_label_set_long_mode(artist_label, LV_LABEL_LONG_WRAP);
+	lv_obj_set_style_text_font(artist_label, font_artist, 0);
+	lv_obj_set_style_text_color(artist_label, pal.ink, 0);
+	lv_obj_set_style_text_align(artist_label, LV_TEXT_ALIGN_CENTER, 0);
+	lv_label_set_text(artist_label, "");
+
+	note_label = lv_label_create(label_block);
+	lv_obj_set_width(note_label, lv_pct(100));
+	lv_label_set_long_mode(note_label, LV_LABEL_LONG_WRAP);
+	lv_obj_set_style_text_font(note_label, font_note, 0);
+	lv_obj_set_style_text_color(note_label, pal.body_dark, 0);
+	lv_obj_set_style_text_align(note_label, LV_TEXT_ALIGN_CENTER, 0);
+	lv_label_set_text(note_label, "");
+
+	// The strip the spools sit in: a lighter cut of the shell's colour.
+	lv_obj_t *insert = lplate(body, 107, 103, 265, 71, pal.body, SC(12), 0);
+	insert_strip = insert;
+	(void)insert;
+
+	// The two spools: the owner's hub drawing turned on top of the reel it
+	// hides, which is black.
+	int32_t r = 30;
+	for (int s = 0; s < 2; s++) {
+		int32_t lcx = s == 0 ? 143 : 336;
+		int32_t lcy = 139;
+		lcircle(body, lcx, lcy, r, pal.panel, 0);
+		int32_t x, y, w, h;
+		lrect(lcx - r, lcy - r, 2 * r, 2 * r, &x, &y, &w, &h);
+		lv_obj_t *hub = lv_image_create(body);
+		lv_image_set_src(hub, &spr_hub);
+		lv_obj_set_pos(hub, x, y);
+		reels[s].image = hub;
+		reels[s].cx = x + w / 2;
+		reels[s].cy = y + h / 2;
+		reels[s].r = r;
+	}
+
+	// The window, with the two bands of tape the head sees, and the plate at
+	// the short end -- both cut from the render, because they are shapes no
+	// rounded rectangle describes.
+	{
+		int32_t x, y, w, h;
+		lrect(195, 114, 90, 50, &x, &y, &w, &h);
+		(void)w;
+		(void)h;
+		lv_obj_t *win = lv_image_create(body);
+		lv_image_set_src(win, &spr_window);
+		lv_obj_set_pos(win, x, y);
+
+		lrect(88, 216, 304, 84, &x, &y, &w, &h);
+		lv_obj_t *plate_img = lv_image_create(body);
+		lv_image_set_src(plate_img, &spr_plate);
+		lv_obj_set_pos(plate_img, x, y);
+	}
+
+	// Screws in the corners.
+	// The screws are hardware, not artwork: one fixed dark grey, whatever the
+	// sleeve does to the shell around them.
+	const int32_t screw_at[4][2] = {{28, 38}, {452, 38}, {28, 282}, {452, 282}};
+	for (int i = 0; i < 4; i++) {
+		screws[i] = lcircle(body, screw_at[i][0], screw_at[i][1], 7, lv_color_make(0x4a, 0x4a, 0x4a), 0);
+	}
+}
+
+static void apply_palette(void) {
+	if (body == NULL) {
+		return;
+	}
+	lv_obj_set_style_bg_color(screen, pal.bg, 0);
+	lv_obj_set_style_bg_color(body, lv_color_black(), 0);
+	if (shell) {
+		lv_obj_set_style_bg_color(shell, pal.body, 0);
+	}
+	lv_obj_set_style_bg_color(panel, pal.panel, 0);
+	lv_obj_set_style_bg_color(label_block, lv_color_make(0xc5, 0xc2, 0xb1), 0);
+	lv_obj_set_style_text_color(artist_label, pal.ink, 0);
+	lv_obj_set_style_text_color(note_label, pal.body_dark, 0);
+	lv_obj_set_style_bg_color(head_strip, pal.body_dark, 0);
+	if (insert_strip) {
+		lv_obj_set_style_bg_color(insert_strip, pal.body, 0);
+	}
+
+
+
+}
+
+// ---------------------------------------------------------------------------
+// what is playing
+// ---------------------------------------------------------------------------
+
+static void refresh_labels(const device_state_t *st) {
+	const char *artist = "";
+	if (st->live) {
+		artist = st->metadata.artist[0] ? st->metadata.artist : st->metadata.title;
+	} else if (st->metadata.has_tags) {
+		artist = metadata_shown_artist(&st->metadata);
+	}
+	if (artist == NULL || artist[0] == '\0') {
+		artist = st->current_file[0] ? "Unknown artist" : "--";
+	}
+	if (strcmp(lv_label_get_text(artist_label), artist) != 0) {
+		lv_label_set_text(artist_label, artist);
+	}
+
+	// Under the artist: the record it came from. A stream has no record, and a
+	// file with no album tag has nothing to say either -- then it is the side.
+	const char *album = st->metadata.album;
+	char note[288];
+	if (st->live) {
+		snprintf(note, sizeof(note), "LIVE  ·  SIDE A");
+	} else if (album[0] != '\0') {
+		snprintf(note, sizeof(note), "%s", album);
+	} else {
+		snprintf(note, sizeof(note), "SIDE A");
+	}
+	if (strcmp(lv_label_get_text(note_label), note) != 0) {
+		lv_label_set_text(note_label, note);
+	}
+}
+
+static void poll_cb(lv_timer_t *timer) {
+	(void)timer;
+
+	device_state_t st;
+	device_state_get(&st);
+
+	const char *key = st.live ? st.metadata.title : st.current_file;
+	const void *cover = player_cover_image();
+	// The hubs turn while the transport is playing, and also when there is
+	// nothing on the tape at all -- an empty cassette standing still reads as a
+	// broken picture, and the simulator (no sound device) never gets past
+	// STOPPED with a file. Pause, and a stopped tape that still holds a track,
+	// are the states that stop it.
+	bool nothing_loaded = !st.live && st.current_file[0] == '\0';
+	bool playing = st.status == AUDIO_STATUS_PLAYING || (st.status == AUDIO_STATUS_STOPPED && nothing_loaded);
+
+	bool changed = strcmp(key, shown_key) != 0 || cover != shown_cover ||
+				   st.live != shown_live;
+
+	if (changed) {
+		snprintf(shown_key, sizeof(shown_key), "%s", key);
+		shown_cover = cover;
+		shown_live = st.live;
+
+		if (cover != NULL && cpal_from_cover(cover, &pal)) {
+			// the palette is ready
+		} else {
+			cpal_default(&pal);
+		}
+		apply_palette();
+	}
+
+	shown_playing = playing;
+	refresh_labels(&st);
+
+	double total = st.progress_total_secs;
+	double cur = st.progress_current_secs;
+	float left = 1.0f;
+	if (total > 0.5) {
+		left = (float)(1.0 - cur / total);
+		if (left < 0.0f) {
+			left = 0.0f;
+		}
+		if (left > 1.0f) {
+			left = 1.0f;
+		}
+	}
+	(void)left;
+}
+
+static void anim_cb(lv_timer_t *timer) {
+	(void)timer;
+
+	uint32_t now = lv_tick_get();
+	float dt = (float)(now - anim_last_ms) / 1000.0f;
+	anim_last_ms = now;
+	if (!shown_playing) {
+		return;
+	}
+	// A stall (a card read, a decode) is not a jump: the tape does not teleport.
+	if (dt > 0.2f) {
+		dt = 0.2f;
+	}
+	angle_deg = fmodf(angle_deg + ANIM_DEG_PER_S * dt, 360.0f);
+	reel_turn(&reels[0], angle_deg);
+	reel_turn(&reels[1], angle_deg);
+}
+
+// ---------------------------------------------------------------------------
+// gestures
+// ---------------------------------------------------------------------------
+
+static struct {
+	int32_t x, y;
+	uint32_t started;
+	bool swiped;
+} gesture;
+
+static void pressed_cb(lv_event_t *e) {
+	(void)e;
+	lv_indev_t *indev = lv_indev_active();
+	if (indev == NULL) {
+		return;
+	}
+	lv_point_t p;
+	lv_indev_get_point(indev, &p);
+	gesture.x = p.x;
+	gesture.y = p.y;
+	gesture.started = lv_tick_get();
+	gesture.swiped = false;
+}
+
+static void released_cb(lv_event_t *e) {
+	(void)e;
+	lv_indev_t *indev = lv_indev_active();
+	if (indev == NULL) {
+		return;
+	}
+	lv_point_t p;
+	lv_indev_get_point(indev, &p);
+	int32_t dx = p.x - gesture.x;
+	int32_t dy = p.y - gesture.y;
+	int32_t adx = dx < 0 ? -dx : dx;
+	int32_t ady = dy < 0 ? -dy : dy;
+
+	if (adx >= SWIPE_MIN && (float)adx > (float)ady * SWIPE_RATIO) {
+		if (dx > 0) {
+			gesture.swiped = true;
+			back_btn_cb(NULL);
+		}
+		return;
+	}
+	if (ady >= SWIPE_MIN && (float)ady > (float)adx * SWIPE_RATIO) {
+		gesture.swiped = true;
+		if (dy < 0) {
+			player_key_next();
+		} else {
+			player_key_prev();
+		}
+		return;
+	}
+
+	// A press that went nowhere: the cassette is the button.
+	if (adx <= TAP_SLOP && ady <= TAP_SLOP &&
+		lv_tick_elaps(gesture.started) <= TAP_MS && !gesture.swiped) {
+		player_key_play_pause();
+	}
+}
+
+static void clicked_cb(lv_event_t *e) {
+	(void)e;
+	gesture.swiped = false; // the release above has already dealt with it
+}
+
+// ---------------------------------------------------------------------------
+// the fonts
+// ---------------------------------------------------------------------------
+
+static void fonts_load(const char *dir) {
+	char path[512];
+	snprintf(path, sizeof(path), "%s/%s", dir, FONT_FILE);
+
+	int32_t w = (int32_t)cfg->screen_width;
+	int32_t artist_px = (int32_t)((float)w * 0.070f);
+	int32_t note_px = (int32_t)((float)w * 0.053f);
+
+	font_artist = lv_freetype_font_create(path, LV_FREETYPE_FONT_RENDER_MODE_BITMAP,
+										  (uint32_t)artist_px, LV_FREETYPE_FONT_STYLE_NORMAL);
+	font_artist_owned = font_artist != NULL;
+	if (font_artist == NULL) {
+		font_artist = &font_ui_24;
+	}
+
+	font_note = lv_freetype_font_create(path, LV_FREETYPE_FONT_RENDER_MODE_BITMAP,
+										(uint32_t)note_px, LV_FREETYPE_FONT_STYLE_NORMAL);
+	font_note_owned = font_note != NULL;
+	if (font_note == NULL) {
+		font_note = &font_ui_14;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the page's life
+// ---------------------------------------------------------------------------
+
+static void loaded_cb(lv_event_t *e) {
+	(void)e;
+	// The panel belongs to the cassette: no status bar over it, no chevron in
+	// its corner (the rightward swipe is the way out).
+	topbar_set_hidden(true);
+	back_btn_force_hidden(true);
+	if (anim_timer) {
+		lv_timer_resume(anim_timer);
+	}
+	if (poll_timer) {
+		lv_timer_resume(poll_timer);
+	}
+	anim_last_ms = lv_tick_get();
+	poll_cb(NULL);
+}
+
+static void unloaded_cb(lv_event_t *e) {
+	(void)e;
+	back_btn_force_hidden(false);
+	topbar_set_hidden(false);
+	if (anim_timer) {
+		lv_timer_pause(anim_timer);
+	}
+	if (poll_timer) {
+		lv_timer_pause(poll_timer);
+	}
+}
+
+lv_obj_t *cpage_build(const sonix_addon_host_t *host) {
+	cfg = host->cfg;
+	cpal_default(&pal);
+	shown_key[0] = '\0';
+	shown_cover = NULL;
+	shown_playing = false;
+	shown_live = false;
+	angle_deg = 0.0f;
+	anim_last_ms = lv_tick_get();
+
+	fonts_load(host->dir);
+	sprite_load(host->dir, "hub.png", &spr_hub, &spr_pixels[0]);
+	sprite_load(host->dir, "window.png", &spr_window, &spr_pixels[1]);
+	sprite_load(host->dir, "plate.png", &spr_plate, &spr_pixels[2]);
+	sprite_load(host->dir, "sticker.png", &spr_sticker, &spr_pixels[3]);
+	sprite_load(host->dir, "reflection.png", &spr_reflection, &spr_pixels[4]);
+
+	screen = lv_obj_create(NULL);
+	lv_obj_remove_style_all(screen);
+	lv_obj_set_style_bg_color(screen, pal.bg, 0);
+	lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+	lv_obj_set_scrollable(screen, false);
+	lv_obj_set_clickable(screen, true);
+	lv_obj_set_scroll_dir(screen, LV_DIR_NONE);
+
+	build_cassette();
+
+	lv_obj_add_event_cb(screen, loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
+	lv_obj_add_event_cb(screen, unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
+	lv_obj_add_event_cb(screen, pressed_cb, LV_EVENT_PRESSED, NULL);
+	lv_obj_add_event_cb(screen, released_cb, LV_EVENT_RELEASED, NULL);
+	lv_obj_add_event_cb(screen, clicked_cb, LV_EVENT_CLICKED, NULL);
+
+	anim_timer = lv_timer_create(anim_cb, ANIM_PERIOD_MS, NULL);
+	poll_timer = lv_timer_create(poll_cb, POLL_PERIOD_MS, NULL);
+	lv_timer_pause(anim_timer);
+	lv_timer_pause(poll_timer);
+	power_pause_in_standby(anim_timer);
+	power_pause_in_standby(poll_timer);
+
+	reel_turn(&reels[0], 0.0f);
+	reel_turn(&reels[1], 60.0f);
+
+	return screen;
+}
+
+void cpage_stop(void) {
+	// The player can take the page away without the screen being unloaded
+	// first (the card left): the chrome has to come back either way.
+	back_btn_force_hidden(false);
+	topbar_set_hidden(false);
+
+	if (anim_timer) {
+		power_forget_timer(anim_timer);
+		lv_timer_delete(anim_timer);
+		anim_timer = NULL;
+	}
+	if (poll_timer) {
+		power_forget_timer(poll_timer);
+		lv_timer_delete(poll_timer);
+		poll_timer = NULL;
+	}
+	if (artist_label) {
+		lv_obj_set_style_text_font(artist_label, &font_ui_24, 0);
+	}
+	if (note_label) {
+		lv_obj_set_style_text_font(note_label, &font_ui_14, 0);
+	}
+
+	if (font_artist_owned) {
+		lv_freetype_font_delete(font_artist);
+	}
+	if (font_note_owned) {
+		lv_freetype_font_delete(font_note);
+	}
+	font_artist = NULL;
+	font_note = NULL;
+	font_artist_owned = false;
+	font_note_owned = false;
+
+	screen = NULL;
+	body = NULL;
+	shell = NULL;
+	panel = NULL;
+	label_panel = NULL;
+	label_block = NULL;
+	artist_label = NULL;
+	note_label = NULL;
+	head_strip = NULL;
+	insert_strip = NULL;
+	memset(screws, 0, sizeof(screws));
+	memset(reels, 0, sizeof(reels));
+	for (int i = 0; i < 5; i++) {
+		if (spr_pixels[i]) {
+			stbi_image_free(spr_pixels[i]);
+			spr_pixels[i] = NULL;
+		}
+	}
+	memset(&spr_hub, 0, sizeof(spr_hub));
+	memset(&spr_window, 0, sizeof(spr_window));
+	memset(&spr_plate, 0, sizeof(spr_plate));
+	memset(&spr_sticker, 0, sizeof(spr_sticker));
+	memset(&spr_reflection, 0, sizeof(spr_reflection));
+	cfg = NULL;
+	shown_key[0] = '\0';
+	shown_cover = NULL;
+}

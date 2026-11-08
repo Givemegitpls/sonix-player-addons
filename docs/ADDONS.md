@@ -758,6 +758,7 @@ this is the state behind it:
 | `tidal` | no | the device-code sign-in and playback were never checked on a device; `tidal/README.md` says what is unverified |
 | `spotify` | no | the C half builds, but the addon means nothing without its Rust engine, and the engine's session was never checked on a device |
 | `piped` | no | checked in the simulator and on a device against a live Piped instance; what it depends on is a third party (see `### piped`) |
+| `cassette` | yes | a decorative page: it has run on a device, and what it adds to a build is a small `.so` and its sprites |
 
 A plain `make` still builds all of them, and that is deliberate: a developer's
 machine is where the unverified ones are supposed to be tried. What the whitelist
@@ -1332,6 +1333,57 @@ answer 500 with
 `SignInConfirmNotBotException: YouTube probably temporarily blocked anonymous access from this IP`
 for every video they have not cached, and the addon says "The instance could not
 get this from YouTube". It passes when YouTube lets them through again.
+
+### cassette
+
+`cassette/` — a cassette filling the panel, painted in the sleeve of what is
+playing. It came from a request for the cassette screensaver of a Sony NW-A105:
+the same object, the cartoon look the owner picked, and the shell's colour taken
+from the album art.
+
+**The picture.** The cassette lies on its side — turned ninety degrees, so its
+long axis is the panel's, which is how it fills a portrait screen. The label
+runs down one edge with its writing turned with it; the head opening is the
+other edge. The label carries the **artist only**, in Caveat (`assets/Caveat.ttf`,
+an OFL face subset to Latin and Cyrillic; the player's own face stands in when
+the file is missing), and `SIDE A` or the track's position under it.
+
+**The palette.** `cpal.c` samples the sleeve the player already has decoded
+(`player_cover_image()`, RGB565 — the same buffer the screensaver draws) on a
+32x32 grid, keeps the pixels that are coloured and not black or white, and
+histograms them by hue: the loudest family becomes the shell, the second one (at
+least 60 degrees away) the small accents. The black recess, the paper label, the
+metal hubs and the brown tape are fixed — the owner asked for the recess to be
+black, and the rest is what a cassette is made of. No cover: `cpal_default()`,
+the orange shell of the reference drawing.
+
+**The animation.** Two LVGL timers: 70 ms for the hubs and 500 ms for
+`device_state_get()`, both `power_pause_in_standby()`d and paused while the
+screen is not up. The hubs turn only while `AUDIO_STATUS_PLAYING`; their six
+studs are objects moved a step at a time — this build has `LV_USE_LINE 0`, and a
+transform layer per frame is not something to spend on a cassette. The wound
+tape on each hub is a circle whose diameter follows
+`progress_current_secs / progress_total_secs`, so the tape moves from the supply
+hub to the take-up one as the track runs.
+
+**The controls.** The page hides the status bar and the floating chevron
+(`topbar_set_hidden()`, `back_btn_force_hidden()`) — it is the cassette and
+nothing else. A tap is `player_key_play_pause()`, a vertical swipe is
+`player_key_next()`/`player_key_prev()`, and a rightward swipe is
+`back_btn_cb(NULL)`. The gestures are its own `PRESSED`/`RELEASED` pair on the
+screen; the shell's swipe-back is not attached, so the two cannot claim one drag.
+
+**The fonts belong to the page.** They are created from the card with
+`lv_freetype_font_create()` and deleted in `stop()` — but the shell deletes the
+screen *after* `stop()` returns, so `stop()` hands the labels `&font_ui_24` /
+`&font_ui_14` first. Without that, LVGL reads a freed face while tearing the page
+down.
+
+**Checked on a device, 2026-11-09.** Installed on the V3 over adb: the tile, the
+page, the palette from a real sleeve, the text on the label and the sprites all
+render there. The rotation of the hubs, the gestures and the memory the sprites
+take while the page is open were looked at on the device, not measured; the
+`frames:` line in the log is what to read if it ever feels heavy.
 
 ## Covers on the rows of a list
 
