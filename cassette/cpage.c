@@ -157,11 +157,13 @@ static cpal_t pal;
 static float angle_deg;
 static uint32_t anim_last_ms;
 
-// What the page is showing, so a poll can tell whether anything changed.
-static char shown_key[520];
-static const void *shown_cover;
+// What the page is showing, so a poll can tell whether anything changed. The
+// palette is not keyed on the track: the player keeps the previous sleeve on
+// screen until the new one is decoded (up to two seconds), so a palette built
+// when the track changes is the last record's, and nothing rebuilds it when the
+// real sleeve lands. The picture itself is what moves the palette.
+static uint32_t shown_picture; // fingerprint of the sleeve on screen, 0 for none
 static bool shown_playing;
-static bool shown_live;
 
 static void apply_palette(void);
 
@@ -414,14 +416,35 @@ static void refresh_labels(const device_state_t *st) {
 	}
 }
 
+// A cheap answer to "is this the sleeve the palette was made from": the size
+// and every sixty-fourth byte of the picture, FNV-1a. The palette has to follow
+// the picture and not the track (see shown_picture), and comparing the buffer
+// itself is what notices the new sleeve arrive without asking the player to
+// decode or copy it. On a 320-wide cover that is ten positions in every row --
+// three thousand samples, a few microseconds, alongside the 6.4 thousand the
+// palette itself already reads when it is rebuilt.
+static uint32_t picture_fingerprint(const lv_image_dsc_t *cover) {
+	if (cover == NULL || cover->data == NULL || cover->header.cf != LV_COLOR_FORMAT_RGB565) {
+		return 0;
+	}
+	uint32_t h = 2166136261u;
+	h = (h ^ cover->header.w) * 16777619u;
+	h = (h ^ cover->header.h) * 16777619u;
+	h = (h ^ cover->header.stride) * 16777619u;
+	size_t bytes = (size_t)cover->header.stride * cover->header.h;
+	const uint8_t *px = cover->data;
+	for (size_t i = 0; i < bytes; i += 64) {
+		h = (h ^ px[i]) * 16777619u;
+	}
+	return h ? h : 1; // 0 says "no picture"
+}
+
 static void poll_cb(lv_timer_t *timer) {
 	(void)timer;
 
 	device_state_t st;
 	device_state_get(&st);
 
-	const char *key = st.live ? st.metadata.title : st.current_file;
-	const void *cover = player_cover_image();
 	// The hubs turn while the transport is playing, and also when there is
 	// nothing on the tape at all -- an empty cassette standing still reads as a
 	// broken picture, and the simulator (no sound device) never gets past
@@ -430,15 +453,11 @@ static void poll_cb(lv_timer_t *timer) {
 	bool nothing_loaded = !st.live && st.current_file[0] == '\0';
 	bool playing = st.status == AUDIO_STATUS_PLAYING || (st.status == AUDIO_STATUS_STOPPED && nothing_loaded);
 
-	bool changed = strcmp(key, shown_key) != 0 || cover != shown_cover ||
-				   st.live != shown_live;
-
-	if (changed) {
-		snprintf(shown_key, sizeof(shown_key), "%s", key);
-		shown_cover = cover;
-		shown_live = st.live;
-
-		if (cover != NULL && cpal_from_cover(cover, &pal)) {
+	const lv_image_dsc_t *cover = player_cover_image();
+	uint32_t picture = picture_fingerprint(cover);
+	if (picture != shown_picture) {
+		shown_picture = picture;
+		if (picture != 0 && cpal_from_cover(cover, &pal)) {
 			// the palette is ready
 		} else {
 			cpal_default(&pal);
@@ -610,10 +629,8 @@ static void unloaded_cb(lv_event_t *e) {
 lv_obj_t *cpage_build(const sonix_addon_host_t *host) {
 	cfg = host->cfg;
 	cpal_default(&pal);
-	shown_key[0] = '\0';
-	shown_cover = NULL;
+	shown_picture = 0;
 	shown_playing = false;
-	shown_live = false;
 	angle_deg = 0.0f;
 	anim_last_ms = lv_tick_get();
 
@@ -711,6 +728,5 @@ void cpage_stop(void) {
 	memset(&spr_sticker, 0, sizeof(spr_sticker));
 	memset(&spr_reflection, 0, sizeof(spr_reflection));
 	cfg = NULL;
-	shown_key[0] = '\0';
-	shown_cover = NULL;
+	shown_picture = 0;
 }

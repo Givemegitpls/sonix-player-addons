@@ -362,3 +362,25 @@ it keyed on `sonix-player/sonix-player/docker/Dockerfile` + `rockboxdev/**`.
 - Crops of the render carry the shell's colour at their edges; when a crop must
   show only its dark parts, drop the pixels that are blue-ish (`b - r > 18`) as
   well as the bright ones, or a cyan fringe shows around the holes.
+
+## Cassette palette follows the picture, not the track (2026-11-09)
+
+- `player_cover_image()` returns `&current_cover.dsc` — an address that is the
+  same for the whole run — and `reload_cover()` deliberately keeps the previous
+  sleeve up until the new one is decoded (`cover: on screen 1767 ms after the
+  track change`). So a palette rebuilt on the track change is the *previous*
+  record's and nothing rebuilds it when the real sleeve lands: the cassette wore
+  SOFT PLAY's green over Red Hot Chili Peppers. `cpage.c` now fingerprints the
+  pixels in `poll_cb` (FNV over w/h/stride and every 64th byte, ~3k reads).
+- Checking a palette offline: compile `cassette/cpal.c` with the tone functions
+  cut out of the player's `cover.c` (`/tmp/opencode/toneimpl.c`) plus a stub
+  `lv_color_make`, feed it a 320x320 RGB565 dump of a `player_covers` row. The
+  device's shell colour is that output through RGB565 bit replication
+  (`#11944c` → `(16,150,74)`), which is how a screenshot can be matched back to
+  the record it was taken from.
+- The player's accent is not the tone: `alt_mark()` keeps the hue, cuts the
+  saturation to 72 % of the grey distance and pins luma at 196, so very different
+  sleeves give the same pale tan play button.
+- `make` on its own only ensures LVGL is cloned (the file's first target is
+  `lvgl`): build with `make target` / `make host`, `ADDON_IDS=...` to narrow. The
+  device has `nm` but no `readelf` and no `input`.

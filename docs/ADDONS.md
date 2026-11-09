@@ -1348,14 +1348,28 @@ other edge. The label carries the **artist only**, in Caveat (`assets/Caveat.ttf
 an OFL face subset to Latin and Cyrillic; the player's own face stands in when
 the file is missing), and `SIDE A` or the track's position under it.
 
-**The palette.** `cpal.c` samples the sleeve the player already has decoded
-(`player_cover_image()`, RGB565 — the same buffer the screensaver draws) on a
-32x32 grid, keeps the pixels that are coloured and not black or white, and
-histograms them by hue: the loudest family becomes the shell, the second one (at
-least 60 degrees away) the small accents. The black recess, the paper label, the
-metal hubs and the brown tape are fixed — the owner asked for the recess to be
-black, and the rest is what a cassette is made of. No cover: `cpal_default()`,
-the orange shell of the reference drawing.
+**The palette.** `cpal.c` asks the player's own answer for the sleeve
+(`cover_page_tone()`, the same call the player's alternative arrangement tints
+itself with) on the picture the player already has decoded
+(`player_cover_image()`, RGB565 — the same buffer the screensaver draws), and
+`cover_tone_stretched()` for the small accents. The shell is that tone with its
+brightness held between 0.33 and 0.58 in HSV value and 69..148 in luma: a pale
+sleeve must not make the plastic glow, a black one must not lose the cassette
+into the black around it, and only the brightness is touched, never the hue. The
+black recess, the paper label, the metal hubs and the brown tape are fixed — the
+owner asked for the recess to be black, and the rest is what a cassette is made
+of. No cover: `cpal_default()`, the orange shell of the reference drawing.
+
+**The palette follows the picture, not the track.** The player keeps the
+previous sleeve on screen until the new one is decoded — up to two seconds, and
+longer on a cold card — so the track changing says nothing about what is on
+screen at that moment. A palette built on the track change was therefore the
+last record's, and nothing rebuilt it when the real sleeve landed: the cassette
+wore SOFT PLAY's green over a Red Hot Chili Peppers album, and stayed that way
+until the next track. `poll_cb()` now fingerprints the picture (its size and
+every sixty-fourth byte) and recolours when that changes, so the shell is the
+colour of the sleeve the eye can see, on the poll after it arrives.
+
 
 **The animation.** Two LVGL timers: 70 ms for the hubs and 500 ms for
 `device_state_get()`, both `power_pause_in_standby()`d and paused while the
