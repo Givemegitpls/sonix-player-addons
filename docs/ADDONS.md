@@ -1040,10 +1040,16 @@ What it keeps on the card:
   `quality` (`yandexconf.c`, through `common/store`). In the fork the settings
   were `[yandex]` keys of `device_config.ini` and the four keys were sealed into
   `streaming-keys.bin` with a key compiled into the binary — an addon can open
-  neither, so both live here. The values are the owner's; nothing is compiled in
-  and nothing is guessed. A file that does not carry all four is **"no keys"**,
+  neither, so both live here. The repository **carries the file filled in**
+  (`yandex/settings.ini`, so `make pack`'s `*.ini` glob puts it on the card) and
+  the values are the official client's, published by
+  `MarshalX/yandex-music-api` — the owner's decision of 2026-11-11: the addon
+  ships what is already public rather than asking for it, at the cost of the
+  credentials ageing in the package. A card without the file is **"no keys"**,
   which is a state the screen shows rather than a failure: `yandex_configured()`
-  is false, the service is off, and the sign-in row says why.
+  is false, the service is off, and the screen says which file is missing.
+  `client_header` is the whole header line, name and value, because `yandex.c`
+  puts it into every request as it stands (`"%s\r\n"`).
 - `<card>/Addons/yandex/yandex_session.ini` — `access_token`, `refresh_token`,
   `expires_at`, `uid`, `user` (`yandex.c`).
 - `Addons/yandex/token.txt` — the token the user pastes, in the addon's folder,
@@ -1054,14 +1060,14 @@ What it keeps on the card:
 
 **Where the four keys come from.** The Music API has no developer program: they
 are the credentials of the official client, which is why the fork sealed them.
-Nothing is compiled in and the tree carries only `yandex/settings.ini.example`
-— an example, deliberately named so `make pack`'s `*.ini` glob does not put a
-keyless `settings.ini` on a card. The published place to read the values is
-`MarshalX/yandex-music-api`, which talks to the same API: `client_id` and
-`client_secret` are the Android application's defaults in
+This tree publishes them instead, in `yandex/settings.ini`, and the published
+place that names them is `MarshalX/yandex-music-api`, which talks to the same
+API: `client_id` and `client_secret` are the Android application's defaults in
 `yandex_music/_client/device_auth.py`, and `sign_key` with `client_header` are
 `DESKTOP_SIGN_KEY` and `DESKTOP_CLIENT` in `yandex_music/utils/sign_request.py`
-(`DEFAULT_SIGN_KEY` there is the Android one). Two rules:
+(`DEFAULT_SIGN_KEY` there is the Android one). Because the file ships filled in,
+a newer release zip overwrites a card's `settings.ini` -- README.txt and
+`docs/SETUP.md` say not to do it over an edit. Two rules:
 
 - **`sign_key` and `client_header` are a pair.** The library says so in as many
   words: the signature of `get-file-info` is checked together with the

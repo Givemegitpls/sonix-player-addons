@@ -2238,6 +2238,12 @@ static void poll_async(void *user) {
 // the home page
 // ---------------------------------------------------------------------------
 
+// One sentence for every action that cannot work without the keys. It names the
+// file, because a card without it is the only way to see this: the file ships
+// filled in with the release zip.
+#define NO_KEYS_POPUP \
+	"no keys: Addons/yandex/settings.ini is missing from the card (it ships filled in with the release zip)"
+
 static void quality_refresh(void) {
 	if (!quality_pills[0]) {
 		return;
@@ -2339,7 +2345,7 @@ static void play_wave_cb(lv_event_t *e) {
 		return;
 	}
 	if (!yandex_configured()) {
-		gui_notify_popup("no keys: the addon's settings.ini has none");
+		gui_notify_popup(NO_KEYS_POPUP);
 		return;
 	}
 	if (!yandex_logged_in()) {
@@ -2362,7 +2368,7 @@ static void play_wave_cb(lv_event_t *e) {
 static void sign_in_cb(lv_event_t *e) {
 	(void)e;
 	if (!yandex_configured()) {
-		gui_notify_popup("no keys: the addon's settings.ini has none");
+		gui_notify_popup(NO_KEYS_POPUP);
 		return;
 	}
 	start_one_shot(sign_in_main);
@@ -2392,7 +2398,7 @@ static void sign_out_cb(lv_event_t *e) {
 static void code_sign_in_cb(lv_event_t *e) {
 	(void)e;
 	if (!yandex_configured()) {
-		gui_notify_popup("no keys: the addon's settings.ini has none");
+		gui_notify_popup(NO_KEYS_POPUP);
 		return;
 	}
 	if (login_active) {
@@ -2452,15 +2458,31 @@ static void rebuild_home(void) {
 	settingsrow_add(home_container, "Account", &account_value, NULL, NULL);
 	lv_obj_set_style_text_font(account_value, &font_ui_20, 0);
 
-	if (!in) {
+	// Signing in is the code, and the code needs no file on the card: the page
+	// leads there first. The keys are the one thing that has to be put on the
+	// card by hand, so when they are missing the page names the file and the
+	// four keys, and says the code cannot be asked for without them. token.txt
+	// is an old card's leftover and is mentioned only when it is really there.
+	if (!yandex_configured()) {
+		// A card without the settings file is the only way here: the file ships
+		// filled in with the release zip, so the page names what is missing
+		// rather than asking anyone to go and find four values.
+		note_label(home_container,
+				   "No keys: Addons/yandex/settings.ini is missing from the card. It ships filled in with "
+				   "the release zip -- the four values in it are the official client's, as README.txt in "
+				   "this folder says (docs/SETUP.md, section 3). No code can be asked for without it.");
+	} else if (!in) {
 		// Without a session there is nothing to ask the service: the page says
 		// what it would need. The sections stay: they are what the page is, and
 		// opening one says why it is empty instead of hiding the map.
 		note_label(home_container,
-				   "Not signed in. Put the token from music.yandex.ru into Addons/yandex/token.txt on the card, "
-				   "then tap \"Sign in from the card\".");
-		note_label(home_container, token_file_present() ? "The file is there: sign in from the card."
-														: "No Addons/yandex/token.txt on the card.");
+				   "Not signed in. Tap \"Sign in with a code\": nothing is typed into a file on the "
+				   "card, the code is typed on a phone.");
+	}
+	if (!in && token_file_present()) {
+		note_label(home_container,
+				   "A token.txt from an older card is here: \"Sign in from the card\" imports it, but "
+				   "such a session never renews -- the code does.");
 	}
 
 	settingsrow_add(home_container, "My Wave", NULL, play_wave_cb, NULL);
@@ -2497,6 +2519,12 @@ static void rebuild_home(void) {
 	settingsrow_add(home_container, "Code", &code_value, NULL, NULL);
 	settingsrow_add(home_container, "Where", &where_value, NULL, NULL);
 	settingsrow_add(home_container, "Waiting", &wait_value, NULL, NULL);
+	// Those three are state, not a form to fill in here: the address is opened
+	// on a phone and the code is typed there, which the page has to say out loud
+	// or the rows read as something the player is waiting to be given.
+	note_label(home_container,
+			   "Open Where on a phone already signed in to this account, type Code there and confirm: "
+			   "the addon signs in by itself, and Waiting counts the code's lifetime down.");
 	login_clear();
 
 	settingsrow_action(home_container, "Sign in with a code", code_sign_in_cb, NULL);

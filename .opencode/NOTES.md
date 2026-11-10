@@ -394,3 +394,65 @@ it keyed on `sonix-player/sonix-player/docker/Dockerfile` + `rockboxdev/**`.
 - `make` on its own only ensures LVGL is cloned (the file's first target is
   `lvgl`): build with `make target` / `make host`, `ADDON_IDS=...` to narrow. The
   device has `nm` but no `readelf` and no `input`.
+
+## The Yandex page leads with the code, and says where the keys come from (2026-11-11)
+
+- The concept the owner wants: "Sign in with a code" is the whole sign-in and
+  nothing is typed on the player. Since 2026-11-11 that holds literally —
+  `yandex/settings.ini` **ships filled in** (`make pack`'s `*.ini` glob puts it
+  on the card), so the four keys are not asked of anyone. `rebuild_home()`
+  (`yandex/src/gui/streaming/yandexstate.c`) then has three notes: no keys (only
+  when the file is missing — it names `Addons/yandex/settings.ini`), not signed
+  in (tap the code row), and — only when it is really on the card — the old
+  `token.txt`. The `Code`/`Where`/`Waiting` rows are state, and a note under them
+  says the code is typed on a phone.
+- **`client_header` is the whole header line**, not just the client string:
+  `yandex.c` puts it into the request as `"%s\r\n"` (`key_header`), so the value
+  must be `X-Yandex-Music-Client: YandexMusicDesktopAppWindows/5.95.0`. A bare
+  `YandexMusicDesktopAppWindows/5.95.0` parses, shows "keys present", and fails
+  at playback.
+- The owner chose to publish the official client's credentials (2026-11-11),
+  knowing the pair ages and that ToS/DMCA risk sits on the repository: a newer
+  release zip overwrites a card's `settings.ini`, so README.txt and
+  `docs/SETUP.md` say not to do it over an edit. `settings.ini.example` is gone.
+- **Verified end to end on the device, 2026-11-11:** with a card holding only
+  the shipped five files (no session, no `token.txt`) the page says "not signed
+  in", "Sign in with a code" gets a code from the addon itself
+  (`Code`/`Where`/`Waiting`), confirming it on a phone writes
+  `yandex_session.ini` **with a `refresh_token`** and rebuilds the page to the
+  account's name — so the shipped `client_id`/`client_secret` are accepted for
+  both grants. A session imported from `token.txt` has none of that
+  (`refresh_token` absent, verified on the same card): the code is the only way
+  that renews.
+- A code lives 300 s and the page keeps counting while the panel sleeps
+  (`screen_off_seconds`), so a code read off a dark screen is already dead —
+  wake the panel before asking for one.
+- Every action that cannot work without keys says the same thing:
+  `NO_KEYS_POPUP` in the same file, one macro rather than three copies.
+- `docs/SETUP.md` section 3 links the upstream files instead of naming them:
+  `MarshalX/yandex-music-api/blob/main/yandex_music/_client/device_auth.py`
+  (`_DEFAULT_CLIENT_ID`, `_DEFAULT_CLIENT_SECRET`) and
+  `.../yandex_music/utils/sign_request.py` (`DESKTOP_SIGN_KEY`,
+  `DESKTOP_CLIENT`). Both answered 200 on 2026-11-11; `main` is the branch.
+
+## Driving the player over adb after a reboot (2026-11-11)
+
+- `/tmp` is cleared by the reboot the launcher does after `killall
+  sonix_player`, so `/tmp/touch` and `/tmp/key` have to be pushed again; both
+  are crossed from `/tmp/oc/touch.c` with the tree's
+  `rockbox-toolchain/bin/mipsel-rockbox-linux-gnu-gcc -static`.
+- **A tap needs an `ABS_MT_SLOT` event.** Without it the injected sequence is
+  read back fine from `/dev/input/event2` (`cat` shows the events) and the player
+  ignores it, which looks like a frozen UI: the helper in `/tmp/oc/touch.c` has
+  no slot and did nothing on the 2026-11-07 build, while the same sequence with
+  `ABS_MT_SLOT 0` before `ABS_MT_TRACKING_ID` works (`/tmp/opencode/touch2.c`).
+- The panel has double-tap wake **off** and `screen_off_seconds = 45`, so a
+  single tap on a dark screen only arms nothing: wake it with the power key
+  instead — `EV_KEY` 116 on `/dev/input/event1` (`/tmp/opencode/key.c`), and
+  check `/sys/class/backlight/pwm-backlight.0/brightness` (0 = dark, 247 = on).
+- `log_to_sd = 0` in `/data/device_config.ini` means the player's stdout and
+  stderr are `/dev/null` (`/proc/<pid>/fd/1`), and `/data/sonix-launch.log` holds
+  the launcher's lines only. Set it to 1 for a device run; the log is
+  `/mnt/sd_0/.local/sonix_player.log` and it **appends** across restarts.
+- Screenshot: `dd if=/dev/fb0` is 320x480 BGRA with stride 1280; the panel is
+  readable while the backlight is on only.

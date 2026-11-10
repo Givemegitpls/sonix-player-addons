@@ -177,41 +177,39 @@ FLAC 16/44.1, FLAC 24/96, FLAC 24/192. Остальное на странице:
 
 ### English
 
-**What you need:** a Yandex account (Plus for lossless), the card, Wi-Fi, and the
-four keys the addon cannot ship — see below.
+**What you need:** a Yandex account (Plus for lossless), the card and Wi-Fi.
+Nothing has to be typed in.
 
-**The keys.** The Music API has no developer program: `client_id`,
-`client_secret`, `sign_key` and `client_header` are the official client's
-credentials, and the addon neither compiles nor guesses them. Put them into
-`<card>/Addons/yandex/settings.ini`, one `key = value` per line (the addon's
-`settings.ini.example` in this repository is the same file with explanations):
+**The keys are already there.** `Addons/yandex/settings.ini` in the release zip
+ships filled in — `client_id`, `client_secret`, `sign_key`, `client_header` and
+`quality` — so **Sign in with a code** works as it is. The four values are the
+official client's own, and the addon only carries what is already public: the
+`MarshalX/yandex-music-api` Python library publishes them, since it talks to the
+same API:
 
-```ini
-client_id =
-client_secret =
-sign_key =
-client_header =
-quality = lossless
-```
+- `client_id` and `client_secret` —
+  [`yandex_music/_client/device_auth.py`](https://github.com/MarshalX/yandex-music-api/blob/main/yandex_music/_client/device_auth.py),
+  the Android application's defaults (`_DEFAULT_CLIENT_ID`,
+  `_DEFAULT_CLIENT_SECRET`);
+- `sign_key` and `client_header` —
+  [`yandex_music/utils/sign_request.py`](https://github.com/MarshalX/yandex-music-api/blob/main/yandex_music/utils/sign_request.py),
+  `DESKTOP_SIGN_KEY` and `DESKTOP_CLIENT` (`DEFAULT_SIGN_KEY` there is the
+  Android one and does not fit).
 
-A file that does not carry all four is "no keys": the page says so and the
-service stays off. The published place to read the values is the
-`MarshalX/yandex-music-api` Python library, which talks to the same API:
-
-- `client_id` and `client_secret` — the Android application's defaults in
-  `yandex_music/_client/device_auth.py`;
-- `sign_key` and `client_header` — `DESKTOP_SIGN_KEY` and `DESKTOP_CLIENT` in
-  `yandex_music/utils/sign_request.py` (`DEFAULT_SIGN_KEY` there is the Android
-  one and does not fit).
+A card without that file is "no keys": the page says so and the service stays
+off. That is the only thing that state means — the values are not asked of you.
 
 Two rules, both of them the service's, not this addon's:
 
 - `sign_key` and `client_header` are a pair from the same client. `get-file-info`
   is signed with the key and checked together with that header, so a key from one
   client beside another client's header is refused;
-- `client_header` carries the client's version, and the version ages. When
-  playback starts being refused, bump the version in the header before
-  suspecting the key.
+- `client_header` is the whole header line — name and value,
+  `X-Yandex-Music-Client: YandexMusicDesktopAppWindows/5.95.0` — because it goes
+  into the request as it stands. It carries the client's version, and the version
+  ages: when playback starts being refused, bump it before suspecting the key. A
+  newer release zip carries a newer one, but it also carries the whole file — if
+  you have edited `settings.ini`, do not overwrite it when updating.
 
 `client_id`/`client_secret` are only used for the sign-in and the refresh; they
 play no part in playback.
@@ -251,41 +249,39 @@ browsing is limited to those two actions.
 
 ### Русский
 
-**Что нужно:** аккаунт Яндекса (Plus — для lossless), карта, Wi-Fi и четыре
-ключа, которые аддон поставлять не может — о них ниже.
+**Что нужно:** аккаунт Яндекса (Plus — для lossless), карта и Wi-Fi. Вписывать
+ничего не нужно.
 
-**Ключи.** У API Музыки нет программы для разработчиков: `client_id`,
-`client_secret`, `sign_key` и `client_header` — это учётные данные официального
-клиента, аддон их не вшивает и не угадывает. Их нужно положить в
-`<card>/Addons/yandex/settings.ini`, по одной паре `ключ = значение` в строке
-(файл `settings.ini.example` в этом репозитории — тот же файл с пояснениями):
+**Ключи уже лежат.** В релизном zip `Addons/yandex/settings.ini` идёт
+заполненным — `client_id`, `client_secret`, `sign_key`, `client_header` и
+`quality`, — поэтому **Sign in with a code** работает как есть. Четыре значения
+принадлежат официальному клиенту, и аддон несёт только то, что и так
+опубликовано: их публикует питоновская библиотека `MarshalX/yandex-music-api`,
+работающая с тем же API:
 
-```ini
-client_id =
-client_secret =
-sign_key =
-client_header =
-quality = lossless
-```
-
-Файл, в котором нет всех четырёх, — это «no keys»: страница так и говорит,
-сервис выключен. Опубликованное место, откуда брать значения, — питоновская
-библиотека `MarshalX/yandex-music-api`, работающая с тем же API:
-
-- `client_id` и `client_secret` — значения Андроид-приложения по умолчанию в
-  `yandex_music/_client/device_auth.py`;
-- `sign_key` и `client_header` — `DESKTOP_SIGN_KEY` и `DESKTOP_CLIENT` в
-  `yandex_music/utils/sign_request.py` (`DEFAULT_SIGN_KEY` там андроидный и не
+- `client_id` и `client_secret` —
+  [`yandex_music/_client/device_auth.py`](https://github.com/MarshalX/yandex-music-api/blob/main/yandex_music/_client/device_auth.py),
+  значения Андроид-приложения по умолчанию (`_DEFAULT_CLIENT_ID`,
+  `_DEFAULT_CLIENT_SECRET`);
+- `sign_key` и `client_header` —
+  [`yandex_music/utils/sign_request.py`](https://github.com/MarshalX/yandex-music-api/blob/main/yandex_music/utils/sign_request.py),
+  `DESKTOP_SIGN_KEY` и `DESKTOP_CLIENT` (`DEFAULT_SIGN_KEY` там андроидный и не
   подходит).
+
+Карта без этого файла — это «no keys»: страница так и говорит, сервис выключен.
+Только это то состояние и означает — значения у вас никто не спрашивает.
 
 Два правила, и оба — правила сервиса, а не аддона:
 
 - `sign_key` и `client_header` — пара из одного клиента. Подпись
   `get-file-info` проверяется вместе с этим заголовком, поэтому ключ одного
   клиента рядом с заголовком другого будет отвергнут;
-- в `client_header` зашита версия клиента, и она стареет. Если воспроизведение
-  начали отклонять, сначала поднимайте версию в заголовке, а не ищите новый
-  ключ.
+- `client_header` — это вся строка заголовка, с именем и значением:
+  `X-Yandex-Music-Client: YandexMusicDesktopAppWindows/5.95.0`, потому что она
+  подставляется в запрос как есть. В ней зашита версия клиента, и она стареет:
+  если воспроизведение начали отклонять, сначала поднимайте версию, а не ищите
+  новый ключ. В новом релизном zip строка новее, но в нём же лежит и весь файл —
+  если правили `settings.ini`, не перезаписывайте его при обновлении.
 
 `client_id`/`client_secret` нужны только для входа и обновления сессии, в
 воспроизведении они не участвуют.
