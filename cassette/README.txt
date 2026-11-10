@@ -4,12 +4,15 @@ Cassette - an addon for the Sonix Player (TempoTec V3 Analog)
 INSTALL / УСТАНОВКА
   These files belong in <card>/Addons/cassette/ - addon.json has to sit directly
   in that folder, not a level deeper, and assets/ has to come along: the
-  handwriting on the label is a font inside it. The tile appears in More when
-  the card is read; a restart is normally not needed.
+  cassette is pictures there (overlay.png and hub.png, and shadow.png and
+  light.png if they are there) and the handwriting on the label is a font
+  inside it. The tile appears in More when the card is read; a restart is
+  normally not needed.
   Эти файлы кладутся в <card>/Addons/cassette/ - addon.json должен лежать прямо
-  в этой папке, не уровнем глубже, и assets/ нужно копировать вместе: почерк на
-  ярлыке - это шрифт внутри неё. Плитка появляется в More, когда карта
-  прочитана; перезапуск обычно не нужен.
+  в этой папке, не уровнем глубже, и assets/ нужно копировать вместе: кассета -
+  это картинки в ней (overlay.png и hub.png, а также shadow.png и light.png,
+  если они есть), а почерк на ярлыке - шрифт внутри неё. Плитка появляется в
+  More, когда карта прочитана; перезапуск обычно не нужен.
 
 WHAT IT IS / ЧТО ЭТО
   A cassette filling the screen, painted in the sleeve of what is playing: the

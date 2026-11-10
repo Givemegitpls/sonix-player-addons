@@ -1341,12 +1341,47 @@ playing. It came from a request for the cassette screensaver of a Sony NW-A105:
 the same object, the cartoon look the owner picked, and the shell's colour taken
 from the album art.
 
-**The picture.** The cassette lies on its side — turned ninety degrees, so its
-long axis is the panel's, which is how it fills a portrait screen. The label
-runs down one edge with its writing turned with it; the head opening is the
-other edge. The label carries the **artist only**, in Caveat (`assets/Caveat.ttf`,
-an OFL face subset to Latin and Cyrillic; the player's own face stands in when
-the file is missing), and `SIDE A` or the track's position under it.
+**The picture.** Three layers, bottom to top. The cassette lies on its side — turned
+ninety degrees, so its long axis is the panel's, which is how it fills a portrait
+screen. The label runs down one edge with its writing turned with it; the head
+opening is the other edge. The label carries the **artist only**, in Caveat
+(`assets/Caveat.ttf`, an OFL face subset to Latin and Cyrillic; the player's own
+face stands in when the file is missing), and `SIDE A` or the track's position
+under it.
+
+- **The colour** is one flat rectangle filling the panel, painted `pal.body`. It
+  carries no shape of its own: everything that makes it a cassette is on the
+  overlay.
+- **The hubs** are `assets/hub.png` — the reel with the tape wound on it and the
+  black disc it sits in, as one picture — placed by their centre on the drawing's
+  two reels and turned about it. Their centres are the drawing's `(143,139)` and
+  `(336,139)` turned to the page, `(181,143)` and `(181,336)`, and they are fixed:
+  a hub drawn at another size is still placed, and still turns, about those two
+  points. The overlay frames it, so a larger picture is simply clipped by it.
+- **The overlay** is `assets/overlay.png`, 320x480 — the shape of the shell with
+  its bevel, shadows and reflections, the strip the reels sit in, the window, the
+  screws, the label and the recess, with alpha where the colour and the hubs show
+  through. It is drawn *over* the hubs, and the page's black is part of it, not
+  an object. `tools/addon_assets.py` builds both files from the owner's Blender
+  export, from a single ready-made layer (`--static`), or from the four pieces
+  the first version of the addon drew (`--pieces`); both are written already
+  turned to the page.
+
+The writing is the only thing above the overlay: two labels in a rotated,
+colourless container, sitting on the paper the overlay has already drawn.
+
+**The light.** Two optional panel-sized pictures over the lot of it, the writing
+included — `assets/shadow.png` and `assets/light.png`. They are the room the
+cassette stands in rather than a part of the drawing, so they do not change when
+the sleeve does. The shadow is drawn `LV_BLEND_MODE_MULTIPLY` (its dark pixels
+darken what is under them) and the light `LV_BLEND_MODE_ADDITIVE` (its white
+pixels add); in both, the alpha is the strength, so a transparent pixel is no
+change at all. Neither file is required: the page asks for it and leaves the
+layer out when the card does not have one. `tools/addon_assets.py` writes them
+from `--shadow`/`--light` (or from the drawing's own `shadow.png`/`light.png`),
+turning them like the rest. LVGL's multiply is `dest * src >> 8`, so a fully
+white pixel is 255/256 of the colour under it rather than exactly itself — the
+shadow's alpha has to carry the effect, not its brightness.
 
 **The palette.** `cpal.c` asks the player's own answer for the sleeve
 (`cover_page_tone()`, the same call the player's alternative arrangement tints
@@ -1371,14 +1406,20 @@ every sixty-fourth byte) and recolours when that changes, so the shell is the
 colour of the sleeve the eye can see, on the poll after it arrives.
 
 
-**The animation.** Two LVGL timers: 70 ms for the hubs and 500 ms for
+**The animation.** Two LVGL timers: 16 ms for the hubs and 500 ms for
 `device_state_get()`, both `power_pause_in_standby()`d and paused while the
-screen is not up. The hubs turn only while `AUDIO_STATUS_PLAYING`; their six
-studs are objects moved a step at a time — this build has `LV_USE_LINE 0`, and a
-transform layer per frame is not something to spend on a cassette. The wound
-tape on each hub is a circle whose diameter follows
-`progress_current_secs / progress_total_secs`, so the tape moves from the supply
-hub to the take-up one as the track runs.
+screen is not up. The hubs turn only while `AUDIO_STATUS_PLAYING`; what moves is
+the rotation of one 60 pixel image per hub (`lv_image_set_rotation`, the pivot is
+the picture's own centre), so a frame costs a small transform and the blend of
+the overlay over the rectangle it lands on. The tape is part of that picture: the
+wound reel turns with the hub, which is what the drawing has it do.
+
+**What it costs.** 320x480 in ARGB8888 is 614 KB, held while the page is open —
+that much for the overlay, and again for each of the two light textures when the
+card has them, so up to 1.8 MB with everything. The `.so` is unchanged and the
+pictures are decoded once at init from the card. The page used to decode five
+pieces (~480 KB) and build eighteen objects; it now decodes two, or four with
+the light, and builds seven, or nine.
 
 **The controls.** The page hides the status bar and the floating chevron
 (`topbar_set_hidden()`, `back_btn_force_hidden()`) — it is the cassette and
@@ -1398,6 +1439,19 @@ page, the palette from a real sleeve, the text on the label and the sprites all
 render there. The rotation of the hubs, the gestures and the memory the sprites
 take while the page is open were looked at on the device, not measured; the
 `frames:` line in the log is what to read if it ever feels heavy.
+
+**Checked for the three layers, 2026-11-10.** Offline only: the overlay and the
+hub were composited from the four pieces the page used to draw, and that stack
+differs from the old page by nothing above 2/255 on any pixel (0 pixels over
+that), so the drawing is the same one; the addon builds for the host with no
+warnings. It has not been on a device in this arrangement yet — what to look at
+is the hub's edge against the overlay's opening while it turns, and the label's
+writing on the paper.
+
+**The light, checked the same way.** A synthetic pair (a radial highlight in one
+corner, a soft shadow in the other) composited with LVGL's own arithmetic over
+the page previews as expected; the two layers cost one more blend of the
+invalidated rectangle per frame, which is the hub's 60x60 when it is turning.
 
 ## Covers on the rows of a list
 

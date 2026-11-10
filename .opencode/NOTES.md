@@ -213,10 +213,18 @@ it keyed on `sonix-player/sonix-player/docker/Dockerfile` + `rockboxdev/**`.
   then `tar -xzf lvgl.tgz -C sonix-player/sonix-player/lvgl --strip-components=1`.
   The player's Makefile reads the version from `lvgl/include/lvgl/lv_version.h`.
 - `make host` in the player tree builds `sonix_player_host`; SDL2, FreeType,
-  opusfile, wavpack and ALSA are installed on this machine. Audio output is not:
-  the simulator logs `Cannot open PCM device 'hw:0,0'` and every track "ends"
+  opusfile and ALSA are installed on this machine, **wavpack is not** (2026-11-10:
+  `build_host/system/decode/opusdec.o` fails with "Package wavpack was not found"),
+  so the simulator does not build here and the addons' own `make host` is the
+  only host build to run. Audio output is not: the simulator logs
+  `Cannot open PCM device 'hw:0,0'` and every track "ends"
   immediately, so playback cannot be heard here — decode startup is still
   visible in the log (`aac: libfdk-aac loaded`, `growfile: following ...`).
+- LVGL cloned fine on 2026-11-10 (`Cloning LVGL v9.6.0` in `make host`); the
+  tarball route above is only the fallback when git gives "early EOF".
+- The cross toolchain is not in a fresh checkout and `sonix-player/` starts
+  empty: `git submodule update --init` first, and `make target` / `check-abi`
+  need the 20-60 minute toolchain build (CI has it cached).
 
 ## Piped (the YouTube addon's backend), measured 2026-11-05/06
 
@@ -317,51 +325,53 @@ it keyed on `sonix-player/sonix-player/docker/Dockerfile` + `rockboxdev/**`.
   that animates "only while playing" therefore looks frozen in the simulator;
   the cassette addon spins while `status != PAUSED` for exactly that reason.
 
-## The cassette addon draws the owner's Blender render (2026-11-08)
+## Cassette addon: three layers (2026-11-10)
 
-- The design comes from a flat Blender render at **480x320**, and the page is
-  that drawing turned 90° clockwise to fill the 320x480 panel. So the render's
-  numbers are used as they are: `lrect()`/`lcircle()` in `cassette/cpage.c` do
-  the turn (`px = 320 - (ly + lh), py = lx`), and nothing in the file is in
-  panel coordinates that came from the drawing.
-- `tools/svg_to_lvgl_image.py` turns one of the drawing's SVG layers into an
-  `lv_image_dsc_t` compiled into the addon (ARGB8888, **B,G,R,A** byte order on
-  little-endian — getting that wrong draws a coloured square). The hub is such
-  a layer and is rotated at run time with `lv_image_set_rotation` (50-60 px, so
-  the transform layer is cheap); the window and the plate are 1:1 crops of the
-  render, pre-rotated in the generator, with the shell colour made transparent.
-- The shell itself stays an object: it has to take the sleeve's colour. Its
-  radius is 20 (drawing units, `SC(20)` on the panel), the drawing's outer edge
-  is `10,20 → 469,300`. The page behind it is black.
-- The label (`33,47 → 446,217`) is square at one end and **chamfered 22.5 px at
-  the other**; LVGL has no polygon, so two diamonds of the shell's colour cover
-  the corners, and they are repainted with the palette.
-- The baked reflection is a white image whose alpha is how much the render lifts
-  the shell (`(px - shell) / (255 - shell)`, only the paper excluded). It is very
-  subtle by nature: ~13 % at the strongest.
-- Cost of doing it this way: the addon's `.so` is ~930 KB, most of it the
-  full-screen reflection and the plate crop. On the card that is free; if RAM
-  ever matters, the reflection can go and nothing else changes.
-
-## Cassette addon: sprites instead of compiled images (2026-11-09)
-
-- The owner draws the cassette in Blender and exports both layers (SVG/PNG) and a
-  flat render. `tools/addon_assets.py` turns those into five PNGs in
-  `cassette/assets/`, already **turned to the page** (the drawing is 480x320, the
-  page is that rotated clockwise): `hub` (from `tape_roller.svg`, 59 px),
-  `window` and `plate` (crops of the render), `sticker` and `reflection` (his own
-  PNGs). The `.so` is 48 KB and the sprites are decoded once at init with
-  `stbi_load_from_memory` (exported) into `LV_COLOR_FORMAT_ARGB8888`.
-- stb hands back R,G,B,A and LVGL wants **B,G,R,A** on this machine; the loader in
-  `cpage.c` swizzles, and the pixels are freed in `stop()`.
-- Colours come from the player, not from a sampler of our own:
-  `cover_page_tone()` + `cover_tone_stretched()` on the buffer the player already
-  has. Nothing is mixed into the hue; only brightness is capped --
-  `BODY_MAX_VALUE 0.50` and `BODY_MAX_LUMA 120` (the paper label is ~194, and a
-  shell as bright as the label reads as glowing on this panel).
-- Crops of the render carry the shell's colour at their edges; when a crop must
-  show only its dark parts, drop the pixels that are blue-ish (`b - r > 18`) as
-  well as the bright ones, or a cyan fringe shows around the holes.
+- The page is the owner's flat render, drawn at **480x320** and turned 90°
+  clockwise to fill 320x480, so a drawing point lands on the page as
+  `x = 320 - y_drawing`, `y = x_drawing`. Nothing is redrawn in C any more.
+- Bottom to top: **one flat rectangle of `pal.body` filling the panel** (no
+  radius, no edge) — **`assets/hub.png`**, the reel with its tape and the black
+  disc as one picture, twice — **`assets/overlay.png`** 320x480 ARGB, which is
+  everything else including the black page, the shell's bevel and shadows, the
+  strip the reels sit in, the window, the screws, the label and the reflections.
+  The overlay is *above* the hubs: its alpha is where the colour and the reels
+  show through, and it frames a hub of any size. The artist/album labels are the
+  only thing above it, with no background of their own.
+- Hub pivots are fixed at `(181,143)` and `(181,336)` and are placed as
+  `centre - size/2` from the sprite's own `header.w/h`, so a hub drawn at
+  another size keeps the pivot. `lv_image_set_rotation` pivots on the picture's
+  centre by default in LVGL 9.6 (no `lv_image_set_pivot` needed).
+- `tools/addon_assets.py` writes both files, already turned to the page. Input
+  is one of `--static PNG` (one ready layer, 480x320 or 320x480), `--pieces DIR`
+  (the four pre-rotated pieces the first version drew: sticker, reflection,
+  window, plate) or `--blender-dir DIR --render PNG` (cut them out of the
+  project). `--hub PNG` overrides the hub drawing. The old four sprites are not
+  in the repository any more; take them from commit `341945a` if the overlay has
+  to be rebuilt exactly as it was.
+- Stb hands back R,G,B,A and LVGL wants **B,G,R,A** here; the loader in
+  `cpage.c` swizzles and the pixels are freed in `stop()`. Every picture is
+  decoded once at init with `stbi_load_from_memory` (exported) into
+  `LV_COLOR_FORMAT_ARGB8888`; a file that is not on the card is simply skipped.
+- The overlay costs **614 KB** of RAM while the page is open (five pieces used
+  to be ~480 KB); the `.so` is unchanged and the pictures live on the card.
+- **Light**: two optional panel-sized pictures, `assets/shadow.png` and
+  `assets/light.png`, drawn above everything including the labels — the shadow
+  with `LV_BLEND_MODE_MULTIPLY` (`lv_image_set_blend_mode`), the light with
+  `LV_BLEND_MODE_ADDITIVE`; alpha is the strength in both. LVGL's multiply is
+  `dest * src >> 8` and the result is mixed by the source alpha, so a white
+  pixel is 255/256 of the colour rather than exactly it, and a transparent one
+  changes nothing. Non-normal blend modes are only safe because these two are
+  plain images — no radius, no transform, `LV_OPA_COVER` — so LVGL draws them
+  straight into the area buffer; give them a radius or a rotation and they go
+  through a layer, where the blend has nothing under it to read.
+- The stack was checked offline, not on a device: composited from the old pieces
+  it differs from the old page by nothing above 2/255 on any pixel, and the two
+  light layers were previewed with LVGL's own arithmetic over that page.
+  `make host ADDON_IDS=cassette` builds clean with `-Wextra -Wshadow`; the
+  three layers and the light have not been on a device yet.
+- Cost with everything on the card: overlay + shadow + light = three 320x480
+  ARGB buffers, 1.8 MB of RAM while the page is open.
 
 ## Cassette palette follows the picture, not the track (2026-11-09)
 

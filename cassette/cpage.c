@@ -8,9 +8,12 @@
 
 // The owner's drawing, as sprites on the card (tools/addon_assets.py writes
 // them already turned to the page). They are decoded once, at init, into ARGB
-// images the page keeps for as long as it is open.
-static lv_image_dsc_t spr_hub, spr_window, spr_plate, spr_sticker, spr_reflection;
-static void *spr_pixels[5];
+// images the page keeps for as long as it is open: the reel that turns, the one
+// overlay everything else is baked into, and the light -- a shadow, whose dark
+// pixels multiply, and a light, whose white pixels add. The two light textures
+// are optional: without them the page is the flat shell and the overlay.
+static lv_image_dsc_t spr_hub, spr_overlay, spr_shadow, spr_light;
+static void *spr_pixels[4];
 
 static bool sprite_load(const char *dir, const char *name, lv_image_dsc_t *dsc, void **keep) {
 	char path[512];
@@ -64,12 +67,9 @@ static bool sprite_load(const char *dir, const char *name, lv_image_dsc_t *dsc, 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdio.h>
 #include <string.h>
 
 #include "cpal.h"
-
-#include "src/system/image/stb_image_decl.h"
 
 #include "src/gui/nowplaying/player.h"
 #include "src/gui/fonts/fonts.h"
@@ -98,9 +98,18 @@ static bool sprite_load(const char *dir, const char *name, lv_image_dsc_t *dsc, 
 // down one edge with its writing turned with it, exactly as it would be on a
 // cassette standing on its short end -- the reference the owner picked.
 //
-// Everything the page draws is a handful of LVGL objects whose colours are set
-// once per track: only the six studs of each hub are moved on every frame,
-// which is what keeps this affordable on a MIPS without a GPU.
+// Three layers, bottom to top: one flat rectangle of the shell's colour, the
+// two hubs turned every frame, and one 320x480 overlay with everything else
+// baked into it -- the shell's shape, its shadows and bevel, the strip the
+// reels sit in, the window, the screws, the label and the reflections. Its
+// alpha is where the colour and the hubs show through, and it is drawn over
+// them, so it frames the turning reels too. The label's writing is the only
+// thing drawn above it: two LVGL labels, no background of their own.
+//
+// That is the whole page. Everything that does not move is the owner's picture
+// in one file (tools/addon_assets.py writes it), so a frame costs one rotation
+// of a 60 pixel image and the blend of the overlay over the rectangle it lands
+// on -- which is what keeps this affordable on a MIPS without a GPU.
 
 // Font faces, in panel pixels. The label is written on by hand, so it is
 // Caveat, brought in the addon's assets/; the player's own face stands in when
@@ -123,9 +132,7 @@ static bool sprite_load(const char *dir, const char *name, lv_image_dsc_t *dsc, 
 #define DEG2RAD 0.017453292f
 
 typedef struct {
-	lv_obj_t *image; // the hub, from the owner's drawing (assets/hub.c)
-	int32_t cx, cy;
-	int32_t r;
+	lv_obj_t *image; // the hub, from the owner's drawing (assets/hub.png)
 } reel_t;
 
 static void reel_turn(reel_t *r, float deg);
@@ -133,15 +140,10 @@ static void reel_turn(reel_t *r, float deg);
 static const gui_config_t *cfg;
 static lv_obj_t *screen;
 static lv_obj_t *body;
-static lv_obj_t *shell;
-static lv_obj_t *panel;
-static lv_obj_t *label_panel;
+static lv_obj_t *shell; // only when the overlay is missing: the plain colour
 static lv_obj_t *label_block;
 static lv_obj_t *artist_label;
 static lv_obj_t *note_label;
-static lv_obj_t *head_strip;
-static lv_obj_t *insert_strip;
-static lv_obj_t *screws[4];
 static reel_t reels[2];
 
 static lv_font_t *font_artist;
@@ -171,72 +173,18 @@ static void apply_palette(void);
 // the cassette
 // ---------------------------------------------------------------------------
 
-static lv_obj_t *circle(lv_obj_t *parent, int32_t d, lv_color_t fill, int32_t border) {
-	lv_obj_t *o = lv_obj_create(parent);
-	lv_obj_remove_style_all(o);
-	lv_obj_set_size(o, d, d);
-	lv_obj_set_style_radius(o, LV_RADIUS_CIRCLE, 0);
-	lv_obj_set_style_bg_color(o, fill, 0);
-	lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
-	if (border > 0) {
-		lv_obj_set_style_border_color(o, pal.ink, 0);
-		lv_obj_set_style_border_width(o, border, 0);
-	}
-	lv_obj_set_clickable(o, false);
-	lv_obj_set_scrollable(o, false);
-	return o;
-}
+// The sheet the owner drew on is 480x320 and the page is that sheet turned
+// ninety degrees clockwise, so a point of the drawing comes out on the page as
+// x = 320 - y_drawing, y = x_drawing. The two reels are at (143,139) and
+// (336,139) in the drawing; these are their centres on the page, and they are
+// the pivots the hubs turn about. They do not depend on the hub's picture: swap
+// in one drawn at another size and it is still placed, and still turns, about
+// these points -- the overlay frames it.
+static const int32_t reel_cx[2] = {181, 181};
+static const int32_t reel_cy[2] = {143, 336};
 
-static lv_obj_t *plate(lv_obj_t *parent, lv_color_t fill, int32_t border) {
-	lv_obj_t *o = lv_obj_create(parent);
-	lv_obj_remove_style_all(o);
-	lv_obj_set_style_bg_color(o, fill, 0);
-	lv_obj_set_style_bg_opa(o, LV_OPA_COVER, 0);
-	if (border > 0) {
-		lv_obj_set_style_border_color(o, pal.ink, 0);
-		lv_obj_set_style_border_width(o, border, 0);
-	}
-	lv_obj_set_clickable(o, false);
-	lv_obj_set_scrollable(o, false);
-	return o;
-}
-
-// ---------------------------------------------------------------------------
-// the drawing's coordinates
-// ---------------------------------------------------------------------------
-//
-// The cassette is the owner's flat render, drawn at 480x320, and the page is
-// that drawing turned ninety degrees clockwise to fill the panel (320x480):
-// the render's numbers go in here as they are, and lrect()/lcircle() do the
-// turn. Nothing in this file is in panel coordinates when it came from there.
-
-#define MOCK_H 320
-
-static void lrect(int32_t lx, int32_t ly, int32_t lw, int32_t lh, int32_t *x, int32_t *y, int32_t *w, int32_t *h) {
-	*x = MOCK_H - (ly + lh);
-	*y = lx;
-	*w = lh;
-	*h = lw;
-}
-
-static lv_obj_t *lplate(lv_obj_t *parent, int32_t lx, int32_t ly, int32_t lw, int32_t lh, lv_color_t fill, int32_t radius,
-						int32_t border) {
-	int32_t x, y, w, h;
-	lrect(lx, ly, lw, lh, &x, &y, &w, &h);
-	lv_obj_t *o = plate(parent, fill, border);
-	lv_obj_set_pos(o, x, y);
-	lv_obj_set_size(o, w, h);
-	lv_obj_set_style_radius(o, radius, 0);
-	return o;
-}
-
-static lv_obj_t *lcircle(lv_obj_t *parent, int32_t lcx, int32_t lcy, int32_t r, lv_color_t fill, int32_t border) {
-	lv_obj_t *o = circle(parent, r * 2, fill, border);
-	lv_obj_set_pos(o, MOCK_H - lcy - r, lcx - r);
-	return o;
-}
-
-// One step of the tape: the hub picture turns. It is 50 pixels square, so the
+// One step of the tape: the hub picture turns about its own centre, which the
+// placement below puts on the reel's. It is a 60 pixel picture, so the
 // transform LVGL spends on it every frame is a fraction of a full-screen one.
 static void reel_turn(reel_t *r, float deg) {
 	if (r->image) {
@@ -244,47 +192,76 @@ static void reel_turn(reel_t *r, float deg) {
 	}
 }
 
+static lv_obj_t *blank(lv_obj_t *parent) {
+	lv_obj_t *o = lv_obj_create(parent);
+	lv_obj_remove_style_all(o);
+	lv_obj_set_clickable(o, false);
+	lv_obj_set_scrollable(o, false);
+	return o;
+}
+
+// A panel-sized picture laid over everything, blended its own way: the shadow
+// multiplies (its dark pixels darken what is under them), the light adds (its
+// white pixels brighten it). Both are one object over the whole panel, so the
+// alpha in the file is the strength and the colour decides the sign.
+static lv_obj_t *light_layer(lv_obj_t *parent, lv_image_dsc_t *dsc, lv_blend_mode_t mode) {
+	if (dsc->data == NULL) {
+		return NULL;
+	}
+	lv_obj_t *o = lv_image_create(parent);
+	lv_image_set_src(o, dsc);
+	lv_image_set_blend_mode(o, mode);
+	lv_obj_set_pos(o, 0, 0);
+	return o;
+}
+
 static void build_cassette(void) {
 	int32_t W = (int32_t)cfg->screen_width;
 	int32_t H = (int32_t)cfg->screen_height;
 
-	// The page is black; the cassette is the rounded rectangle of the owner's
-	// body, and everything else sits on it in the drawing's coordinates.
-	body = plate(screen, lv_color_black(), 0);
+	// The first layer: the shell's colour and nothing else, the whole panel
+	// tall. The overlay covers what is not the shell, so its own shape is not
+	// this object's business. Without the overlay there is nothing to cover it,
+	// and the page falls back to the plain rounded rectangle it used to be.
+	body = blank(screen);
 	lv_obj_set_pos(body, 0, 0);
 	lv_obj_set_size(body, W, H);
-
-	shell = lplate(body, 10, 20, 459, 279, pal.body, SC(20), 0);
-
-	// The paper label: a long field down one side, the writing turned with it.
-	// The baked reflection, white over the shell's colour: it is the owner's
-	// drawing of the light on the body, and it has to come before everything
-	// that is not the body.
-	lv_obj_t *cast = lv_image_create(body);
-	lv_image_set_src(cast, &spr_reflection);
-	{
-		int32_t x, y, w, h;
-		lrect(94, 224, 291, 67, &x, &y, &w, &h);
-		lv_obj_set_pos(cast, x, y);
+	if (spr_overlay.data == NULL) {
+		lv_obj_set_style_bg_color(body, lv_color_black(), 0);
+		lv_obj_set_style_bg_opa(body, LV_OPA_COVER, 0);
+		shell = blank(body);
+		lv_obj_set_pos(shell, 21, 10); // the drawing's 10,20 -> 469,299
+		lv_obj_set_size(shell, 279, 459);
+		lv_obj_set_style_radius(shell, SC(20), 0);
+		lv_obj_set_style_bg_opa(shell, LV_OPA_COVER, 0);
+	} else {
+		lv_obj_set_style_bg_color(body, pal.body, 0);
+		lv_obj_set_style_bg_opa(body, LV_OPA_COVER, 0);
 	}
 
-	// The paper label is the owner's sticker, as drawn: chamfers, corners and all.
-	{
-		int32_t x, y, w, h;
-		lrect(32, 47, 415, 170, &x, &y, &w, &h);
-		lv_obj_t *sticker = lv_image_create(body);
-		lv_image_set_src(sticker, &spr_sticker);
-		lv_obj_set_pos(sticker, x, y);
+	// The second layer: the two hubs, under the overlay. They are placed by
+	// their centre, so a picture of another size keeps the pivot it had.
+	for (int s = 0; s < 2; s++) {
+		lv_obj_t *hub = lv_image_create(body);
+		lv_image_set_src(hub, &spr_hub);
+		lv_obj_set_pos(hub, reel_cx[s] - (int32_t)spr_hub.header.w / 2,
+					   reel_cy[s] - (int32_t)spr_hub.header.h / 2);
+		reels[s].image = hub;
 	}
 
-	// The writing goes on the part of the label the insert does not cover: in
-	// the drawing that is the band left of the strip (33..107 across), which
-	// turns into a horizontal band across the top of the page.
-	int32_t bw = 300;                 // along the label; a wider rotated layer is dropped
-	int32_t bh = 54;                  // across it: the label column left of the insert
-	// Centre of the free column of the label (the insert covers the middle of
-	// it): x 217..273, y 33..446 on the page.
-	label_block = plate(body, pal.label, 0);
+	// The third layer: everything that does not move.
+	if (spr_overlay.data != NULL) {
+		lv_obj_t *overlay = lv_image_create(body);
+		lv_image_set_src(overlay, &spr_overlay);
+		lv_obj_set_pos(overlay, 0, 0);
+	}
+
+	// The writing goes on the paper the overlay has already drawn: the band
+	// down the middle of the label, turned with the rest of it. The container
+	// has no colour of its own -- it is only here to rotate the two labels.
+	int32_t bw = 300; // along the label; a wider rotated layer is dropped
+	int32_t bh = 54;  // across it: the paper column between the strips
+	label_block = blank(body);
 	lv_obj_set_size(label_block, bw, bh);
 	lv_obj_set_pos(label_block, 245 - bw / 2, 239 - bh / 2);
 	lv_obj_set_style_transform_pivot_x(label_block, lv_pct(50), 0);
@@ -310,76 +287,27 @@ static void build_cassette(void) {
 	lv_obj_set_style_text_align(note_label, LV_TEXT_ALIGN_CENTER, 0);
 	lv_label_set_text(note_label, "");
 
-	// The strip the spools sit in: a lighter cut of the shell's colour.
-	lv_obj_t *insert = lplate(body, 107, 103, 265, 71, pal.body, SC(12), 0);
-	insert_strip = insert;
-	(void)insert;
-
-	// The two spools: the owner's hub drawing turned on top of the reel it
-	// hides, which is black.
-	int32_t r = 30;
-	for (int s = 0; s < 2; s++) {
-		int32_t lcx = s == 0 ? 143 : 336;
-		int32_t lcy = 139;
-		lcircle(body, lcx, lcy, r, pal.panel, 0);
-		int32_t x, y, w, h;
-		lrect(lcx - r, lcy - r, 2 * r, 2 * r, &x, &y, &w, &h);
-		lv_obj_t *hub = lv_image_create(body);
-		lv_image_set_src(hub, &spr_hub);
-		lv_obj_set_pos(hub, x, y);
-		reels[s].image = hub;
-		reels[s].cx = x + w / 2;
-		reels[s].cy = y + h / 2;
-		reels[s].r = r;
-	}
-
-	// The window, with the two bands of tape the head sees, and the plate at
-	// the short end -- both cut from the render, because they are shapes no
-	// rounded rectangle describes.
-	{
-		int32_t x, y, w, h;
-		lrect(195, 114, 90, 50, &x, &y, &w, &h);
-		(void)w;
-		(void)h;
-		lv_obj_t *win = lv_image_create(body);
-		lv_image_set_src(win, &spr_window);
-		lv_obj_set_pos(win, x, y);
-
-		lrect(88, 216, 304, 84, &x, &y, &w, &h);
-		lv_obj_t *plate_img = lv_image_create(body);
-		lv_image_set_src(plate_img, &spr_plate);
-		lv_obj_set_pos(plate_img, x, y);
-	}
-
-	// Screws in the corners.
-	// The screws are hardware, not artwork: one fixed dark grey, whatever the
-	// sleeve does to the shell around them.
-	const int32_t screw_at[4][2] = {{28, 38}, {452, 38}, {28, 282}, {452, 282}};
-	for (int i = 0; i < 4; i++) {
-		screws[i] = lcircle(body, screw_at[i][0], screw_at[i][1], 7, lv_color_make(0x4a, 0x4a, 0x4a), 0);
-	}
+	// The light goes over the lot of it, the writing included: it is the room
+	// the cassette stands in, not a part of the drawing. Each file is optional
+	// and each is a panel-sized picture, so a missing one costs nothing.
+	light_layer(body, &spr_shadow, LV_BLEND_MODE_MULTIPLY);
+	light_layer(body, &spr_light, LV_BLEND_MODE_ADDITIVE);
 }
 
 static void apply_palette(void) {
 	if (body == NULL) {
 		return;
 	}
+	// The colour layer is the whole page when the overlay is there to cover the
+	// rest of it; without the overlay it is only the shell's rectangle.
 	lv_obj_set_style_bg_color(screen, pal.bg, 0);
-	lv_obj_set_style_bg_color(body, lv_color_black(), 0);
-	if (shell) {
+	if (spr_overlay.data != NULL) {
+		lv_obj_set_style_bg_color(body, pal.body, 0);
+	} else if (shell) {
 		lv_obj_set_style_bg_color(shell, pal.body, 0);
 	}
-	lv_obj_set_style_bg_color(panel, pal.panel, 0);
-	lv_obj_set_style_bg_color(label_block, lv_color_make(0xc5, 0xc2, 0xb1), 0);
 	lv_obj_set_style_text_color(artist_label, pal.ink, 0);
 	lv_obj_set_style_text_color(note_label, pal.body_dark, 0);
-	lv_obj_set_style_bg_color(head_strip, pal.body_dark, 0);
-	if (insert_strip) {
-		lv_obj_set_style_bg_color(insert_strip, pal.body, 0);
-	}
-
-
-
 }
 
 // ---------------------------------------------------------------------------
@@ -636,10 +564,9 @@ lv_obj_t *cpage_build(const sonix_addon_host_t *host) {
 
 	fonts_load(host->dir);
 	sprite_load(host->dir, "hub.png", &spr_hub, &spr_pixels[0]);
-	sprite_load(host->dir, "window.png", &spr_window, &spr_pixels[1]);
-	sprite_load(host->dir, "plate.png", &spr_plate, &spr_pixels[2]);
-	sprite_load(host->dir, "sticker.png", &spr_sticker, &spr_pixels[3]);
-	sprite_load(host->dir, "reflection.png", &spr_reflection, &spr_pixels[4]);
+	sprite_load(host->dir, "overlay.png", &spr_overlay, &spr_pixels[1]);
+	sprite_load(host->dir, "shadow.png", &spr_shadow, &spr_pixels[2]);
+	sprite_load(host->dir, "light.png", &spr_light, &spr_pixels[3]);
 
 	screen = lv_obj_create(NULL);
 	lv_obj_remove_style_all(screen);
@@ -707,26 +634,20 @@ void cpage_stop(void) {
 	screen = NULL;
 	body = NULL;
 	shell = NULL;
-	panel = NULL;
-	label_panel = NULL;
 	label_block = NULL;
 	artist_label = NULL;
 	note_label = NULL;
-	head_strip = NULL;
-	insert_strip = NULL;
-	memset(screws, 0, sizeof(screws));
 	memset(reels, 0, sizeof(reels));
-	for (int i = 0; i < 5; i++) {
+	for (int i = 0; i < 4; i++) {
 		if (spr_pixels[i]) {
 			stbi_image_free(spr_pixels[i]);
 			spr_pixels[i] = NULL;
 		}
 	}
 	memset(&spr_hub, 0, sizeof(spr_hub));
-	memset(&spr_window, 0, sizeof(spr_window));
-	memset(&spr_plate, 0, sizeof(spr_plate));
-	memset(&spr_sticker, 0, sizeof(spr_sticker));
-	memset(&spr_reflection, 0, sizeof(spr_reflection));
+	memset(&spr_overlay, 0, sizeof(spr_overlay));
+	memset(&spr_shadow, 0, sizeof(spr_shadow));
+	memset(&spr_light, 0, sizeof(spr_light));
 	cfg = NULL;
 	shown_picture = 0;
 }
