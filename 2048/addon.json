@@ -1,0 +1,9 @@
+{
+  "api": 1,
+  "title": "2048",
+  "titles": { "Russian": "2048" },
+  "section": "more",
+  "order": 8,
+  "version": "0.1",
+  "icon": "icon.png"
+}
