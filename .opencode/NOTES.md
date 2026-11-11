@@ -456,3 +456,33 @@ it keyed on `sonix-player/sonix-player/docker/Dockerfile` + `rockboxdev/**`.
   `/mnt/sd_0/.local/sonix_player.log` and it **appends** across restarts.
 - Screenshot: `dd if=/dev/fb0` is 320x480 BGRA with stride 1280; the panel is
   readable while the backlight is on only.
+
+## One-line labels: dots, not a character count (2026-11-11)
+
+- `common/oneline.{h,c}` — `oneline_label(lv_obj_t *label)`: `LV_LABEL_LONG_MODE_DOTS`
+  plus `lv_obj_set_height(label, lv_font_get_line_height(font))`. LVGL writes the
+  `...` itself and cuts with the real metrics of the font that draws (the
+  `LV_LABEL_LONG_DOT` spelling is a v9.1 compat alias; the enum in this LVGL is
+  `LV_LABEL_LONG_MODE_DOTS`). Called before the label's font and width are set,
+  the height is measured from the wrong face.
+- **The height is the whole trick.** `lv_label.c` computes dots only when
+  `size.y > lv_area_get_height(&txt_coords)` and cuts at the last visible line
+  (`p.y` rounded down to a whole line). Height of exactly one line = one line of
+  text ending in dots; `LV_SIZE_CONTENT` = it wraps and nothing is cut.
+- Why no magic number: the faces are proportional. Measured with FreeType on
+  `cassette/assets/Caveat.ttf` against the cassette's 300 px label — artist
+  22 px: 38 lower-case letters, 26 capitals, 35 Cyrillic lower-case, 31 digits;
+  "The Weeknd, Playboi Carti & Madonna" is 35 chars / 297 px (fits by 3 px),
+  "WWWWWWWWWW" is 10 chars / 160 px. Record line 16 px: 51 / 37 / 48 / 44.
+- The player's `src/gui/fonts/fonts.c` recognises a label pinned to one line by
+  its height being a whole number of its font's lines, so a UI size change keeps
+  it one line — that is a second reason to set the height and not just the mode.
+- Side effect worth knowing: `oneline_label()` replaces `LV_LABEL_LONG_WRAP`, so
+  the page must be able to afford a single line's height in its layout (cassette:
+  300x54 block holds 22 px + 16 px lines).
+- The library index is a 8.7 MB SQLite on the card, `/mnt/sd_0/.local/library.db`;
+  copy it to the device's `/tmp` first (`adb shell 'cp ... /tmp/lib.db'`) and pull
+  that, so a scan writing the real file cannot produce a torn read. Useful tables:
+  `MEDIA_TABLE(path,name,album,artist,...)` 3331 tracks, `ALBUM_ARTIST_LINK(path,album_artist)`
+  — the second is what `metadata_shown_artist()` answers with by default, and a file
+  with no album-artist tag has no row there, so the track's own artist shows instead.

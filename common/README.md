@@ -18,6 +18,11 @@ What is here:
   `docs/ADDONS.md`, "The card is the slowest thing in the player".
 - `gunzip.{h,c}` — a small inflate for the `Content-Encoding: gzip` a proxy in
   front of a server may add whatever the request asked for.
+- `oneline.{h,c}` — a label kept to one line, cut with dots: LVGL's
+  `LV_LABEL_LONG_MODE_DOTS` with the height pinned to the face's own line, which
+  is what makes it write `...` instead of wrapping. No character count: the
+  faces are proportional (300 px of the cassette's Caveat at 22 px holds 38
+  lower-case letters and 26 capitals). The label needs a fixed width first.
 - `store.{h,c}` — an addon's own `key = value` settings file on the card, written
   atomically. Every addon that remembers anything (a session, a token, a quality)
   uses this rather than the player's `device_config.ini`: that file belongs to

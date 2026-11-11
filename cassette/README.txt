@@ -18,10 +18,13 @@ WHAT IT IS / ЧТО ЭТО
   A cassette filling the screen, painted in the sleeve of what is playing: the
   shell takes its colour from the artwork, the label carries the artist, and the
   hubs turn while the music plays. The tape wound on the hubs moves from one to
-  the other as the track runs.
+  the other as the track runs. The artist and the record are one line each on
+  the label; what does not fit is cut and ends in "..." .
   Кассета во весь экран, раскрашенная обложкой играющего альбома: корпус берёт
   цвет с картинки, на ярлыке - исполнитель, катушки крутятся, пока играет
   музыка. Намотка ленты на катушках переезжает с одной на другую по ходу трека.
+  Исполнитель и альбом занимают на ярлыке по одной строке; что не влезает -
+  обрезается и заканчивается на "...".
 
 CONTROLS / УПРАВЛЕНИЕ
   tap          play / pause

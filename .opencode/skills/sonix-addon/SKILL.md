@@ -125,6 +125,14 @@ addon_cache_dir(host, cache, sizeof cache);               // <addon>/cache, crea
   with `lv_obj_set_scroll_dir(c, LV_DIR_VER)`.
 - A row name longer than ~18 characters overlaps its right-hand value; clip it
   yourself (`clip()` in `subsonic/page.c`).
+- A label that must stay on one line: `#include "common/oneline.h"`, give it a
+  fixed width first (`lv_pct(100)` of a sized parent counts), then
+  `oneline_label(label)` — it switches to `LV_LABEL_LONG_MODE_DOTS` and pins the
+  height to the face's own line, which is what makes LVGL cut and write `...`
+  instead of wrapping. No character count: the faces are proportional (300 px of
+  Caveat at 22 px holds 38 lower-case letters and 26 capitals). Called before
+  the font is set or before a later font change, the height is the wrong one —
+  call it again.
 
 ## Threads
 

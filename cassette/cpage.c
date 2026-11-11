@@ -69,6 +69,7 @@ static bool sprite_load(const char *dir, const char *name, lv_image_dsc_t *dsc, 
 #include <stdlib.h>
 #include <string.h>
 
+#include "common/oneline.h"
 #include "cpal.h"
 
 #include "src/gui/nowplaying/player.h"
@@ -166,6 +167,15 @@ static uint32_t anim_last_ms;
 // real sleeve lands. The picture itself is what moves the palette.
 static uint32_t shown_picture; // fingerprint of the sleeve on screen, 0 for none
 static bool shown_playing;
+
+// What the two labels were given last, as the strings the player handed over --
+// not what lv_label_get_text() says. With LV_LABEL_LONG_MODE_DOTS LVGL rewrites
+// the label's own buffer in place (the original is kept in its dot field and put
+// back only for the next measurement), so after a long name has been cut the
+// label's text is the cut one and comparing against it would set the same string
+// again on every poll: a free, a copy and a full refresh every 500 ms.
+static char shown_artist[256];
+static char shown_note[288];
 
 static void apply_palette(void);
 
@@ -271,20 +281,24 @@ static void build_cassette(void) {
 	lv_obj_set_flex_align(label_block, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
 	lv_obj_set_style_pad_row(label_block, 0, 0);
 
+	// One line each, cut with dots: the paper column is 300 px along the label,
+	// and an artist or a record longer than that used to wrap onto a second line
+	// and push the other one out of the paper. oneline_label() pins the height to
+	// the face's own line, which is what makes LVGL cut instead of wrap.
 	artist_label = lv_label_create(label_block);
 	lv_obj_set_width(artist_label, lv_pct(100));
-	lv_label_set_long_mode(artist_label, LV_LABEL_LONG_WRAP);
 	lv_obj_set_style_text_font(artist_label, font_artist, 0);
 	lv_obj_set_style_text_color(artist_label, pal.ink, 0);
 	lv_obj_set_style_text_align(artist_label, LV_TEXT_ALIGN_CENTER, 0);
+	oneline_label(artist_label);
 	lv_label_set_text(artist_label, "");
 
 	note_label = lv_label_create(label_block);
 	lv_obj_set_width(note_label, lv_pct(100));
-	lv_label_set_long_mode(note_label, LV_LABEL_LONG_WRAP);
 	lv_obj_set_style_text_font(note_label, font_note, 0);
 	lv_obj_set_style_text_color(note_label, pal.body_dark, 0);
 	lv_obj_set_style_text_align(note_label, LV_TEXT_ALIGN_CENTER, 0);
+	oneline_label(note_label);
 	lv_label_set_text(note_label, "");
 
 	// The light goes over the lot of it, the writing included: it is the room
@@ -324,7 +338,8 @@ static void refresh_labels(const device_state_t *st) {
 	if (artist == NULL || artist[0] == '\0') {
 		artist = st->current_file[0] ? "Unknown artist" : "--";
 	}
-	if (strcmp(lv_label_get_text(artist_label), artist) != 0) {
+	if (strcmp(shown_artist, artist) != 0) {
+		snprintf(shown_artist, sizeof(shown_artist), "%s", artist);
 		lv_label_set_text(artist_label, artist);
 	}
 
@@ -339,7 +354,8 @@ static void refresh_labels(const device_state_t *st) {
 	} else {
 		snprintf(note, sizeof(note), "SIDE A");
 	}
-	if (strcmp(lv_label_get_text(note_label), note) != 0) {
+	if (strcmp(shown_note, note) != 0) {
+		snprintf(shown_note, sizeof(shown_note), "%s", note);
 		lv_label_set_text(note_label, note);
 	}
 }
@@ -559,6 +575,8 @@ lv_obj_t *cpage_build(const sonix_addon_host_t *host) {
 	cpal_default(&pal);
 	shown_picture = 0;
 	shown_playing = false;
+	shown_artist[0] = '\0';
+	shown_note[0] = '\0';
 	angle_deg = 0.0f;
 	anim_last_ms = lv_tick_get();
 
@@ -650,4 +668,6 @@ void cpage_stop(void) {
 	memset(&spr_light, 0, sizeof(spr_light));
 	cfg = NULL;
 	shown_picture = 0;
+	shown_artist[0] = '\0';
+	shown_note[0] = '\0';
 }

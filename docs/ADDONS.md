@@ -1440,6 +1440,18 @@ screen *after* `stop()` returns, so `stop()` hands the labels `&font_ui_24` /
 `&font_ui_14` first. Without that, LVGL reads a freed face while tearing the page
 down.
 
+**Both labels are one line, cut with dots.** The paper column is 300 px along
+the cassette, and the artist and the record used to wrap onto a second line and
+push each other out of it. `common/oneline.h` (`oneline_label()`) puts them in
+`LV_LABEL_LONG_MODE_DOTS` and pins the height to the face's own line, which is
+what makes LVGL cut instead of wrap and write `...` in place of the rest. There
+is no character count anywhere: the face is proportional, so a number would be
+wrong both ways. Measured on `assets/Caveat.ttf` against the 300 px label — 22 px
+artist line: 38 lower-case letters fit, 26 capitals, 35 Cyrillic lower-case, and
+"The Weeknd, Playboi Carti & Madonna" is 35 characters at 297 px; 16 px record
+line: 51 / 37 / 48. The same helper is in `common/` for every addon that has a
+label which must not grow.
+
 **Checked on a device, 2026-11-09.** Installed on the V3 over adb: the tile, the
 page, the palette from a real sleeve, the text on the label and the sprites all
 render there. The rotation of the hubs, the gestures and the memory the sprites
