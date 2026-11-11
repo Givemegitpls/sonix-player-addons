@@ -1,0 +1,11 @@
+{
+	"api": 1,
+	"title": "Calculator",
+	"titles": {
+		"English": "Calculator",
+		"Russian": "Калькулятор"
+	},
+	"section": "more",
+	"version": "0.1",
+	"icon": "icon.png"
+}
