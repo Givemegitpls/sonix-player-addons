@@ -1,4 +1,3 @@
-#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,10 +15,13 @@
 
 // Four-function calculator for More: AC/C, backspace, phone-style %,
 // repeat '=', locale decimal, digit cap / scientific display, op highlight.
-// Title / error / clear labels follow lang_current(); glyphs are neutral.
+//
+// Numbers are rationals (p/q), same model as Windows Calculator's Ratpack /
+// AOSP ExactCalculator's BoundedRational: 1÷3 stays 1/3, ×3 is exactly 1.
+// Display rounds the rational to MAX_DIGITS significant digits.
 
-#define BUF_MAX 32
-#define EXPR_MAX 96
+#define BUF_MAX 48
+#define EXPR_MAX 128
 #define MAX_DIGITS 12
 #define KEY_GAP SC(10)
 #define KEY_RADIUS SC(16)
@@ -48,6 +50,11 @@ enum {
 	KEY_9 = 9,
 };
 
+typedef struct {
+	int64_t num;
+	int64_t den; // always > 0 after normalize
+} rat_t;
+
 static lv_obj_t *calc_screen;
 static lv_obj_t *expr_label;
 static lv_obj_t *display_label;
@@ -58,10 +65,10 @@ static gui_config_t *calc_cfg;
 static char buf[BUF_MAX];
 static char lhs[BUF_MAX];
 static char eq_expr[EXPR_MAX];
-static double acc;
+static rat_t acc;
 static int pending;
 static int last_op;
-static double last_rhs;
+static rat_t last_rhs;
 static bool have_repeat;
 static bool fresh;
 static bool errored;
@@ -70,6 +77,7 @@ static bool showing_eq;
 static const char *key_label(int key);
 static void refresh_display(void);
 static void refresh_op_highlight(void);
+static bool rat_format(rat_t r, char *out, size_t size);
 
 static bool lang_ru(void) {
 	const char *name = lang_current();
@@ -111,38 +119,414 @@ static void localise_number(const char *src, char *dst, size_t size) {
 	dst[i] = '\0';
 }
 
-static void format_number(double v, char *out, size_t size) {
-	if (!isfinite(v)) {
+// ---------------------------------------------------------------------------
+// rationals (Windows/AOSP model, fixed 64-bit limbs)
+// ---------------------------------------------------------------------------
+
+static rat_t rat_zero(void) {
+	return (rat_t){0, 1};
+}
+
+static int64_t i64_abs(int64_t x) {
+	return x < 0 ? -x : x;
+}
+
+static int64_t igcd(int64_t a, int64_t b) {
+	a = i64_abs(a);
+	b = i64_abs(b);
+	while (b) {
+		int64_t t = a % b;
+		a = b;
+		b = t;
+	}
+	return a ? a : 1;
+}
+
+static void rat_normalize(rat_t *r) {
+	if (!r->den) {
+		r->num = 0;
+		r->den = 1;
+		return;
+	}
+	if (r->den < 0) {
+		r->num = -r->num;
+		r->den = -r->den;
+	}
+	if (r->num == 0) {
+		r->den = 1;
+		return;
+	}
+	int64_t g = igcd(r->num, r->den);
+	r->num /= g;
+	r->den /= g;
+}
+
+static bool mul_i64(int64_t a, int64_t b, int64_t *out) {
+	if (a == 0 || b == 0) {
+		*out = 0;
+		return true;
+	}
+	// Overflow check without __int128 (32-bit MIPS toolchain).
+	if (a == INT64_MIN && b == -1) {
+		return false;
+	}
+	if (b == INT64_MIN && a == -1) {
+		return false;
+	}
+	int64_t aa = i64_abs(a);
+	int64_t bb = i64_abs(b);
+	if (aa > INT64_MAX / bb) {
+		return false;
+	}
+	*out = a * b;
+	return true;
+}
+
+static bool rat_add(rat_t a, rat_t b, rat_t *out) {
+	rat_normalize(&a);
+	rat_normalize(&b);
+	int64_t g = igcd(a.den, b.den);
+	int64_t a_den = a.den / g;
+	int64_t b_den = b.den / g;
+	int64_t t1, t2, num, den;
+	if (!mul_i64(a.num, b_den, &t1) || !mul_i64(b.num, a_den, &t2)) {
+		return false;
+	}
+	// t1 + t2 may overflow
+	if ((t2 > 0 && t1 > INT64_MAX - t2) || (t2 < 0 && t1 < INT64_MIN - t2)) {
+		return false;
+	}
+	num = t1 + t2;
+	if (!mul_i64(a_den, b.den, &den)) {
+		return false;
+	}
+	out->num = num;
+	out->den = den;
+	rat_normalize(out);
+	return true;
+}
+
+static bool rat_sub(rat_t a, rat_t b, rat_t *out) {
+	b.num = -b.num;
+	return rat_add(a, b, out);
+}
+
+static bool rat_mul(rat_t a, rat_t b, rat_t *out) {
+	rat_normalize(&a);
+	rat_normalize(&b);
+	// Cross-cancel before multiplying (Ratpack-style), to keep limbs small.
+	int64_t g1 = igcd(a.num, b.den);
+	a.num /= g1;
+	b.den /= g1;
+	int64_t g2 = igcd(b.num, a.den);
+	b.num /= g2;
+	a.den /= g2;
+	int64_t num, den;
+	if (!mul_i64(a.num, b.num, &num) || !mul_i64(a.den, b.den, &den)) {
+		return false;
+	}
+	out->num = num;
+	out->den = den;
+	rat_normalize(out);
+	return true;
+}
+
+static bool rat_div(rat_t a, rat_t b, rat_t *out) {
+	rat_normalize(&b);
+	if (b.num == 0) {
+		return false;
+	}
+	rat_t inv = {b.den, b.num};
+	if (inv.den < 0) {
+		inv.num = -inv.num;
+		inv.den = -inv.den;
+	}
+	return rat_mul(a, inv, out);
+}
+
+// Parse a decimal entry string ("-12.34") into an exact rational.
+static bool rat_parse(const char *s, rat_t *out) {
+	if (!s || !s[0]) {
+		*out = rat_zero();
+		return true;
+	}
+	int sign = 1;
+	if (*s == '-') {
+		sign = -1;
+		s++;
+	} else if (*s == '+') {
+		s++;
+	}
+	int64_t num = 0;
+	int64_t den = 1;
+	bool seen_dot = false;
+	bool any = false;
+	for (; *s; s++) {
+		if (*s == '.') {
+			if (seen_dot) {
+				return false;
+			}
+			seen_dot = true;
+			continue;
+		}
+		if (*s < '0' || *s > '9') {
+			return false;
+		}
+		any = true;
+		int dig = *s - '0';
+		if (num > (INT64_MAX - dig) / 10) {
+			return false;
+		}
+		num = num * 10 + dig;
+		if (seen_dot) {
+			if (den > INT64_MAX / 10) {
+				return false;
+			}
+			den *= 10;
+		}
+	}
+	if (!any) {
+		*out = rat_zero();
+		return true;
+	}
+	out->num = sign < 0 ? -num : num;
+	out->den = den;
+	rat_normalize(out);
+	return true;
+}
+
+static int count_digits_u64(uint64_t v) {
+	int n = 1;
+	while (v >= 10) {
+		v /= 10;
+		n++;
+	}
+	return n;
+}
+
+static void strip_trailing_frac_zeros(char *s) {
+	char *dot = strchr(s, '.');
+	if (!dot) {
+		return;
+	}
+	char *end = s + strlen(s) - 1;
+	while (end > dot && *end == '0') {
+		*end-- = '\0';
+	}
+	if (end == dot) {
+		*end = '\0';
+	}
+}
+
+// Round |num|/den to MAX_DIGITS significant digits for the screen only.
+// The in-memory rational stays exact (Windows Ratpack / AOSP display contract).
+static bool rat_format(rat_t r, char *out, size_t size) {
+	if (!out || size == 0) {
+		return false;
+	}
+	rat_normalize(&r);
+	if (r.den == 0) {
 		snprintf(out, size, "%s", t_error());
-		return;
+		return false;
 	}
-
-	double a = fabs(v);
-	char tmp[64];
-
-	// Phone-calc range: beyond ~12 digits or tiny fractions, use scientific.
-	if (a != 0.0 && (a >= 1e12 || a < 1e-9)) {
-		snprintf(tmp, sizeof(tmp), "%.6g", v);
-		snprintf(out, size, "%s", tmp);
-		return;
-	}
-
-	snprintf(tmp, sizeof(tmp), "%.10f", v);
-	char *dot = strchr(tmp, '.');
-	if (dot) {
-		char *end = tmp + strlen(tmp) - 1;
-		while (end > dot && *end == '0') {
-			*end-- = '\0';
-		}
-		if (end == dot) {
-			*end = '\0';
-		}
-	}
-	if (tmp[0] == '-' && strcmp(tmp + 1, "0") == 0) {
+	if (r.num == 0) {
 		snprintf(out, size, "0");
-		return;
+		return true;
 	}
-	snprintf(out, size, "%s", tmp);
+
+	int neg = r.num < 0;
+	uint64_t num = (uint64_t)(neg ? -r.num : r.num);
+	uint64_t den = (uint64_t)r.den;
+
+	uint64_t ip = num / den;
+	uint64_t rem = num % den;
+	int ip_digits = ip ? count_digits_u64(ip) : 0;
+
+	// Too large for the fixed window: scientific from the integer quotient.
+	if (ip_digits > MAX_DIGITS || (ip_digits == 0 && rem && num < den && den / num > 1000000000ULL)) {
+		// Build significand digits by scaling rem/num into [1,10) × 10^exp.
+		int exp = 0;
+		uint64_t n = num;
+		uint64_t d = den;
+		while (n < d) {
+			if (n > UINT64_MAX / 10) {
+				snprintf(out, size, "%s", t_error());
+				return false;
+			}
+			n *= 10;
+			exp--;
+		}
+		while (n / d >= 10) {
+			n /= 10;
+			exp++;
+		}
+		char digs[MAX_DIGITS + 2];
+		for (int i = 0; i < MAX_DIGITS + 1; i++) {
+			digs[i] = (char)('0' + (n / d));
+			n %= d;
+			if (n <= UINT64_MAX / 10) {
+				n *= 10;
+			} else {
+				n = 0;
+			}
+		}
+		if (digs[MAX_DIGITS] >= '5') {
+			for (int i = MAX_DIGITS - 1; i >= 0; i--) {
+				if (digs[i] < '9') {
+					digs[i]++;
+					break;
+				}
+				digs[i] = '0';
+				if (i == 0) {
+					memmove(digs + 1, digs, (size_t)MAX_DIGITS);
+					digs[0] = '1';
+					exp++;
+				}
+			}
+		}
+		digs[MAX_DIGITS] = '\0';
+		{
+			size_t L = strlen(digs);
+			while (L > 1 && digs[L - 1] == '0') {
+				digs[--L] = '\0';
+			}
+		}
+		if (digs[1]) {
+			snprintf(out, size, "%s%c.%se%d", neg ? "-" : "", digs[0], digs + 1, exp);
+		} else {
+			snprintf(out, size, "%s%ce%d", neg ? "-" : "", digs[0], exp);
+		}
+		return true;
+	}
+
+	// Fixed path: at most MAX_DIGITS integer digits (else scientific above).
+	// Digits are written by hand so GCC cannot warn about %llu→small buffer.
+	char frac[MAX_DIGITS + 10];
+	int sig_have = ip_digits;
+	int frac_budget = MAX_DIGITS - sig_have;
+	if (ip == 0) {
+		frac_budget = MAX_DIGITS + 8; // leading zeros after the point; tinier → sci
+	}
+	if (frac_budget < 0) {
+		frac_budget = 0;
+	}
+	if (frac_budget > (int)sizeof(frac) - 2) {
+		frac_budget = (int)sizeof(frac) - 2;
+	}
+
+	int frac_len = 0;
+	int sig = sig_have;
+	bool started = ip != 0;
+	uint64_t rrem = rem;
+
+	while (rrem && frac_len < frac_budget + 1) {
+		rrem *= 10;
+		int dig = (int)(rrem / den);
+		rrem %= den;
+		frac[frac_len++] = (char)('0' + dig);
+		if (!started) {
+			if (dig != 0) {
+				started = true;
+				sig = 1;
+			}
+		} else {
+			sig++;
+		}
+		if (started && sig >= MAX_DIGITS + 1) {
+			break;
+		}
+	}
+	frac[frac_len] = '\0';
+
+	if (frac_len > 0 && started) {
+		int keep = frac_len;
+		if (ip != 0) {
+			keep = MAX_DIGITS - ip_digits;
+			if (keep < 0) {
+				keep = 0;
+			}
+		} else {
+			int lead = 0;
+			while (frac[lead] == '0') {
+				lead++;
+			}
+			keep = lead + MAX_DIGITS;
+		}
+		if (keep > (int)sizeof(frac) - 1) {
+			keep = (int)sizeof(frac) - 1;
+		}
+		if (keep < frac_len) {
+			if (frac[keep] >= '5') {
+				int i = keep - 1;
+				while (i >= 0) {
+					if (frac[i] < '9') {
+						frac[i]++;
+						break;
+					}
+					frac[i] = '0';
+					i--;
+				}
+				if (i < 0) {
+					ip++;
+					ip_digits = count_digits_u64(ip);
+				}
+			}
+			frac[keep] = '\0';
+			frac_len = keep;
+		}
+	}
+
+	while (frac_len > 0 && frac[frac_len - 1] == '0') {
+		frac[--frac_len] = '\0';
+	}
+
+	size_t pos = 0;
+	if (neg) {
+		if (pos + 1 >= size) {
+			return false;
+		}
+		out[pos++] = '-';
+	}
+	if (ip == 0) {
+		if (pos + 1 >= size) {
+			return false;
+		}
+		out[pos++] = '0';
+	} else {
+		char idigs[MAX_DIGITS + 2];
+		int n = 0;
+		uint64_t v = ip;
+		do {
+			idigs[n++] = (char)('0' + (v % 10));
+			v /= 10;
+		} while (v && n < MAX_DIGITS + 1);
+		while (n--) {
+			if (pos + 1 >= size) {
+				return false;
+			}
+			out[pos++] = idigs[n];
+		}
+	}
+	if (frac_len > 0) {
+		if (pos + 1 >= size) {
+			return false;
+		}
+		out[pos++] = '.';
+		for (int i = 0; i < frac_len; i++) {
+			if (pos + 1 >= size) {
+				return false;
+			}
+			out[pos++] = frac[i];
+		}
+	}
+	out[pos] = '\0';
+	strip_trailing_frac_zeros(out);
+	if (out[0] == '-' && strcmp(out + 1, "0") == 0) {
+		out[0] = '0';
+		out[1] = '\0';
+	}
+	(void)ip_digits;
+	return true;
 }
 
 static bool has_entry(void) {
@@ -239,7 +623,7 @@ static void refresh_display(void) {
 
 static void set_error(void) {
 	errored = true;
-	acc = 0;
+	acc = rat_zero();
 	pending = 0;
 	fresh = true;
 	showing_eq = false;
@@ -251,14 +635,14 @@ static void set_error(void) {
 }
 
 static void clear_all(void) {
-	acc = 0;
+	acc = rat_zero();
 	pending = 0;
 	fresh = true;
 	errored = false;
 	showing_eq = false;
 	have_repeat = false;
 	last_op = 0;
-	last_rhs = 0;
+	last_rhs = rat_zero();
 	buf[0] = '\0';
 	lhs[0] = '\0';
 	eq_expr[0] = '\0';
@@ -298,36 +682,41 @@ static void input_clear(void) {
 	clear_all();
 }
 
-static double current_value(void) {
-	if (!buf[0]) {
-		return 0;
+// When the entry is "fresh", `acc` is the exact left/result value. Re-parsing
+// the rounded display string would destroy 1÷3 and break ×3 → 1.
+static bool operand(rat_t *out) {
+	if (fresh) {
+		*out = acc;
+		return true;
 	}
-	return strtod(buf, NULL);
+	if (!buf[0]) {
+		*out = rat_zero();
+		return true;
+	}
+	return rat_parse(buf, out);
 }
 
-static bool apply_op(int op, double left, double right, double *out) {
+static bool apply_op(int op, rat_t left, rat_t right, rat_t *out) {
+	bool ok = false;
 	switch (op) {
 	case KEY_ADD:
-		*out = left + right;
+		ok = rat_add(left, right, out);
 		break;
 	case KEY_SUB:
-		*out = left - right;
+		ok = rat_sub(left, right, out);
 		break;
 	case KEY_MUL:
-		*out = left * right;
+		ok = rat_mul(left, right, out);
 		break;
 	case KEY_DIV:
-		if (right == 0.0) {
-			set_error();
-			return false;
-		}
-		*out = left / right;
+		ok = rat_div(left, right, out);
 		break;
 	default:
 		*out = right;
+		ok = true;
 		break;
 	}
-	if (!isfinite(*out)) {
+	if (!ok) {
 		set_error();
 		return false;
 	}
@@ -335,17 +724,29 @@ static bool apply_op(int op, double left, double right, double *out) {
 }
 
 static bool apply_pending(void) {
-	double rhs = current_value();
-	double result = rhs;
+	rat_t rhs;
+	if (!operand(&rhs)) {
+		set_error();
+		return false;
+	}
+	rat_t result = rhs;
 
 	if (pending) {
 		if (!apply_op(pending, acc, rhs, &result)) {
 			return false;
 		}
+	} else if (!fresh) {
+		// Commit a freshly typed entry into acc.
+		acc = rhs;
 	}
 
-	acc = result;
-	format_number(result, buf, sizeof(buf));
+	if (pending) {
+		acc = result;
+	}
+	if (!rat_format(acc, buf, sizeof(buf))) {
+		set_error();
+		return false;
+	}
 	fresh = true;
 	return true;
 }
@@ -441,7 +842,7 @@ static void input_op(int op) {
 	}
 	snprintf(lhs, sizeof(lhs), "%s", buf[0] ? buf : "0");
 	pending = op;
-	acc = current_value();
+	// `acc` already holds the exact left operand from apply_pending / prior result.
 	fresh = true;
 	have_repeat = false;
 	refresh_display();
@@ -459,7 +860,10 @@ static void input_eq(void) {
 		char rhs_l[BUF_MAX];
 		snprintf(rhs_txt, sizeof(rhs_txt), "%s", buf[0] ? buf : "0");
 		last_op = pending;
-		last_rhs = current_value();
+		if (!operand(&last_rhs)) {
+			set_error();
+			return;
+		}
 		have_repeat = true;
 		localise_number(lhs, lhs_l, sizeof(lhs_l));
 		localise_number(rhs_txt, rhs_l, sizeof(rhs_l));
@@ -478,9 +882,16 @@ static void input_eq(void) {
 		char left_l[BUF_MAX];
 		char rhs_txt[BUF_MAX];
 		char rhs_l[BUF_MAX];
-		double left = current_value();
-		double result;
-		format_number(last_rhs, rhs_txt, sizeof(rhs_txt));
+		rat_t left;
+		rat_t result;
+		if (!operand(&left)) {
+			set_error();
+			return;
+		}
+		if (!rat_format(last_rhs, rhs_txt, sizeof(rhs_txt))) {
+			set_error();
+			return;
+		}
 		localise_number(buf[0] ? buf : "0", left_l, sizeof(left_l));
 		localise_number(rhs_txt, rhs_l, sizeof(rhs_l));
 		snprintf(eq_expr, sizeof(eq_expr), "%s %s %s", left_l, key_label(last_op), rhs_l);
@@ -488,7 +899,10 @@ static void input_eq(void) {
 			return;
 		}
 		acc = result;
-		format_number(result, buf, sizeof(buf));
+		if (!rat_format(result, buf, sizeof(buf))) {
+			set_error();
+			return;
+		}
 		fresh = true;
 		showing_eq = true;
 		refresh_display();
@@ -506,7 +920,10 @@ static void input_sign(void) {
 		return;
 	}
 	if (fresh && !buf[0]) {
-		format_number(acc, buf, sizeof(buf));
+		if (!rat_format(acc, buf, sizeof(buf))) {
+			set_error();
+			return;
+		}
 		fresh = false;
 	}
 	if (!buf[0] || strcmp(buf, "0") == 0) {
@@ -520,7 +937,10 @@ static void input_sign(void) {
 	}
 	if (pending && fresh) {
 		snprintf(lhs, sizeof(lhs), "%s", buf);
-		acc = current_value();
+		if (!rat_parse(buf[0] ? buf : "0", &acc)) {
+			set_error();
+			return;
+		}
 	}
 	refresh_display();
 }
@@ -530,19 +950,31 @@ static void input_percent(void) {
 		clear_all();
 		return;
 	}
-	double cur = current_value();
-	double v;
-	// Phone-style: with +/− pending, n% is (acc * n / 100); otherwise /100.
-	if (pending == KEY_ADD || pending == KEY_SUB) {
-		v = acc * (cur / 100.0);
-	} else {
-		v = cur / 100.0;
-	}
-	if (!isfinite(v)) {
+	rat_t cur;
+	if (!operand(&cur)) {
 		set_error();
 		return;
 	}
-	format_number(v, buf, sizeof(buf));
+	rat_t hundred = {100, 1};
+	rat_t v;
+	// Phone-style: with +/− pending, n% is (acc * n / 100); otherwise /100.
+	if (pending == KEY_ADD || pending == KEY_SUB) {
+		rat_t pct;
+		if (!rat_div(cur, hundred, &pct) || !rat_mul(acc, pct, &v)) {
+			set_error();
+			return;
+		}
+	} else {
+		if (!rat_div(cur, hundred, &v)) {
+			set_error();
+			return;
+		}
+	}
+	acc = v;
+	if (!rat_format(acc, buf, sizeof(buf))) {
+		set_error();
+		return;
+	}
 	fresh = true;
 	showing_eq = false;
 	refresh_display();
@@ -670,7 +1102,6 @@ static lv_obj_t *make_key(lv_obj_t *parent, int key, int width, int height) {
 
 	if (key_is_op(key)) {
 		lv_obj_add_style(btn, &theme_style_accent_bg, 0);
-		// Pressed: darken so the finger gets the same feedback digits do.
 		lv_obj_set_style_bg_color(btn, theme()->surface_pressed, LV_STATE_PRESSED);
 		lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_STATE_PRESSED);
 	} else {
@@ -811,10 +1242,10 @@ static bool calc_stop(void) {
 	clear_label = NULL;
 	memset(op_btns, 0, sizeof(op_btns));
 	calc_cfg = NULL;
-	acc = 0;
+	acc = rat_zero();
 	pending = 0;
 	last_op = 0;
-	last_rhs = 0;
+	last_rhs = rat_zero();
 	have_repeat = false;
 	fresh = true;
 	errored = false;
