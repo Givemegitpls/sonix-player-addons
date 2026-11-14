@@ -184,6 +184,20 @@ gearboy: settings /mnt/sd_0/Addons/gearboy/settings.ini (read|new)
 
 ## Грабли, уже стоившие времени
 
+- **C++ в аддоне требует `extern "C"` на всё, что зовёт C-половина.** `addon.c` — C, и
+  `dlopen` падает с `undefined symbol: gravity_quit`, если функция объявлена в `.cpp` без
+  `extern "C"`: C хочет `gravity_quit`, C++ отдаёт `_Z12gravity_quitv`. Касается и
+  заголовков самого плеера: `src/gui/shell/gui.h` — C-заголовок без `extern "C"`, поэтому
+  `gui_post` из C++ объявляют отдельно (`extern "C" bool gui_post(...)`) вместо включения
+  шапки. Проверять `nm -D -u <addon.so> | grep '_Z'`.
+- **Ландшафтная игра на портретной панели.** LVGL живёт в панели (здесь 320x480 —
+  `SONIX_LAYOUT_SCALE=2`), поэтому кадр 480x320 показывают как `lv_image` размером с экран
+  с `lv_image_set_rotation(img, 900)` и `lv_image_set_scale(img, 256 * screen_w / src_h)`
+  (256 в портрете, 384 на 480x720-панели симулятора). Проверять по скриншоту: поворот
+  900 даёт читаемый текст и меню слева, 2700 — вверх ногами.
+- **Статус-бар возвращается сам** при переключении экрана: `topbar_set_hidden(true)` в
+  `init()` не работает, нужен колбэк на `LV_EVENT_SCREEN_LOADED` (и `false` на
+  `LV_EVENT_SCREEN_UNLOADED`).
 - `CROSS_CXX` не был объявлен в `Makefile`: правило `.opp` разворачивалось в пустой
   компилятор, и make печатал `make: O2: No such file or directory` — похоже на проблему shell.
 - `init()` менял экран (см. шаг 4) — статус-бар поверх Flappy.

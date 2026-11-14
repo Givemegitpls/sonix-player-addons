@@ -366,3 +366,14 @@ pack: target
 .PHONY: clean
 clean:
 	rm -rf $(BUILD_DIR)
+
+# ---------------------------------------------------------------------------
+# The dependencies the compiler wrote
+#
+# Every rule passes -MMD, which writes <object>.d beside each object, and nothing
+# used to read them: a change to a header rebuilt nothing, and the only symptom
+# was an object that did not match its sources (a symbol still mangled after the
+# header grew extern "C", a constant still the old one). Including them here is
+# the whole fix; the tree is small enough for the find to run every time.
+# ---------------------------------------------------------------------------
+-include $(shell find $(BUILD_DIR) -name '*.d' 2>/dev/null)
