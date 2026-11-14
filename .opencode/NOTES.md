@@ -486,3 +486,23 @@ it keyed on `sonix-player/sonix-player/docker/Dockerfile` + `rockboxdev/**`.
   `MEDIA_TABLE(path,name,album,artist,...)` 3331 tracks, `ALBUM_ARTIST_LINK(path,album_artist)`
   — the second is what `metadata_shown_artist()` answers with by default, and a file
   with no album-artist tag has no row there, so the track's own artist shows instead.
+
+## Build quirks (2026-11-15)
+
+- `make` with no goal builds **nothing**: the default goal is `.DEFAULT_GOAL := lvgl`
+  (Makefile:121). `make` in the Makefile's own comment and in README/AGENTS says
+  "all of them"; the working command is `make target` (`make host` for the simulator).
+- Building a PR in a `git worktree` outside the repo needs
+  `PLAYER_DIR=<main checkout>/sonix-player/sonix-player`, otherwise lvgl, the headers
+  and the toolchain are not found (the submodule is not populated in the worktree).
+
+## Testing an addon's state machine on the host (2026-11-15)
+
+`calc/calc.c` can be run natively without the SDL simulator: include the `.c`
+directly from a harness, provide stub headers for `lvgl/lvgl.h`,
+`src/addon/addon.h`, `src/gui/{fonts/fonts.h,shell/*.h}`, `src/system/core/lang.h`,
+and implementation stubs whose `lv_label_set_text()` keeps the text in the fake
+`lv_obj_t`. The statics (`display_label`, `expr_label`, `acc`, `fresh`, `pending`)
+are then readable after each scripted `on_key()` call. Reusable copy:
+`/tmp/opencode/stub/` (harness.c + stubimpl.c). This is how the `%` and `±` bugs in
+the merged calculator were demonstrated rather than argued from the code.
