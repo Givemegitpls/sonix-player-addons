@@ -3,7 +3,6 @@
   "title": "Tic Tac Toe",
   "titles": { "Russian": "Крестики-нолики", "Italiano": "Tris" },
   "section": "more",
-  "order": 12,
   "version": "0.1",
   "icon": "icon.png"
 }
