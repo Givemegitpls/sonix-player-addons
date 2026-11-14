@@ -1,4 +1,4 @@
 [submodule "sonix-player"]
 	path = sonix-player
 	url = https://github.com/Givemegitpls/sonix-player-tempotec-v3-analog.git
-	branch = feature/addons-system
+	branch = main
