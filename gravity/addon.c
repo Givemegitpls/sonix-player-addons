@@ -8,6 +8,7 @@
 #include "src/addon/addon.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/topbar.h"
+#include "src/system/audio/audio.h"
 
 #include "lvgl/lvgl.h"
 #include "lvgl/src/misc/cache/instance/lv_image_cache.h"
@@ -31,6 +32,7 @@ static lv_image_dsc_t frame_dsc; // points at frame
 static uint16_t *frame;		 // 480x320 RGB565, in our own memory
 static char gravity_id[ADDON_ID_MAX];
 static lv_obj_t *return_screen; // the page the tile was tapped on
+static char gravity_dir[ADDON_PATH_MAX]; // <card>/Addons/gravity, for a restart
 
 // A finished frame, on the interface thread (posted by the game's thread).
 //
@@ -38,38 +40,16 @@ static lv_obj_t *return_screen; // the page the tile was tapped on
 // reading has to be memory nothing else writes until the next hand-over. 300 KB
 // at the game's 30 steps a second is 9 MB/s, a fifth of what the panel's own
 // copy of a frame costs.
-// The whole glass, and the chevron kept: it is the only way out of a game until
-// the touch zones arrive (stage two of the port). Both are put back when the
-// screen goes away, so the next page finds the shell as it left it.
-static void screen_loaded_cb(lv_event_t *e)
+// A tap anywhere on the glass is the game's FIRE key: its menus choose a row with
+// it (MenuManager::processKeyCode, case 8 -> processGameActionUpd(1)), and the ride
+// itself has no use for it. It is also the only thing the touchscreen does now --
+// the ride is on the buttons (platform/touch.c), and the chevron the shell draws on
+// top of the picture stays live, because LVGL's indev is no longer parked.
+static void tap_cb(lv_event_t *e)
 {
-	(void)e;
-	topbar_set_hidden(true);
-}
-
-static void screen_unloaded_cb(lv_event_t *e)
-{
-	(void)e;
-	topbar_set_hidden(false);
-}
-
-#ifdef HOST_BUILD
-// The simulator has no evdev node to take and one pointer to give: the view's own
-// press events are handed to the zones as a single contact (platform/touch.c).
-// Every event carries the pointer, so a finger sliding from gas to brake is
-// followed without any state kept here.
-static void touch_cb(lv_event_t *e)
-{
-	lv_point_t p = { 0, 0 };
-	lv_indev_t *indev = lv_indev_active();
-	if (indev) {
-		lv_indev_get_point(indev, &p);
-	}
 	lv_event_code_t code = lv_event_get_code(e);
-	bool down = code == LV_EVENT_PRESSED || code == LV_EVENT_PRESSING;
-	gtouch_contact(0, p.x, p.y, down);
+	gtouch_fire(code == LV_EVENT_PRESSED || code == LV_EVENT_PRESSING);
 }
-#endif
 
 // The game's own menu has an "Exit Game" item, and it ends the game's loop. While
 // the game runs the panel belongs to it (platform/touch.c parks LVGL's indev), so
@@ -83,9 +63,63 @@ static void game_finished(void *user)
 	}
 }
 
+static void frame_ready(void *user);
+static void game_finished(void *user);
+
+// The screen's own lifetime is what the panel and the game thread hang on.
+//
+// The game has the touch panel while it runs (platform/touch.c parks LVGL's
+// indev, because a bike needs gas and a lean at once and one pointer cannot say
+// that). Anything that takes the screen away without going through the game's
+// own "Exit Game" -- a back gesture, another page -- must hand the panel back, or
+// the shell is left with a dead touchscreen until the player is restarted: that
+// is exactly what happened on the device the first time. So: loaded starts the
+// game if it is not already running, unloaded stops it and gives the panel back.
+static void screen_loaded_cb(lv_event_t *e)
+{
+	(void)e;
+	topbar_set_hidden(true);
+	// The game paints white, and the shell's chevron is white on a dark theme: it
+	// was invisible on this page. Tinting it for the screen the addon owns is what
+	// the shell offers a page with colours of its own.
+	back_btn_tint_on_screen(gravity_screen, true, lv_color_black());
+	if (!gravity_running() && gravity_dir[0]) {
+		gravity_frame_cb_set(frame_ready, NULL);
+		gravity_exit_cb_set(game_finished, NULL);
+		if (!gravity_run(gravity_dir)) {
+			printf("gravity: the game did not start again\n");
+		}
+	}
+}
+
+static void screen_unloaded_cb(lv_event_t *e)
+{
+	(void)e;
+	topbar_set_hidden(false);
+	back_btn_tint_on_screen(gravity_screen, false, lv_color_black());
+	back_btn_force_hidden(false);
+	gravity_frame_cb_set(NULL, NULL);
+	gravity_exit_cb_set(NULL, NULL);
+	gravity_quit();
+}
+
 static void frame_ready(void *user)
 {
 	(void)user;
+
+	// The chevron is the way out, and the way out is wanted when the game is
+	// listening rather than while a race is being ridden: it is shown in the
+	// game's menus only. The shell hides it per page, so it is put back on the way
+	// out of the addon.
+	// -1 until the first frame: the chevron has to be hidden while the logo and the
+	// race are up, and "not known yet" is not the same as "shown".
+	static int chevron_state = -1;
+	int menu = gravity_menu_open() ? 1 : 0;
+	if (menu != chevron_state) {
+		chevron_state = menu;
+		back_btn_force_hidden(!menu);
+	}
+
 	gravity_frame_copy(frame);
 	if (view) {
 		lv_obj_invalidate(view);
@@ -101,6 +135,7 @@ static lv_obj_t *gravity_addon_init(const sonix_addon_host_t *host)
 	}
 
 	snprintf(gravity_id, sizeof(gravity_id), "%s", host->id && host->id[0] ? host->id : "gravity");
+	snprintf(gravity_dir, sizeof(gravity_dir), "%s", host->dir ? host->dir : "");
 
 	// Where the game goes back to: the section page the tile is on. init() runs
 	// before the shell switches to the screen this function returns.
@@ -143,15 +178,16 @@ static lv_obj_t *gravity_addon_init(const sonix_addon_host_t *host)
 	lv_image_set_inner_align(view, LV_IMAGE_ALIGN_CENTER);
 	lv_obj_set_clickable(view, false);
 
-#ifdef HOST_BUILD
-	lv_obj_add_event_cb(gravity_screen, touch_cb, LV_EVENT_PRESSED, NULL);
-	lv_obj_add_event_cb(gravity_screen, touch_cb, LV_EVENT_PRESSING, NULL);
-	lv_obj_add_event_cb(gravity_screen, touch_cb, LV_EVENT_RELEASED, NULL);
-	lv_obj_add_event_cb(gravity_screen, touch_cb, LV_EVENT_PRESS_LOST, NULL);
-#endif
+	lv_obj_add_event_cb(gravity_screen, tap_cb, LV_EVENT_PRESSED, NULL);
+	lv_obj_add_event_cb(gravity_screen, tap_cb, LV_EVENT_RELEASED, NULL);
+	lv_obj_add_event_cb(gravity_screen, tap_cb, LV_EVENT_PRESS_LOST, NULL);
 
 	lv_obj_add_event_cb(gravity_screen, screen_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 	lv_obj_add_event_cb(gravity_screen, screen_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
+
+	// A game is not a soundtrack: whatever the player was playing stops. Paused
+	// rather than stopped, so leaving the addon puts it back where it was.
+	audio_pause();
 
 	gravity_frame_cb_set(frame_ready, NULL);
 	gravity_exit_cb_set(game_finished, NULL);
@@ -176,10 +212,8 @@ static lv_obj_t *gravity_addon_init(const sonix_addon_host_t *host)
 // writing pixels -- then the picture, then the buffer it pointed at.
 static bool gravity_addon_stop(void)
 {
-	gravity_frame_cb_set(NULL, NULL);
-	gravity_exit_cb_set(NULL, NULL);
-	gravity_quit();
-
+	// The game thread and the panel were let go when the screen was unloaded
+	// (screen_unloaded_cb); this only drops the picture and its buffer.
 	if (view) {
 		lv_image_set_src(view, NULL);
 		lv_image_cache_drop(&frame_dsc);

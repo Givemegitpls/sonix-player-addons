@@ -26,8 +26,10 @@ gfx_target *surface(void);
 int surface_width(void);
 int surface_height(void);
 
-// Called on the game thread when a frame is complete.
-void surface_hand_over(void);
+// Called on the game thread when a frame is complete. `dim` darkens it as it goes
+// by -- the game's own menus are black on white, and a menu read in a dark room is
+// a lamp; the multiply costs nothing extra because the copy is happening anyway.
+void surface_hand_over(bool dim);
 
 // Called on the interface thread: the last complete frame into `dst`, which must
 // be surface_width() * surface_height() RGB565 pixels.

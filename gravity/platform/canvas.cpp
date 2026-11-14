@@ -104,9 +104,22 @@ void CanvasImpl::setWindowTitle(const std::string &title)
 }
 
 // Called by Canvas::repaint() on the game thread, once per finished frame.
+// The last frame's answer to "is a menu up": the UI thread reads it through
+// gravity_menu_open(), and it is what the frame's dimming follows.
+static volatile bool menu_open;
+
+bool gravity_menu_open(void)
+{
+    return menu_open;
+}
+
 void CanvasImpl::repaint()
 {
-    surface_hand_over();
+    // The game's own menus (main, in-game, play) are drawn over the bright level.
+    // Dimmed on the way out: a menu is read, not raced, and the picture behind it
+    // is only there to be recognised.
+    menu_open = Micro::isInGameMenu;
+    surface_hand_over(menu_open);
     if (frame_pending) {
         return; // the interface has not taken the last one yet
     }

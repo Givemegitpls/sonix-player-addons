@@ -31,6 +31,11 @@ bool gravity_running(void);
 
 void gravity_frame_cb_set(void (*cb)(void *), void *user);
 
+// True while one of the game's own menus is up (main, in-game, play). Read on the
+// UI thread: the addon shows the shell's back chevron only then -- while riding it
+// would sit over the picture for nothing -- and dims the frame.
+bool gravity_menu_open(void);
+
 // Called on the UI thread when the game's own loop ends -- the "Exit Game" item
 // of its menu is what ends it (Micro::run() returns, the thread is done). The
 // addon uses it to go back to the page the tile was tapped on: while the game has

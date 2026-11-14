@@ -2,6 +2,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // The software drawing the game expects from javax.microedition.lcdui.
 //
 // Upstream this is SDL: Graphics was a wrapper around an SDL_Renderer, Image an
@@ -48,3 +52,7 @@ void gfx_blit(gfx_target *t, const uint16_t *px, const uint8_t *mask, int w, int
 
 // 8-bit coverage text: one glyph, blended with the current colour.
 void gfx_glyph(gfx_target *t, const uint8_t *coverage, int w, int h, int x, int y);
+
+#ifdef __cplusplus
+}
+#endif

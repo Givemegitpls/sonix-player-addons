@@ -32,21 +32,24 @@ HOLDING IT
 The game is landscape: turn the player a quarter turn, its top edge to the left.
 The screen is 480x320 that way.
 
-Controls are four zones and the strip between them, the way two hands hold the
-player's ends:
+Controls are the player's own buttons, because this board's touchscreen reports
+one finger at a time and a bike needs gas and a lean together:
 
-    left, upper half     lean forward
-    left, lower half     lean back
-    right, upper half    gas
-    right, lower half    brake
+    play/pause button    gas
+    next song button     brake
+    volume up            lean back
+    volume down          lean forward
+    prev song button     the game's own menu
 
-    the strip between the hands
-        tap              select, in the game's menus
-        hold half a sec   the game's own menu
+    a tap on the screen   select, in the game's menus
+    the back chevron      leave the addon -- drawn only while one of the game's
+                          menus is open, so the race itself has the whole screen
 
-The game's menu has "Exit Game", and that is the way out of the addon: while the
-game runs the touch panel belongs to it, so the shell's back chevron cannot be
-tapped.
+While the game runs the buttons belong to it: pressing them does not change the
+volume, skip a track or pause anything. The power button is the exception and is
+handed back to the player.
+
+Whatever the player was playing is paused when the game opens.
 
 FILES
 -----
