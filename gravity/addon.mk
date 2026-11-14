@@ -25,6 +25,12 @@ gravity_CFLAGS = -I$(CURDIR)/gravity -I$(CURDIR)/gravity/game/src -O3
 # output in places and these are all over it. Warnings, not errors.
 gravity_CXXFLAGS = $(gravity_CFLAGS) -std=c++17 -fno-rtti -Wno-narrowing -Wno-sign-compare -Wno-unused-variable
 
-# The linker is the C++ driver for both halves: the library needs libstdc++.
-gravity_LD_target = $(CROSS_CXX)
+# The linker is the C++ driver for both halves: the library needs libstdc++, and
+# on the target the runtime goes inside it. The device has libstdc++.so.6.0.21 --
+# GCC 5's ABI, GLIBCXX_3.4.21 -- while the toolchain is GCC 9 and refers to symbols
+# up to 3.4.26, so a dynamically linked library does not load at all ("cannot open
+# shared object file: libstdc++.so.6", the message the shell puts up over the tile).
+# Gearboy's addon.mk carries the same two flags for the same reason. The simulator
+# keeps the machine's own libstdc++: distributions do not ship a static one.
+gravity_LD_target = $(CROSS_CXX) -static-libstdc++ -static-libgcc
 gravity_LD_host = $(HOST_CXX)

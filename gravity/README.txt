@@ -32,10 +32,21 @@ HOLDING IT
 The game is landscape: turn the player a quarter turn, its top edge to the left.
 The screen is 480x320 that way.
 
-Controls are the next stage of the port: the game currently runs on its own --
-the loading screen, the menu drawn over the first level -- without a way to press
-a key. Gas, brake and the two leans are to be touch zones, and the menu button
-the centre of the screen.
+Controls are four zones and the strip between them, the way two hands hold the
+player's ends:
+
+    left, upper half     lean forward
+    left, lower half     lean back
+    right, upper half    gas
+    right, lower half    brake
+
+    the strip between the hands
+        tap              select, in the game's menus
+        hold half a sec   the game's own menu
+
+The game's menu has "Exit Game", and that is the way out of the addon: while the
+game runs the touch panel belongs to it, so the shell's back chevron cannot be
+tapped.
 
 FILES
 -----

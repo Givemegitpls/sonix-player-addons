@@ -31,6 +31,12 @@ bool gravity_running(void);
 
 void gravity_frame_cb_set(void (*cb)(void *), void *user);
 
+// Called on the UI thread when the game's own loop ends -- the "Exit Game" item
+// of its menu is what ends it (Micro::run() returns, the thread is done). The
+// addon uses it to go back to the page the tile was tapped on: while the game has
+// the panel, nothing in LVGL can be touched, so this is the only way out.
+void gravity_exit_cb_set(void (*cb)(void *), void *user);
+
 // The last finished frame, into `dst`: 480x320 RGB565, which is what
 // gravity_width()/gravity_height() say. UI thread only.
 void gravity_frame_copy(uint16_t *dst);
