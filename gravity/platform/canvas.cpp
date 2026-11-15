@@ -7,6 +7,7 @@
 
 #include "gravity.h"
 #include "gfx.h"
+#include "stop.h"
 #include "surface.h"
 
 #include "lcdui/Canvas.h"
@@ -42,6 +43,11 @@ static void *frame_user;
 static pthread_t game_thread_id;
 static bool thread_started;
 static volatile bool running;
+
+// The stop the game cannot undo (platform/stop.h). Set by gravity_quit(), cleared
+// by gravity_run(); read on the game thread by Time::sleep() and
+// Micro::goLoadingStep(), both of which throw gravity::stopped when it is up.
+static volatile bool stop_flag;
 
 static char saves_dir[ADDON_PATH_MAX_LOCAL];
 static char levels_path[ADDON_PATH_MAX_LOCAL * 2];
@@ -170,6 +176,19 @@ void CanvasImpl::processEvents()
 }
 
 // One state of the glass: what the keys are now, against what they were.
+static bool menu_down;
+
+static void forget_keys()
+{
+	// The last state applied is a *transition* detector: a key left down when the
+	// game stops would never be seen as "pressed" again in the next run. Both are
+	// file scope so that gravity_run() can put them back.
+	for (int i = 0; i < 5; i++) {
+		applied_key[i] = -1;
+	}
+	menu_down = false;
+}
+
 static void apply_state(Canvas *c, uint16_t mask)
 {
 
@@ -190,7 +209,6 @@ static void apply_state(Canvas *c, uint16_t mask)
 
 	// The strip held down is the game's own menu command: upstream's Escape key,
 	// which runs the BACK command the canvas registered (Canvas::pressedEsc).
-	static bool menu_down;
 	if ((mask & GD_KEY_MENU) && !menu_down) {
 		c->pressedEsc();
 	}
@@ -211,6 +229,9 @@ static void *game_thread(void *arg)
         argv[1] = levels_path;
         argv[2] = NULL;
         micro.startApp(2, argv);
+    } catch (const gravity::stopped &) {
+        // The addon asked for this; nothing went wrong. The game object unwinds
+        // with the exception, so a half-built game is deleted rather than used.
     } catch (const std::exception &e) {
         printf("gravity: the game stopped: %s\n", e.what());
     } catch (...) {
@@ -221,11 +242,17 @@ static void *game_thread(void *arg)
 
     // The game's own loop has ended. Whatever the addon wants to do about it has
     // to happen on the interface thread, which is the only place LVGL may be
-    // touched.
-    if (exit_cb) {
+    // touched. Not for a stop the addon asked for: the screen is already being
+    // taken away, and nothing is waiting for this message.
+    if (exit_cb && !stop_flag) {
         gui_post(exit_on_ui, NULL);
     }
     return NULL;
+}
+
+bool gravity::stop_requested()
+{
+    return stop_flag;
 }
 
 bool gravity_run(const char *addon_dir)
@@ -236,6 +263,30 @@ bool gravity_run(const char *addon_dir)
     if (!addon_dir || !addon_dir[0]) {
         return false;
     }
+
+    // A thread that ended by itself -- the game's own "Exit Game", or a crash
+    // inside the game -- is still joinable, and pthread_create() on its id would
+    // leak its stack. It is finished, so this returns at once.
+    if (thread_started) {
+        pthread_join(game_thread_id, NULL);
+        thread_started = false;
+    }
+
+    // The game's process-wide state, back to a first-run state.
+    //
+    // The addon's screen is created once and the game is torn down and built
+    // again every time the user comes back to it. Upstream has one Micro per
+    // launch and several statics that its loading sequence fills in: with the
+    // step counter left at ten, the second init() walks no steps at all, and the
+    // game then runs with a null GamePhysics -- a SIGSEGV on the first
+    // restart(false), which is what "open the game a second time" used to be.
+    Micro::gameLoadingStateStage = 0;
+    Micro::isInGameMenu = false;
+    Micro::field_249 = false;
+    menu_open = false;
+    frame_pending = false;
+    forget_keys();
+    stop_flag = false;
 
     snprintf(saves_dir, sizeof(saves_dir), "%s/saves", addon_dir);
     snprintf(levels_path, sizeof(levels_path), "%s/assets/levels.mrg", addon_dir);
@@ -256,8 +307,9 @@ bool gravity_run(const char *addon_dir)
     }
 
     // Micro::field_249 is the game's own "keep going": startApp() sets it, run()
-    // loops on it, and destroyApp() clears it. It is how the game is asked to
-    // stop from outside, and gravity_quit() is the only other caller.
+    // loops on it, and destroyApp() clears it. It is not enough on its own -- the
+    // loading sequence never tests it, and startApp() sets it back to true -- so
+    // the platform's own stop_flag (platform/stop.h) is what gravity_quit() uses.
     Micro::field_249 = true;
 
     running = true;
@@ -272,8 +324,13 @@ bool gravity_run(const char *addon_dir)
 
 void gravity_quit(void)
 {
+    // The flag first, and it stays up: the game cannot set it back, which is the
+    // whole point (startApp() would clear field_249's counterpart).
+    stop_flag = true;
+    Micro::field_249 = false;
     if (thread_started) {
-        Micro::field_249 = false;
+        // Bounded: Time::sleep() and goLoadingStep() notice the flag within a
+        // slice (50 ms) or a loading step, so this is not the wait it used to be.
         pthread_join(game_thread_id, NULL);
         thread_started = false;
     }

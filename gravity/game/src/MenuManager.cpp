@@ -18,6 +18,8 @@ MenuManager::MenuManager(Micro* var1)
     field_376 = std::make_unique<TextRender>("", var1);
 }
 
+MenuManager::~MenuManager() = default;
+
 void MenuManager::initPart(int var1)
 {
     int var4;

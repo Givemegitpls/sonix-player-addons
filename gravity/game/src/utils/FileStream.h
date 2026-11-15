@@ -49,6 +49,13 @@ public:
         return std::fstream::is_open();
     }
 
+    // Whether the last read or write actually happened: a store file that is
+    // short or gone has to be told apart from one that parsed (RecordStore).
+    bool good()
+    {
+        return std::fstream::good();
+    }
+
     virtual void setPos(std::streampos pos)
     {
         std::fstream::seekg(pos);

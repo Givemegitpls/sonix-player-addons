@@ -136,6 +136,9 @@ public:
     bool field_377 = false;
 
     MenuManager(Micro* var1);
+    // Out of line: its members are unique_ptrs to types this header only
+    // forward-declares, and the destructor has to be built where they are complete.
+    virtual ~MenuManager();
     void initPart(int var1);
     int getCurrentLevel();
     int getCurrentTrack();

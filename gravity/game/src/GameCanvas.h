@@ -16,6 +16,11 @@ class GamePhysics;
 class MenuManager;
 
 class GameCanvas : public Canvas, public CommandListener {
+public:
+    // Virtual so that deleting it through the Canvas it also is cannot skip the
+    // parts below (the images, the timers).
+    virtual ~GameCanvas() = default;
+
 private:
     void method_164();
     void handleUpdatedInput();

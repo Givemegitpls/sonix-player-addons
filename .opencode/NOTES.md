@@ -624,3 +624,32 @@ and implementation stubs whose `lv_label_set_text()` keeps the text in the fake
 are then readable after each scripted `on_key()` call. Reusable copy:
 `/tmp/opencode/stub/` (harness.c + stubimpl.c). This is how the `%` and `±` bugs in
 the merged calculator were demonstrated rather than argued from the code.
+## Gravity Defied: жизненный цикл игры и хранилище записей (2026-11-15)
+- Экран аддона создаётся один раз (`init()` зовётся на загрузку библиотеки, не на тап),
+  поэтому «вход в игру» — это `LV_EVENT_SCREEN_LOADED`, а игра каждый раз строится
+  заново. Отсюда две вещи: пауза музыки живёт в `screen_loaded_cb` (в `init()` она
+  срабатывала только при первом заходе за сессию), а `gravity_run()` сбрасывает
+  статики игры (`Micro::gameLoadingStateStage`, `Micro::isInGameMenu`) и состояние
+  ввода. Без сброса `gameLoadingStateStage` второй заход не проходил ни одного шага
+  загрузки и падал по null `gamePhysics` — на девайсе это выглядело как зависание
+  (SIGSEGV ловит обработчик плеера и «остаётся живым», музыка при этом играет).
+- Остановка игры — свой флаг в `platform/canvas.cpp` (`platform/stop.h`), а не
+  `Micro::field_249`: `startApp()` ставит его обратно в true, а последовательность
+  загрузки его вообще не смотрит, поэтому выход во время загрузки вешал UI-поток в
+  `pthread_join`. `Time::sleep` (нарезан по 50 мс) и `Micro::goLoadingStep` бросают
+  `gravity::stopped`; `Micro::run()` ловит его и всё равно зовёт `destroyApp`, иначе
+  терялся сейв (меню игры крутят свои модальные циклы внутри `method_201`).
+- Хранилище записей (`saves/GDTRStates`, `saves/<league><level>`) чинилось в трёх
+  местах: `RecordEnumerationImpl::destroy()` больше не чистит список хранилища (он же
+  и перечисление), `getLevelInfo`/`pushLongAs5Bytes` берут буфер по ссылке (в Java это
+  были массивы — по значению писались 96 нулей), имена терминируются, а битый файл
+  читается как пустое хранилище. Проверять хранилище можно без игры и симулятора:
+  `g++ -std=c++17 -I gravity/game/src harness.cpp RecordManager.cpp rms/RecordStore.cpp
+  rms/RecordEnumerationImpl.cpp` — готовый harness в `/tmp/opencode/rms/harness.cpp`.
+- Симулятор: тап по экрану = только FIRE (`gtouch_fire` из `tap_cb`), поэтому в меню
+  игры активируется лишь подсвеченный пункт, а во время заезда тап не значит ничего;
+  ключи `gpio-keys` на хосте не эмулируются. Выход из заезда в симуляторе невозможен —
+  жать `kill -9` и поднимать заново.
+- Проверено на девайсе 2026-11-15 (владелец): выход во время загрузки, повторный
+  заход, музыка на входе и сейвы ведут себя как ожидается. `tictactoe` залит на карту
+  рядом (`/mnt/sd_0/Addons/tictactoe/`) и виден в More как «Tic Tac Toe».

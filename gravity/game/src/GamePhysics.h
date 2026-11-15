@@ -101,6 +101,9 @@ public:
     bool isGenerateInputAI = false;
 
     GamePhysics(LevelLoader* levelLoader);
+    // Out of line: unique_ptrs to types this header forward-declares (class_10,
+    // TimerOrMotoPartOrMenuElem) have to be destroyed where those are complete.
+    ~GamePhysics();
     int method_21();
     void method_22(int var1);
     void setMode(int mode);

@@ -64,7 +64,29 @@ Small, and each one is a comment where it happens:
 | `src/lcdui/Canvas.cpp` | `make_unique<Graphics>(impl->getRenderer())` → `getTarget()`: there is no renderer |
 | `src/LevelLoader.cpp` | the cmrc fallback became an exception; the addon passes `<addon>/assets/levels.mrg` |
 | `src/rms/RecordStore.cpp` | `setRecordStoreDir()` took `$HOME` and wrote `~/.GravityDefied`; it now takes the directory it is given -- `<addon>/saves` on the card |
-| `src/utils/Time.cpp` | `CLOCK_MONOTONIC` milliseconds and `nanosleep`; every comparison in the game is an interval |
+| `src/rms/RecordStore.cpp`, `src/rms/RecordEnumerationImpl.cpp` | the store's file is checked before it is read and after it is written: a short, empty or corrupt file loads as an empty store and says so, instead of resizing a vector to whatever the bytes claimed. `destroy()` no longer clears the store's records -- in J2ME it released the *enumeration*, and here the store hands out its own list, so clearing it made every later `setRecord()` throw and no save after the first session was ever written |
+| `src/RecordManager.{h,cpp}` | `getLevelInfo()`/`pushLongAs5Bytes()`/`load5BytesAsLong()` take the buffer by reference: in Java these were arrays, and the decompiled signature passed a copy, so every record store file was packed into a vector that was thrown away -- 96 zero bytes on the card. Names are NUL-terminated, and a short record is not read past its end |
+| `src/Micro.{h,cpp}` | `run()` split into `run()`/`runLoop()` so that a stop arriving inside one of the menus' own loops still reaches the save at the end; `destroyApp()` tests the menu for null (the game can be stopped while it loads); the game's objects are deleted, once per visit, instead of leaked |
+| `src/GameCanvas.h`, `src/GamePhysics.h`, `src/MenuManager.h` | virtual/out-of-line destructors, so those objects can be deleted where their `unique_ptr` members are complete |
+| `src/utils/Time.cpp` | `CLOCK_MONOTONIC` milliseconds and `nanosleep`, in 50 ms slices; the sleep is also where the addon's stop request is noticed, by throwing `gravity::stopped` (`platform/stop.h`) |
+
+## The game's lifecycle, which upstream did not have
+
+Upstream starts once, runs until `Micro::field_249` goes false and writes its
+records in `destroyApp()`. An addon is entered and left many times, so:
+
+- `platform/canvas.cpp` owns a stop flag the game cannot clear. `Micro::startApp()`
+  sets `field_249` back to true on its way in, which is why a quit that arrived
+  during the three-second loading sequence used to be undone -- and why the
+  interface thread then waited in `pthread_join()` for a loop that would never
+  end. `Time::sleep()` and `Micro::goLoadingStep()` throw `gravity::stopped` when
+  the flag is up, so a quit lands within a sleep slice or a loading step.
+- because the game is built again on every visit, `gravity_run()` resets the
+  process-wide state the loading sequence leaves behind
+  (`Micro::gameLoadingStateStage`, `Micro::isInGameMenu`) and the input state in
+  `platform/canvas.cpp`. Without the first of those the second visit walked no
+  loading steps and ran with a null `GamePhysics`: a SIGSEGV on the first
+  `restart(false)`, which the player's signal handler turns into "the player hung".
 
 ## What is ours
 
@@ -85,9 +107,7 @@ Small, and each one is a comment where it happens:
 
 The game's loop is upstream's: `Micro::run()` paces itself with `Time::sleep` and
 never returns until it is told to stop. That is why the game has a thread of its
-own, and why `Micro::field_249` -- the game's own "keep going" -- is the handle
-the addon's `stop()` uses. Nothing in the game was restructured into a step
-function to avoid this.
+own. Nothing in the game was restructured into a step function to avoid this.
 
 ## Licence of this directory's own files
 

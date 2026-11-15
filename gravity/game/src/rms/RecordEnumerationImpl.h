@@ -11,6 +11,12 @@ private:
     // static const int64_t serialVersionUID = 123;
     int currentPos = 0;
 
+    // Ceilings for what a store file may claim. One record is 19 bytes of state
+    // or 96 of times; a store holds one of those per level, at most a handful.
+    // They exist to keep a corrupt file from turning into a huge allocation.
+    static const size_t MAX_RECORDS = 512;
+    static const size_t MAX_RECORD_BYTES = 4096;
+
 public:
     RecordEnumerationImpl(std::vector<std::vector<int8_t>> data);
     RecordEnumerationImpl();

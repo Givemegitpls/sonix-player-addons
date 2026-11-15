@@ -49,7 +49,11 @@ While the game runs the buttons belong to it: pressing them does not change the
 volume, skip a track or pause anything. The power button is the exception and is
 handed back to the player.
 
-Whatever the player was playing is paused when the game opens.
+Whatever the player was playing is paused when the game opens. It stays paused
+afterwards: the player's own play button brings it back.
+
+The back chevron (or the game's "Exit Game") ends the game and writes the records
+and settings into saves/; the next visit starts the game again from the logo.
 
 FILES
 -----

@@ -52,9 +52,15 @@ int RecordEnumerationImpl::nextRecordId()
     return currentPos;
 }
 
+// `destroy()` in J2ME released the *enumeration*; the records stayed in the
+// store. Here the store hands out its own record list (RecordStore::
+// enumerateRecords() returns this object), so clearing it took the records away
+// from the store itself: MenuManager's initPart(2) reads the state, calls this,
+// and from then on every setRecord() hits an empty list, throws, and the save
+// writes nothing. Which is what "the save does not load" was: the second session
+// onwards never wrote a record back.
 void RecordEnumerationImpl::destroy()
 {
-    data.clear();
 }
 
 void RecordEnumerationImpl::serialize(FileStream* outStream)
@@ -74,16 +80,37 @@ void RecordEnumerationImpl::serialize(FileStream* outStream)
 
 void RecordEnumerationImpl::deserialize(FileStream* inStream)
 {
-    size_t temp;
+    // A store file on this card can be short, zero length, or half written: the
+    // card has had FAT errors. Reading a count out of it and resizing to it is an
+    // allocation sized by whatever happened to be in those bytes, so each count
+    // is checked before it is used and a store that does not parse is simply
+    // empty -- the game then starts with no records instead of dying on the
+    // allocation.
+    size_t temp = 0;
     inStream->readVariable(&currentPos);
     inStream->readVariable(&temp);
-    data.resize(temp);
+    if (!inStream->good() || temp > MAX_RECORDS) {
+        data.clear();
+        currentPos = 0;
+        return;
+    }
+    data.assign(temp, std::vector<int8_t>());
 
     for (size_t i = 0; i < data.size(); ++i) {
         inStream->readVariable(&temp);
+        if (!inStream->good() || temp > MAX_RECORD_BYTES) {
+            data.clear();
+            currentPos = 0;
+            return;
+        }
         data[i].resize(temp);
         for (size_t j = 0; j < data[i].size(); ++j) {
             inStream->readVariable(&data[i][j]);
+            if (!inStream->good()) {
+                data.clear();
+                currentPos = 0;
+                return;
+            }
         }
     }
 }

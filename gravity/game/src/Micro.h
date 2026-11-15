@@ -12,13 +12,17 @@ class Micro {
 private:
     int64_t goLoadingStep();
     void destroyApp(bool var1);
+    void runLoop();
     std::filesystem::path mrgFilePath;
 
 public:
-    GameCanvas* gameCanvas;
-    LevelLoader* levelLoader;
-    GamePhysics* gamePhysics;
-    MenuManager* menuManager;
+    // Null until the loading sequence has built each of them, and tested as null
+    // before use in destroyApp(): the addon can ask the game to stop in the
+    // middle of that sequence, and a half-built game is what it then is.
+    GameCanvas* gameCanvas = nullptr;
+    LevelLoader* levelLoader = nullptr;
+    GamePhysics* gamePhysics = nullptr;
+    MenuManager* menuManager = nullptr;
     bool field_242 = false;
     int numPhysicsLoops = 2;
     int64_t timeMs = 0;

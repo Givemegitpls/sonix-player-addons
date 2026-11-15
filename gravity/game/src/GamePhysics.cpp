@@ -38,6 +38,8 @@ GamePhysics::GamePhysics(LevelLoader* levelLoader)
     field_35 = false;
 }
 
+GamePhysics::~GamePhysics() = default;
+
 int GamePhysics::method_21()
 {
     if (field_46 && isRenderMotoWithSprites) {

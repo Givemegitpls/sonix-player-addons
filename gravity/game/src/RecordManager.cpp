@@ -44,7 +44,7 @@ void RecordManager::method_8(int var1, int var2)
     }
 }
 
-int64_t RecordManager::load5BytesAsLong(std::vector<int8_t> var1, int offset)
+int64_t RecordManager::load5BytesAsLong(const std::vector<int8_t> &var1, int offset)
 {
     int64_t result = 0L;
     int64_t mult = 1L;
@@ -58,7 +58,7 @@ int64_t RecordManager::load5BytesAsLong(std::vector<int8_t> var1, int offset)
     return result;
 }
 
-void RecordManager::pushLongAs5Bytes(std::vector<int8_t> var1, int var2, int64_t var3)
+void RecordManager::pushLongAs5Bytes(std::vector<int8_t> &var1, int var2, int64_t var3)
 {
     for (int var5 = var2; var5 < 5 + var2; ++var5) {
         var1[var5] = (int8_t)((int)(var3 % 256L));
@@ -66,8 +66,16 @@ void RecordManager::pushLongAs5Bytes(std::vector<int8_t> var1, int var2, int64_t
     }
 }
 
-void RecordManager::loadRecordInfo(std::vector<int8_t> var1)
+void RecordManager::loadRecordInfo(const std::vector<int8_t> &var1)
 {
+    // 4 leagues x 3 places x 5 bytes of time, then the names. A store that is
+    // empty, truncated, or was written by the build that packed into a copy has
+    // none of that: reading it here used to walk off the end of the vector.
+    const std::size_t expected = 4 * 3 * 5 + static_cast<std::size_t>(LEAGUES_MAX) * RECORD_NO_MAX * PLAYER_NAME_MAX;
+    if (var1.size() < expected) {
+        return;
+    }
+
     int offset = 0;
 
     int league;
@@ -88,7 +96,7 @@ void RecordManager::loadRecordInfo(std::vector<int8_t> var1)
     }
 }
 
-void RecordManager::getLevelInfo(std::vector<int8_t> var1)
+void RecordManager::getLevelInfo(std::vector<int8_t> &var1)
 {
     int shift = 0;
 

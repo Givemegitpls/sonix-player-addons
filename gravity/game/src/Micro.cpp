@@ -8,6 +8,8 @@
 #include "lcdui/CanvasImpl.h"
 #include "rms/RecordStore.h"
 
+#include "platform/stop.h"
+
 bool Micro::field_249 = false;
 int Micro::gameLoadingStateStage = 0;
 
@@ -15,8 +17,17 @@ Micro::Micro()
 {
 }
 
+// The game is built and thrown away once per visit to the addon's screen (the
+// screen is created once; leaving it stops the thread, coming back to it starts
+// a new one). Nothing upstream frees any of this -- in Java the collector did --
+// and a few megabytes per visit on a device with 57 MB of RAM is not a leak that
+// can be left for later. Deleted in the reverse of the order init() builds them.
 Micro::~Micro()
 {
+    delete menuManager;
+    delete gamePhysics;
+    delete levelLoader;
+    delete gameCanvas;
 }
 
 void Micro::setNumPhysicsLoops(int value)
@@ -40,6 +51,13 @@ void Micro::menuToGame()
 
 int64_t Micro::goLoadingStep()
 {
+    // The loading sequence is ten heavy steps with no sleep between them, so the
+    // stop hook in Time::sleep() alone would let a whole step run before it is
+    // noticed. This is the other end of platform/stop.h.
+    if (gravity::stop_requested()) {
+        throw gravity::stopped();
+    }
+
     ++gameLoadingStateStage;
     gameCanvas->repaint();
     int64_t startTimeMillis = Time::currentTimeMillis();
@@ -140,7 +158,13 @@ void Micro::destroyApp(bool var1)
     (void)var1;
     field_249 = false;
     field_242 = true;
-    menuManager->saveSmthToRecordStoreAndCloseIt();
+    // A game stopped while it was still loading has no menu to save: the
+    // settings it would write are the ones initPart() has not read yet, and
+    // there is no currentGameMenu either. Upstream never had to ask, because
+    // nothing could interrupt it.
+    if (menuManager) {
+        menuManager->saveSmthToRecordStoreAndCloseIt();
+    }
 }
 
 void Micro::startApp(int argc, char** argv)
@@ -167,7 +191,25 @@ void Micro::startApp(int argc, char** argv)
 }
 
 // original method
+//
+// Upstream's run() and its tail, split in two for one reason: the game's menus
+// have modal loops of their own (MenuManager::method_201()), and those loops are
+// entered from inside here -- the main menu is up while run() has not reached its
+// own while yet. A stop that arrives there used to be honoured by the loops'
+// `Micro::field_249` test, and now arrives as gravity::stopped from Time::sleep();
+// without this catch it would leave by unwinding through run() and skip the save
+// at the end, which is the player's records and settings. So: swallow the stop at
+// this level, save, and let startApp() return.
 void Micro::run()
+{
+    try {
+        runLoop();
+    } catch (const gravity::stopped&) {
+    }
+    destroyApp(true);
+}
+
+void Micro::runLoop()
 {
     if (!isInited) {
         init();
@@ -298,8 +340,6 @@ void Micro::run()
         } catch (std::exception& var14) {
         }
     }
-
-    destroyApp(true);
 }
 
 void Micro::goalLoop()

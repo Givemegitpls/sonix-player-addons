@@ -83,6 +83,18 @@ static void screen_loaded_cb(lv_event_t *e)
 	// was invisible on this page. Tinting it for the screen the addon owns is what
 	// the shell offers a page with colours of its own.
 	back_btn_tint_on_screen(gravity_screen, true, lv_color_black());
+
+	// A game is not a soundtrack: whatever the player was playing stops, and it
+	// stays stopped on the way out (the shell's own play button is how it comes
+	// back). This has to be here rather than in init(): the shell calls init()
+	// once per library load, so the pause used to happen on the first tap of the
+	// session only -- every later visit to the game began over a track that kept
+	// playing, which is exactly what the device reported. Only a track that is
+	// really playing is asked: pausing a paused player is a second command.
+	if (audio_get_status() == AUDIO_STATUS_PLAYING) {
+		audio_pause();
+	}
+
 	if (!gravity_running() && gravity_dir[0]) {
 		gravity_frame_cb_set(frame_ready, NULL);
 		gravity_exit_cb_set(game_finished, NULL);
@@ -185,9 +197,9 @@ static lv_obj_t *gravity_addon_init(const sonix_addon_host_t *host)
 	lv_obj_add_event_cb(gravity_screen, screen_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 	lv_obj_add_event_cb(gravity_screen, screen_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
 
-	// A game is not a soundtrack: whatever the player was playing stops. Paused
-	// rather than stopped, so leaving the addon puts it back where it was.
-	audio_pause();
+	// A game is not a soundtrack: whatever the player was playing stops, and it
+	// stays stopped on the way out. (The pause itself lives in screen_loaded_cb:
+	// init() runs once per library load, and the game is entered many times.)
 
 	gravity_frame_cb_set(frame_ready, NULL);
 	gravity_exit_cb_set(game_finished, NULL);
@@ -209,11 +221,16 @@ static lv_obj_t *gravity_addon_init(const sonix_addon_host_t *host)
 }
 
 // The library is going away. The game thread first -- it is the only thing still
-// writing pixels -- then the picture, then the buffer it pointed at.
+// writing pixels, and a thread left inside a library that is about to be
+// dlclose()d is a crash the loader cannot see coming. Then the picture, then the
+// buffer it pointed at.
+//
+// The game thread and the panel are usually let go when the screen is unloaded
+// (screen_unloaded_cb); gravity_quit() is safe to call twice, so this is the
+// backstop for the case where the card changed while the game was on screen.
 static bool gravity_addon_stop(void)
 {
-	// The game thread and the panel were let go when the screen was unloaded
-	// (screen_unloaded_cb); this only drops the picture and its buffer.
+	gravity_quit();
 	if (view) {
 		lv_image_set_src(view, NULL);
 		lv_image_cache_drop(&frame_dsc);

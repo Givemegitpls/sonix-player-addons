@@ -1,6 +1,7 @@
 #include "RecordStore.h"
 
 #include <cassert>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -59,13 +60,26 @@ void RecordStore::setRecord(int recordId, std::vector<int8_t> arr, int offset, i
 void RecordStore::save()
 {
     FileStream outStream(filePath, std::ios::out | std::ios::binary);
+    if (!outStream.isOpen()) {
+        // Silence here is how "the save does not load" starts: the records are
+        // in memory, the file on the card is not written, and nothing says so.
+        fprintf(stderr, "gravity: %s: cannot be written; the records stay in memory\n", filePath.c_str());
+        return;
+    }
     records->serialize(&outStream);
+    if (!outStream.good()) {
+        fprintf(stderr, "gravity: %s: written short\n", filePath.c_str());
+    }
 }
 
 RecordEnumerationImpl* RecordStore::load(std::filesystem::path filePath)
 {
-    RecordEnumerationImpl* temp = new RecordEnumerationImpl();
     FileStream inStream(filePath, std::ios::in | std::ios::binary);
+    RecordEnumerationImpl* temp = new RecordEnumerationImpl();
+    if (!inStream.isOpen()) {
+        fprintf(stderr, "gravity: %s: cannot be read; starting with no records\n", filePath.c_str());
+        return temp;
+    }
     temp->deserialize(&inStream);
     return temp;
 }
