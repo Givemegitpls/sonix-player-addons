@@ -653,3 +653,21 @@ the merged calculator were demonstrated rather than argued from the code.
 - Проверено на девайсе 2026-11-15 (владелец): выход во время загрузки, повторный
   заход, музыка на входе и сейвы ведут себя как ожидается. `tictactoe` залит на карту
   рядом (`/mnt/sd_0/Addons/tictactoe/`) и виден в More как «Tic Tac Toe».
+
+## Заливка аддона на карту (2026-11-15)
+
+- Карта на устройстве: `/dev/mmcblk0p1` на `/mnt/sd_0`, vfat, при старте `rw`
+  (`adb shell mount | grep sd_0`). Один раз видел `ro` — это `errors=remount-ro`
+  после ошибки fs, а не нормальное состояние.
+- `mount -o remount,ro /mnt/sd_0` при работающем плеере падает с `Device or resource
+  busy`: pid `sonix_player` держит открытыми на запись `.local/sonix_player.log`,
+  `.local/library.db`, `.local/audiobooks.db`, `.local/radio.db` и играющий flac.
+  Искать держателей: перебор `readlink /proc/*/fd/*`.
+- Плеер нельзя просто убить: `/usr/bin/sonix_launch` запускает `sonix_player`, после
+  его выхода спит секунду и перезагружает устройство. То есть «перезапустить плеер»
+  = `adb shell 'sync; reboot'` (~40 с до `adb wait-for-device`). После ребута карта
+  снова `rw`, и это нормально.
+- Минимальная заливка одного аддона без `make pack` всех:
+  `make ADDON_IDS=daily pack` -> `adb push build/Addons/daily/{addon.json,addon.so,icon.png,README.txt} /mnt/sd_0/Addons/daily/`.
+  `settings.ini` аддона в папке не перезаписывать — там его собственное состояние
+  (трек дня, сессии сервисов).

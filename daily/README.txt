@@ -3,9 +3,11 @@ Daily - an addon for the Sonix Player (TempoTec V3 Analog)
 
 INSTALL / УСТАНОВКА
   These files belong in <card>/Addons/daily/ - addon.json has to sit directly
-  in that folder. The tile appears under More when the card is read.
+  in that folder. The tile appears on the Music page, after the library's
+  own tiles, when the card is read.
   Эти файлы кладутся в <card>/Addons/daily/ - addon.json прямо в этой папке.
-  Плитка появляется в More, когда карта прочитана.
+  Плитка появляется на странице Music, после плиток библиотеки, когда карта
+  прочитана.
 
 WHAT IT IS / ЧТО ЭТО
   Each day the app picks one track from your library. The same day always

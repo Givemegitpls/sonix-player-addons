@@ -2,8 +2,7 @@
   "api": 1,
   "title": "Daily",
   "titles": { "Russian": "Трек дня", "English": "Daily", "Italiano": "Brano del giorno" },
-  "section": "more",
-  "order": 5,
+  "section": "music",
   "version": "0.1",
   "icon": "icon.png"
 }
