@@ -1,10 +1,10 @@
 # Addons: apps that arrive on the card
 
-The Streaming and More pages are tiled sections, and every tile in them used to
-be a module compiled into `sonix_player`. This document is about the other kind:
-applications that live in `Addons/` on the microSD card, appear as tiles in
-those two sections, and are loaded by the shell the first time their tile is
-tapped.
+The Music, Streaming, Wireless and More pages are tiled sections, and every
+tile in them used to be a module compiled into `sonix_player`. This document is
+about the other kind: applications that live in `Addons/` on the microSD card,
+appear as tiles in one of those four sections, and are loaded by the shell the
+first time their tile is tapped.
 
 The reference implementation is `subsonic/` – a client for the user's own
 OpenSubsonic server (Navidrome, Gonic, Airsonic, Ampache). `hello/` is the
@@ -81,7 +81,7 @@ can stay about the interface.
 | `api` | yes | the ABI the library was built against; must be `1` today |
 | `title` | yes | the tile's caption |
 | `titles` | no | per-language captions, keyed by the language file's name (`Russian`, `English`, …) |
-| `section` | yes | `streaming` or `more` – which page the tile lands on |
+| `section` | yes | `music`, `streaming`, `wireless` or `more` – which page the tile lands on |
 | `order` | no | the tile's place on that page, 1-based; without it the tile goes after the built-in ones |
 | `version` | no | logged at scan time; not interpreted |
 | `icon` | no | picture in the addon's folder; `icon.png` is used when absent |
@@ -98,15 +98,30 @@ shifts the rest down (src/gui/shell/gridpage.c). Two addons asking for the same
 place are ordered by name, and a number past the end of the page means the last
 place.
 
+Without one, a tile goes after the compiled-in tiles of its section, and that
+is the only place an addon can take on **Music**: that page's arrangement is the
+user's ("Music settings > Library > Rearrange main page"), so the card's tiles
+come after the library's and are not in the rearranging list — an addon cannot
+push "All tracks" off the page, and the user cannot lose a library tile to one.
+No remove/hide switch exists for an addon tile either: a tile is on the page for
+as long as its folder is on the card. `order` still works there, so an app that
+belongs among the index tiles can ask to be put there on purpose.
+
+While the library is empty the Music page shows the "scan the library" panel
+instead of its grid, and the addon tiles are behind it until a scan has run —
+a card in the slot is not a reason to skip the one thing the page is for. A
+missing card hides the whole page the same way, addons included (they live on
+it).
 The directory name is the addon's id and is what `host->id` reports. A folder
 with no `addon.so`, or a manifest that does not parse, is skipped with a line in
 the log – not an error the user sees, because there would be no tile to tap.
 
 The folder is read at start-up **and again whenever the card comes or goes**: the
 storage layer posts `addon_card_changed()` (src/addon/addon_notify.h), the
-registry re-reads `Addons/`, and the Streaming and More pages rebuild their
-tiles (`streaming_refresh()`, `morepage_refresh()`). A library that is already
-open stays open across that: the slot moves, the handle and the screens do not.
+registry re-reads `Addons/`, and the four pages rebuild their tiles
+(`music_refresh()`, `streaming_refresh()`, `wireless_refresh()`,
+`morepage_refresh()`). A library that is already open stays open across that:
+the slot moves, the handle and the screens do not.
 
 A scan never clears the registry when it cannot read the folder. The directory is
 opened before anything is overwritten, so a card that is out, not mounted yet, or
