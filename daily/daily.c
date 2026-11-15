@@ -3,20 +3,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "common/store.h"
 #include "src/addon/addon.h"
 #include "src/gui/fonts/fonts.h"
 #include "src/gui/nowplaying/cover.h"
+#include "src/gui/nowplaying/coverloader.h"
 #include "src/gui/nowplaying/player.h"
 #include "src/gui/shell/gui.h"
 #include "src/gui/shell/icons_select.h"
 #include "src/gui/shell/scale.h"
 #include "src/gui/shell/settingsrow.h"
+#include "src/gui/shell/spinner.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
 #include "src/system/audio/audio.h"
 #include "src/system/core/lang.h"
+#include "src/system/core/utils.h"
 #include "src/system/device/power.h"
 #include "src/system/library/library.h"
 #include "src/system/playback/device_state.h"
@@ -28,17 +32,23 @@
 // The pick is hash(YYYY-MM-DD) into LIBRARY_LIST_TRACKS, skipping recent
 // history when another track is available. Path/title/artist/album for today
 // are kept in settings.ini so a library rebuild does not change today's pick.
-// Cover decode runs on a worker; UI updates through gui_post().
+//
+// Same-day reopen uses the store + one MEDIA_TABLE lookup (no full tracks
+// index). Cover decode goes through coverloader. The pick worker, when needed,
+// runs SCHED_IDLE so it does not fight playback on the single core.
 //
 // Layout is a normal More-menu page: system topbar stays visible, title sits
 // beside the floating back chevron (settingsrow), cover fills the body.
 
 #define PATH_MAX_DAILY 512
-#define HISTORY_SKIP 80
+#define HISTORY_SKIP 24
 #define PICK_TRIES 24
 #define PLAY_DISC SC(84) // same disc as the player's transport play button
 #define META_GAP SC(12)
 #define POLL_PERIOD_MS 500
+// Gap between browser (0..9) and medialist (12..): addons do not share a
+// reserved pool, so pick a slot nothing in the player claims.
+#define DAILY_COVER_SLOT 10
 
 typedef struct {
 	char date[16];
@@ -46,8 +56,6 @@ typedef struct {
 	char name[256];
 	char artist[256];
 	char album[256];
-	cover_image_t cover;
-	bool has_cover;
 	bool ok;
 	bool no_library;
 	bool no_tracks;
@@ -65,6 +73,7 @@ static lv_obj_t *title_label;
 static lv_obj_t *artist_label;
 static lv_obj_t *album_label;
 static lv_obj_t *status_label;
+static lv_obj_t *load_spinner;
 static lv_obj_t *info_row;
 static lv_obj_t *meta_col;
 static lv_obj_t *play_btn;
@@ -76,7 +85,9 @@ static store_t store;
 static bool store_ready;
 static cover_image_t shown_cover;
 static bool shown_has_cover;
+static bool cover_pending;
 static char shown_path[PATH_MAX_DAILY];
+static char shown_date[16];
 static unsigned job_gen;
 static bool theme_hook;
 static bool busy;
@@ -105,14 +116,6 @@ static void sync_play_btn(void) {
 	device_state_t st;
 	device_state_get(&st);
 	set_play_icon(daily_is_loaded(&st) && st.status == AUDIO_STATUS_PLAYING);
-}
-
-static void poll_cb(lv_timer_t *t) {
-	(void)t;
-	if (!daily_screen || lv_screen_active() != daily_screen) {
-		return;
-	}
-	sync_play_btn();
 }
 
 static bool ru(void) {
@@ -209,7 +212,7 @@ static int load_recent_paths(char (*buf)[PATH_MAX_DAILY], int max, const char **
 		free(items);
 		return 0;
 	}
-	int start = n > HISTORY_SKIP ? n - HISTORY_SKIP : 0;
+	int start = n > max ? n - max : 0;
 	int out = 0;
 	for (int i = start; i < n && out < max; i++) {
 		char path[PATH_MAX_DAILY];
@@ -244,12 +247,43 @@ static void fill_album_name(const char *path, char *album, size_t album_size) {
 	library_track_album(path, album, album_size);
 }
 
+// Same calendar day already chosen: one MEDIA_TABLE lookup, no tracks index.
+static bool pick_from_store(daily_job_t *job) {
+	if (!store_ready || strcmp(store_get(&store, "date"), job->date) != 0) {
+		return false;
+	}
+	const char *saved = store_get(&store, "path");
+	if (!saved[0] || access(saved, F_OK) != 0) {
+		return false;
+	}
+	if (!library_is_open()) {
+		job->no_library = true;
+		return false;
+	}
+	char title[256];
+	if (!library_track_title(saved, title, sizeof(title))) {
+		return false; // gone from the index — fall through to a fresh pick
+	}
+
+	snprintf(job->path, sizeof(job->path), "%s", saved);
+	const char *name = store_get(&store, "name");
+	snprintf(job->name, sizeof(job->name), "%s", name[0] ? name : title);
+	snprintf(job->artist, sizeof(job->artist), "%s", store_get(&store, "artist"));
+	snprintf(job->album, sizeof(job->album), "%s", store_get(&store, "album"));
+	return true;
+}
+
 static bool pick_track(daily_job_t *job) {
 	if (!library_is_open()) {
 		job->no_library = true;
 		return false;
 	}
 
+	if (pick_from_store(job)) {
+		return true;
+	}
+
+	// New day (or stale store): build the full tracks index once.
 	library_index_t *ix = library_index_open(LIBRARY_LIST_TRACKS, LIBRARY_FILTER_NONE, NULL, LIBRARY_ORDER_DEFAULT,
 						 false);
 	int count = library_index_count(ix);
@@ -259,30 +293,12 @@ static bool pick_track(daily_job_t *job) {
 		return false;
 	}
 
-	if (store_ready && strcmp(store_get(&store, "date"), job->date) == 0) {
-		const char *saved = store_get(&store, "path");
-		if (saved[0] && library_index_find_path(ix, saved) >= 0) {
-			row_catch_t c = {0};
-			int at = library_index_find_path(ix, saved);
-			library_index_window(ix, at, 1, catch_row, &c);
-			library_index_close(ix);
-			if (c.filled) {
-				snprintf(job->path, sizeof(job->path), "%s", c.path);
-				snprintf(job->name, sizeof(job->name), "%s", c.name[0] ? c.name : store_get(&store, "name"));
-				snprintf(job->artist, sizeof(job->artist), "%s",
-					 c.artist[0] ? c.artist : store_get(&store, "artist"));
-				fill_album_name(job->path, job->album, sizeof(job->album));
-				if (!job->album[0]) {
-					snprintf(job->album, sizeof(job->album), "%s", store_get(&store, "album"));
-				}
-				return true;
-			}
-		}
+	char (*recent_buf)[PATH_MAX_DAILY] = calloc((size_t)HISTORY_SKIP, PATH_MAX_DAILY);
+	const char **recent_ptrs = calloc((size_t)HISTORY_SKIP, sizeof(*recent_ptrs));
+	int recent_n = 0;
+	if (recent_buf && recent_ptrs) {
+		recent_n = load_recent_paths(recent_buf, HISTORY_SKIP, recent_ptrs);
 	}
-
-	char recent_buf[HISTORY_SKIP][PATH_MAX_DAILY];
-	const char *recent_ptrs[HISTORY_SKIP];
-	int recent_n = load_recent_paths(recent_buf, HISTORY_SKIP, recent_ptrs);
 
 	uint32_t h = fnv1a(job->date);
 	int start = (int)(h % (uint32_t)count);
@@ -308,6 +324,8 @@ static bool pick_track(daily_job_t *job) {
 		found = chosen.filled;
 	}
 	library_index_close(ix);
+	free(recent_buf);
+	free(recent_ptrs);
 
 	if (!found) {
 		job->no_tracks = true;
@@ -340,8 +358,68 @@ static void set_cover_visible(bool has) {
 	}
 }
 
-static void paint_empty(const char *msg) {
+static void request_cover(const char *path) {
+	cover_pending = false;
+	coverloader_release(DAILY_COVER_SLOT);
 	free_shown_cover();
+	if (cover_img) {
+		lv_obj_set_hidden(cover_img, true);
+	}
+	if (!path || !path[0]) {
+		return;
+	}
+	int size = cover_w > cover_h ? cover_w : cover_h;
+	coverloader_start();
+	coverloader_request(DAILY_COVER_SLOT, path, size);
+	cover_pending = true;
+}
+
+static void poll_cover(void) {
+	if (!cover_pending || !cover_img) {
+		return;
+	}
+	cover_image_t image;
+	bool finished = false;
+	bool found = coverloader_take(DAILY_COVER_SLOT, &image, &finished);
+	if (!finished) {
+		return;
+	}
+	cover_pending = false;
+	if (!found) {
+		set_cover_visible(false);
+		return;
+	}
+	free_shown_cover();
+	shown_cover = image;
+	shown_has_cover = true;
+	lv_image_set_src(cover_img, &shown_cover.dsc);
+	set_cover_visible(true);
+}
+
+static void set_loading(bool on) {
+	if (load_spinner) {
+		lv_obj_set_hidden(load_spinner, !on);
+	}
+	if (!on) {
+		return;
+	}
+	if (status_label) {
+		lv_label_set_text(status_label, ru() ? "Загрузка…" : "Loading…");
+		lv_obj_set_hidden(status_label, false);
+	}
+	if (info_row) {
+		lv_obj_set_hidden(info_row, true);
+	}
+	if (cover_frame) {
+		lv_obj_set_hidden(cover_frame, true);
+	}
+}
+
+static void paint_empty(const char *msg) {
+	cover_pending = false;
+	coverloader_release(DAILY_COVER_SLOT);
+	free_shown_cover();
+	set_loading(false);
 	if (cover_frame) {
 		lv_obj_set_hidden(cover_frame, true);
 	}
@@ -351,7 +429,32 @@ static void paint_empty(const char *msg) {
 	lv_label_set_text(status_label, msg);
 	lv_obj_set_hidden(status_label, false);
 	shown_path[0] = '\0';
+	shown_date[0] = '\0';
 	set_play_icon(false);
+}
+
+static void paint_track(const char *date, const char *path, const char *name, const char *artist, const char *album) {
+	set_loading(false);
+	if (cover_frame) {
+		lv_obj_set_hidden(cover_frame, false);
+	}
+	lv_label_set_text(title_label, name && name[0] ? name : path);
+	lv_label_set_text(artist_label, artist ? artist : "");
+	lv_obj_set_hidden(artist_label, !artist || artist[0] == '\0');
+	if (album && album[0]) {
+		lv_label_set_text(album_label, album);
+		lv_obj_set_hidden(album_label, false);
+	} else {
+		lv_obj_set_hidden(album_label, true);
+	}
+	if (info_row) {
+		lv_obj_set_hidden(info_row, false);
+	}
+	lv_obj_set_hidden(status_label, true);
+	snprintf(shown_path, sizeof(shown_path), "%s", path ? path : "");
+	snprintf(shown_date, sizeof(shown_date), "%s", date ? date : "");
+	sync_play_btn();
+	request_cover(shown_path);
 }
 
 static void apply_job(void *user) {
@@ -361,9 +464,6 @@ static void apply_job(void *user) {
 		return;
 	}
 	if (job->gen != job_gen || !daily_screen) {
-		if (job->has_cover) {
-			cover_free(&job->cover);
-		}
 		free(job);
 		return;
 	}
@@ -382,55 +482,54 @@ static void apply_job(void *user) {
 		return;
 	}
 
-	free_shown_cover();
-	if (job->has_cover) {
-		shown_cover = job->cover;
-		shown_has_cover = true;
-		lv_image_set_src(cover_img, &shown_cover.dsc);
-		set_cover_visible(true);
-	} else {
-		set_cover_visible(false);
-	}
-
-	lv_label_set_text(title_label, job->name[0] ? job->name : job->path);
-	lv_label_set_text(artist_label, job->artist);
-	lv_obj_set_hidden(artist_label, job->artist[0] == '\0');
-	if (job->album[0]) {
-		lv_label_set_text(album_label, job->album);
-		lv_obj_set_hidden(album_label, false);
-	} else {
-		lv_obj_set_hidden(album_label, true);
-	}
-
-	if (info_row) {
-		lv_obj_set_hidden(info_row, false);
-	}
-	lv_obj_set_hidden(status_label, true);
-	snprintf(shown_path, sizeof(shown_path), "%s", job->path);
-	sync_play_btn();
+	paint_track(job->date, job->path, job->name, job->artist, job->album);
 	free(job);
 }
 
 static void *refresh_worker(void *arg) {
 	daily_job_t *job = arg;
+	thread_be_background("daily");
 	job->ok = pick_track(job);
-	if (job->ok && job->path[0]) {
-		job->has_cover = cover_load_for_file(job->path, cover_w, cover_h, COVER_FIT_COVER, &job->cover);
-	}
 	if (!gui_post(apply_job, job)) {
-		if (job->has_cover) {
-			cover_free(&job->cover);
-		}
 		free(job);
 		busy = false;
 	}
 	return NULL;
 }
 
+static bool already_showing_today(void) {
+	char today[16];
+	today_ymd(today, sizeof(today));
+	return shown_path[0] && shown_date[0] && strcmp(shown_date, today) == 0 &&
+		   store_ready && strcmp(store_get(&store, "path"), shown_path) == 0;
+}
+
+// Instant path: settings.ini already holds today and the file is still indexed.
+static bool try_apply_stored_today(void) {
+	daily_job_t job = {0};
+	today_ymd(job.date, sizeof(job.date));
+	if (!pick_from_store(&job)) {
+		return false;
+	}
+	job.ok = true;
+	paint_track(job.date, job.path, job.name, job.artist, job.album);
+	return true;
+}
+
 static void start_refresh(void) {
 	if (busy) {
 		return;
 	}
+	if (already_showing_today()) {
+		sync_play_btn();
+		return;
+	}
+
+	// Same day in store: paint on the UI thread, cover via coverloader.
+	if (try_apply_stored_today()) {
+		return;
+	}
+
 	daily_job_t *job = calloc(1, sizeof(*job));
 	if (!job) {
 		return;
@@ -438,14 +537,7 @@ static void start_refresh(void) {
 	today_ymd(job->date, sizeof(job->date));
 	job->gen = ++job_gen;
 	busy = true;
-	lv_label_set_text(status_label, ru() ? "Загрузка…" : "Loading…");
-	lv_obj_set_hidden(status_label, false);
-	if (info_row) {
-		lv_obj_set_hidden(info_row, true);
-	}
-	if (cover_frame) {
-		lv_obj_set_hidden(cover_frame, true);
-	}
+	set_loading(true);
 
 	pthread_t th;
 	if (pthread_create(&th, NULL, refresh_worker, job) != 0) {
@@ -457,6 +549,15 @@ static void start_refresh(void) {
 	pthread_detach(th);
 }
 
+static void poll_cb(lv_timer_t *t) {
+	(void)t;
+	if (!daily_screen || lv_screen_active() != daily_screen) {
+		return;
+	}
+	poll_cover();
+	sync_play_btn();
+}
+
 static void play_cb(lv_event_t *e) {
 	(void)e;
 	if (!shown_path[0] || switcher_back_drag_active() || player_sheet_drag_active()) {
@@ -465,14 +566,13 @@ static void play_cb(lv_event_t *e) {
 	device_state_t st;
 	device_state_get(&st);
 	if (daily_is_loaded(&st)) {
-		// Same track: toggle like the player's transport disc.
 		bool was_playing = st.status == AUDIO_STATUS_PLAYING;
 		player_key_play_pause();
-		set_play_icon(!was_playing); // optimistic; poll reconciles
+		set_play_icon(!was_playing);
 		return;
 	}
 	player_play_file(shown_path);
-	set_play_icon(true); // optimistic; poll reconciles if start fails
+	set_play_icon(true);
 }
 
 static void theme_cb(void) {
@@ -521,6 +621,7 @@ static lv_obj_t *daily_addon_init(const sonix_addon_host_t *host) {
 	addon_id = host->id;
 	store_open(host->dir);
 	compute_cover_size();
+	coverloader_start();
 
 	daily_screen = lv_obj_create(NULL);
 	lv_obj_add_style(daily_screen, &theme_style_screen, 0);
@@ -533,7 +634,6 @@ static lv_obj_t *daily_addon_init(const sonix_addon_host_t *host) {
 	int pad = host->cfg->padding;
 	int top = settingsrow_content_top(gui_cfg);
 
-	// Full-bleed cover under the page heading.
 	cover_frame = lv_obj_create(daily_screen);
 	lv_obj_remove_style_all(cover_frame);
 	lv_obj_set_pos(cover_frame, 0, top);
@@ -549,8 +649,6 @@ static lv_obj_t *daily_addon_init(const sonix_addon_host_t *host) {
 	lv_obj_center(cover_img);
 	lv_obj_set_hidden(cover_img, true);
 
-	// Title / artist / album on the left, play disc on the right — like the
-	// player's transport circle, not a full-width caption button.
 	int info_y = top + cover_h + META_GAP;
 	info_row = lv_obj_create(daily_screen);
 	lv_obj_remove_style_all(info_row);
@@ -613,14 +711,19 @@ static lv_obj_t *daily_addon_init(const sonix_addon_host_t *host) {
 	lv_obj_set_style_image_recolor_opa(play_btn_icon, LV_OPA_COVER, 0);
 	lv_obj_center(play_btn_icon);
 
+	load_spinner = spinner_create(daily_screen, &icon_loader_big);
+	lv_obj_align(load_spinner, LV_ALIGN_CENTER, 0, SC(-24));
+	lv_obj_set_hidden(load_spinner, true);
+
 	status_label = lv_label_create(daily_screen);
 	lv_label_set_long_mode(status_label, LV_LABEL_LONG_WRAP);
 	lv_obj_set_width(status_label, sw - 2 * pad);
 	lv_obj_set_style_text_align(status_label, LV_TEXT_ALIGN_CENTER, 0);
 	lv_obj_set_style_text_font(status_label, &font_ui_18, 0);
 	lv_obj_set_style_text_color(status_label, theme()->text_secondary, 0);
-	lv_label_set_text(status_label, ru() ? "Загрузка…" : "Loading…");
-	lv_obj_align(status_label, LV_ALIGN_CENTER, 0, SC(20));
+	lv_label_set_text(status_label, "");
+	lv_obj_align(status_label, LV_ALIGN_CENTER, 0, SC(36));
+	lv_obj_set_hidden(status_label, true);
 
 	lv_obj_add_event_cb(daily_screen, loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 	lv_obj_add_event_cb(daily_screen, unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
@@ -642,6 +745,8 @@ static lv_obj_t *daily_addon_init(const sonix_addon_host_t *host) {
 
 static bool daily_addon_stop(void) {
 	job_gen++;
+	cover_pending = false;
+	coverloader_release(DAILY_COVER_SLOT);
 	if (poll_timer) {
 		power_forget_timer(poll_timer);
 		lv_timer_delete(poll_timer);
@@ -666,6 +771,7 @@ static bool daily_addon_stop(void) {
 	artist_label = NULL;
 	album_label = NULL;
 	status_label = NULL;
+	load_spinner = NULL;
 	info_row = NULL;
 	meta_col = NULL;
 	play_btn = NULL;
@@ -675,6 +781,7 @@ static bool daily_addon_stop(void) {
 	busy = false;
 	play_shows_pause = false;
 	shown_path[0] = '\0';
+	shown_date[0] = '\0';
 	return true;
 }
 
