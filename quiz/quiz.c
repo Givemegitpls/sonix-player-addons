@@ -33,9 +33,10 @@
 
 #define PATH_MAX_QUIZ 512
 #define CHOICES 4
-#define POOL_MAX 512
-#define ARTIST_POOL_MAX 256
-#define PICK_TRIES 5
+// Distractor probes per correct candidate (random index into the live library).
+#define DISTRACTOR_TRIES 64
+// How many correct-deck skips to attempt before declaring the library done.
+#define CORRECT_SKIP_MAX 96
 #define SNIPPET_MS 12000
 #define SEEK_POLL_MS 30
 #define SEEK_WAIT_MS 4500
@@ -69,8 +70,9 @@ typedef struct {
 	quiz_mode_t mode;
 	bool ok;
 	bool no_library;
-	bool no_tracks;	  // library genuinely too small (< CHOICES rows)
-	bool no_choices;  // enough rows, but could not form CHOICES distinct labels
+	bool no_tracks;		 // library genuinely too small (< CHOICES rows)
+	bool no_choices;	 // enough rows, but could not form CHOICES distinct labels
+	bool library_done; // shuffled deck exhausted — session completed the library
 	unsigned gen;
 } quiz_job_t;
 
@@ -190,17 +192,22 @@ static lv_obj_t *reveal_sw;
 static lv_obj_t *reveal_val;
 static lv_obj_t *reveal_slider;
 
-static quiz_track_t pool[POOL_MAX];
-static int pool_n;
-static bool pool_ready;
-static bool pool_used[POOL_MAX]; // correct-answer tracks already played this game
-static char artist_pool[ARTIST_POOL_MAX][256];
-static int artist_pool_n;
-static bool artist_pool_ready;
-static bool artist_pool_used[ARTIST_POOL_MAX];
+// Session deck: shuffled library row indices. Correct answers walk it once;
+// distractors are sampled from the live library and are not consumed.
+static int *deck_idx;
+static int deck_n;
+static int deck_pos;
+static quiz_mode_t deck_kind; // MODE_ARTIST vs track list (track/album)
+static bool deck_ready;
+// Ask-labels already used as the correct answer (album titles / artist names).
+static char (*used_ask_labels)[256];
+static int used_ask_n;
+static int used_ask_cap;
+static int session_rounds; // successful rounds this game (for library-complete)
 static bool pool_failed_library;
 static bool pool_failed_tracks;
 static bool pool_failed_choices;
+static bool run_library_done; // results: finished the library, not lives/time
 static uint32_t seek_wait_started_ms;
 
 static quiz_track_t round_tracks[CHOICES];
@@ -1205,16 +1212,25 @@ static void fill_album(quiz_track_t *t) {
 	library_track_album(t->path, t->album, sizeof(t->album));
 }
 
+static void free_deck(void) {
+	free(deck_idx);
+	deck_idx = NULL;
+	deck_n = 0;
+	deck_pos = 0;
+	deck_ready = false;
+	free(used_ask_labels);
+	used_ask_labels = NULL;
+	used_ask_n = 0;
+	used_ask_cap = 0;
+}
+
 static void invalidate_pool(void) {
-	pool_n = 0;
-	pool_ready = false;
-	memset(pool_used, 0, sizeof(pool_used));
-	memset(pool, 0, sizeof(pool));
-	artist_pool_n = 0;
-	artist_pool_ready = false;
-	memset(artist_pool_used, 0, sizeof(artist_pool_used));
-	memset(artist_pool, 0, sizeof(artist_pool));
+	free_deck();
 	pool_failed_choices = false;
+	pool_failed_library = false;
+	pool_failed_tracks = false;
+	run_library_done = false;
+	session_rounds = 0;
 }
 
 static bool cfg_same(const quiz_cfg_t *a, const quiz_cfg_t *b) {
@@ -1249,26 +1265,6 @@ static void abandon_session(void) {
 	hide_results();
 }
 
-static int pool_unused_count(void) {
-	int n = 0;
-	for (int i = 0; i < pool_n; i++) {
-		if (!pool_used[i]) {
-			n++;
-		}
-	}
-	return n;
-}
-
-static int artist_unused_count(void) {
-	int n = 0;
-	for (int i = 0; i < artist_pool_n; i++) {
-		if (!artist_pool_used[i]) {
-			n++;
-		}
-	}
-	return n;
-}
-
 static bool catch_artist_row(const char *name, const char *path, const char *artist, void *user) {
 	(void)path;
 	(void)artist;
@@ -1280,77 +1276,63 @@ static bool catch_artist_row(const char *name, const char *path, const char *art
 	return false;
 }
 
-// force: rebuild even if a pool is already warm (new game / exhausted sample).
-static bool ensure_track_pool(quiz_job_t *job, bool force) {
-	if (!force && pool_ready && pool_n >= CHOICES) {
+static bool ask_label_seen(const char *lab) {
+	if (!lab || !lab[0] || strcmp(lab, "?") == 0) {
 		return true;
 	}
-	pool_n = 0;
-	pool_ready = false;
-	memset(pool_used, 0, sizeof(pool_used));
-	pool_failed_library = false;
-	pool_failed_tracks = false;
+	for (int i = 0; i < used_ask_n; i++) {
+		if (labels_conflict(used_ask_labels[i], lab, true)) {
+			return true;
+		}
+	}
+	return false;
+}
 
-	if (!library_is_open()) {
-		job->no_library = true;
-		pool_failed_library = true;
+static bool ask_label_remember(const char *lab) {
+	if (!lab || !lab[0] || strcmp(lab, "?") == 0) {
 		return false;
 	}
-
-	library_index_t *ix =
-		library_index_open(LIBRARY_LIST_TRACKS, LIBRARY_FILTER_NONE, NULL, LIBRARY_ORDER_DEFAULT, false);
-	int count = library_index_count(ix);
-	if (count < CHOICES) {
-		library_index_close(ix);
-		job->no_tracks = true;
-		pool_failed_tracks = true;
-		return false;
-	}
-
-	// Sample up to the real library size (capped): more variety for near-dupe filter.
-	int want = count < POOL_MAX ? count : POOL_MAX;
-	for (int i = 0; i < want * 3 && pool_n < want; i++) {
-		int idx = (int)(((uint32_t)rand() + (uint32_t)i * 2654435761u) % (uint32_t)count);
-		row_catch_t c = {0};
-		library_index_window(ix, idx, 1, catch_row, &c);
-		if (!c.filled) {
-			continue;
+	if (used_ask_n >= used_ask_cap) {
+		int cap = used_ask_cap ? used_ask_cap * 2 : 64;
+		char (*next)[256] = realloc(used_ask_labels, (size_t)cap * sizeof(*next));
+		if (!next) {
+			return false;
 		}
-		bool dup = false;
-		for (int j = 0; j < pool_n; j++) {
-			if (strcmp(pool[j].path, c.path) == 0) {
-				dup = true;
-				break;
-			}
-		}
-		if (dup) {
-			continue;
-		}
-		quiz_track_t *t = &pool[pool_n];
-		snprintf(t->path, sizeof(t->path), "%s", c.path);
-		snprintf(t->name, sizeof(t->name), "%s", c.name);
-		snprintf(t->artist, sizeof(t->artist), "%s", c.artist);
-		fill_album(t);
-		pool_n++;
+		used_ask_labels = next;
+		used_ask_cap = cap;
 	}
-	library_index_close(ix);
-
-	if (pool_n < CHOICES) {
-		job->no_tracks = true;
-		pool_failed_tracks = true;
-		return false;
-	}
-	pool_ready = true;
+	snprintf(used_ask_labels[used_ask_n], sizeof(used_ask_labels[0]), "%s", lab);
+	used_ask_n++;
 	return true;
 }
 
-static bool ensure_artist_pool(quiz_job_t *job, bool force) {
-	if (!force && artist_pool_ready && artist_pool_n >= CHOICES) {
-		return true;
+static bool load_track_at(library_index_t *ix, int idx, quiz_track_t *out) {
+	row_catch_t c = {0};
+	library_index_window(ix, idx, 1, catch_row, &c);
+	if (!c.filled) {
+		return false;
 	}
-	artist_pool_n = 0;
-	artist_pool_ready = false;
-	memset(artist_pool_used, 0, sizeof(artist_pool_used));
+	memset(out, 0, sizeof(*out));
+	snprintf(out->path, sizeof(out->path), "%s", c.path);
+	snprintf(out->name, sizeof(out->name), "%s", c.name);
+	snprintf(out->artist, sizeof(out->artist), "%s", c.artist);
+	fill_album(out);
+	return true;
+}
+
+static bool load_artist_name(library_index_t *ix, int idx, char *out, size_t out_sz) {
+	row_catch_t c = {0};
+	library_index_window(ix, idx, 1, catch_artist_row, &c);
+	if (!c.filled) {
+		return false;
+	}
+	snprintf(out, out_sz, "%s", c.name);
+	return out[0] != '\0';
+}
+
+// Build a shuffled index deck once per game. Only correct answers advance deck_pos.
+static bool build_deck(quiz_job_t *job, bool artists) {
+	free_deck();
 	pool_failed_library = false;
 	pool_failed_tracks = false;
 
@@ -1360,47 +1342,44 @@ static bool ensure_artist_pool(quiz_job_t *job, bool force) {
 		return false;
 	}
 
-	// ARTIST_TABLE already respects split_artists / separators / exceptions.
 	library_index_t *ix =
-		library_index_open(LIBRARY_LIST_ARTISTS, LIBRARY_FILTER_NONE, NULL, LIBRARY_ORDER_DEFAULT, false);
+		artists ? library_index_open(LIBRARY_LIST_ARTISTS, LIBRARY_FILTER_NONE, NULL, LIBRARY_ORDER_DEFAULT, false)
+				: library_index_open(LIBRARY_LIST_TRACKS, LIBRARY_FILTER_NONE, NULL, LIBRARY_ORDER_DEFAULT, false);
 	int count = library_index_count(ix);
-	if (count < CHOICES) {
-		library_index_close(ix);
-		job->no_tracks = true;
-		pool_failed_tracks = true;
-		return false;
-	}
-
-	int want = count < ARTIST_POOL_MAX ? count : ARTIST_POOL_MAX;
-	for (int i = 0; i < want * 3 && artist_pool_n < want; i++) {
-		int idx = (int)(((uint32_t)rand() + (uint32_t)i * 2654435761u) % (uint32_t)count);
-		row_catch_t c = {0};
-		library_index_window(ix, idx, 1, catch_artist_row, &c);
-		if (!c.filled) {
-			continue;
-		}
-		bool dup = false;
-		for (int j = 0; j < artist_pool_n; j++) {
-			if (strcmp(artist_pool[j], c.name) == 0) {
-				dup = true;
-				break;
-			}
-		}
-		if (dup) {
-			continue;
-		}
-		snprintf(artist_pool[artist_pool_n], sizeof(artist_pool[0]), "%s", c.name);
-		artist_pool_n++;
-	}
 	library_index_close(ix);
 
-	if (artist_pool_n < CHOICES) {
+	if (count < CHOICES) {
 		job->no_tracks = true;
 		pool_failed_tracks = true;
 		return false;
 	}
-	artist_pool_ready = true;
+
+	deck_idx = malloc((size_t)count * sizeof(int));
+	if (!deck_idx) {
+		job->no_tracks = true;
+		pool_failed_tracks = true;
+		return false;
+	}
+	for (int i = 0; i < count; i++) {
+		deck_idx[i] = i;
+	}
+	shuffle_ints(deck_idx, count);
+	deck_n = count;
+	deck_pos = 0;
+	deck_kind = artists ? MODE_ARTIST : MODE_TRACK;
+	deck_ready = true;
 	return true;
+}
+
+static bool ensure_deck(quiz_job_t *job) {
+	bool want_artists = (job->mode == MODE_ARTIST);
+	if (deck_ready && deck_idx && deck_n >= CHOICES) {
+		bool have_artists = (deck_kind == MODE_ARTIST);
+		if (want_artists == have_artists) {
+			return true;
+		}
+	}
+	return build_deck(job, want_artists);
 }
 
 static bool pick_track_for_artist(const char *artist_name, quiz_track_t *out) {
@@ -1415,55 +1394,29 @@ static bool pick_track_for_artist(const char *artist_name, quiz_track_t *out) {
 		return false;
 	}
 	int idx = rand() % count;
-	row_catch_t c = {0};
-	library_index_window(ix, idx, 1, catch_row, &c);
+	bool ok = load_track_at(ix, idx, out);
 	library_index_close(ix);
-	if (!c.filled) {
+	if (!ok) {
 		return false;
 	}
-	memset(out, 0, sizeof(*out));
-	snprintf(out->path, sizeof(out->path), "%s", c.path);
-	snprintf(out->name, sizeof(out->name), "%s", c.name);
 	// Answer label = split artist name from ARTIST_TABLE, not the raw tag.
 	snprintf(out->artist, sizeof(out->artist), "%s", artist_name);
-	fill_album(out);
 	return true;
 }
 
-static bool try_pick_track_round(quiz_job_t *job, quiz_track_t picked[CHOICES], int *correct_i_out) {
-	quiz_mode_t mode = job->mode;
-	if (pool_unused_count() < 1) {
-		return false;
-	}
-	int unused = pool_unused_count();
-	int pick = rand() % unused;
-	int correct_i = -1;
-	for (int i = 0; i < pool_n; i++) {
-		if (pool_used[i]) {
-			continue;
-		}
-		if (pick-- == 0) {
-			correct_i = i;
-			break;
-		}
-	}
-	if (correct_i < 0) {
-		return false;
-	}
-
-	memset(picked, 0, sizeof(quiz_track_t) * CHOICES);
-	picked[0] = pool[correct_i];
-	int have = 1;
-
+static bool fill_distractors_tracks(library_index_t *ix, int count, quiz_mode_t mode, quiz_track_t picked[CHOICES],
+									int *have_io) {
+	int have = *have_io;
 	for (int pass = 0; pass < 2 && have < CHOICES; pass++) {
-		for (int t = 0; t < pool_n * 3 && have < CHOICES; t++) {
-			int idx = rand() % pool_n;
-			if (idx == correct_i) {
+		for (int t = 0; t < DISTRACTOR_TRIES && have < CHOICES; t++) {
+			int idx = rand() % count;
+			quiz_track_t cand;
+			if (!load_track_at(ix, idx, &cand)) {
 				continue;
 			}
 			bool dup_path = false;
 			for (int i = 0; i < have; i++) {
-				if (strcmp(picked[i].path, pool[idx].path) == 0) {
+				if (strcmp(picked[i].path, cand.path) == 0) {
 					dup_path = true;
 					break;
 				}
@@ -1471,17 +1424,63 @@ static bool try_pick_track_round(quiz_job_t *job, quiz_track_t picked[CHOICES], 
 			if (dup_path) {
 				continue;
 			}
-			if (label_used(picked, have, mode, &pool[idx], pass == 0)) {
+			if (label_used(picked, have, mode, &cand, pass == 0)) {
 				continue;
 			}
-			picked[have++] = pool[idx];
+			picked[have++] = cand;
 		}
 	}
-	if (have < CHOICES) {
+	*have_io = have;
+	return have >= CHOICES;
+}
+
+// Walk the shuffled track deck for the correct answer; sample distractors freely.
+static bool try_pick_track_round(quiz_job_t *job, quiz_track_t picked[CHOICES]) {
+	quiz_mode_t mode = job->mode;
+	if (!deck_ready || !deck_idx || deck_pos >= deck_n) {
 		return false;
 	}
-	*correct_i_out = correct_i;
-	return true;
+
+	library_index_t *ix =
+		library_index_open(LIBRARY_LIST_TRACKS, LIBRARY_FILTER_NONE, NULL, LIBRARY_ORDER_DEFAULT, false);
+	int count = library_index_count(ix);
+	if (count < CHOICES) {
+		library_index_close(ix);
+		return false;
+	}
+
+	int skips = 0;
+	while (deck_pos < deck_n && skips < CORRECT_SKIP_MAX) {
+		int lib_i = deck_idx[deck_pos++];
+		skips++;
+		quiz_track_t correct;
+		if (!load_track_at(ix, lib_i, &correct)) {
+			continue;
+		}
+		const char *lab = track_label(&correct, mode);
+		// Track mode: deck path uniqueness is enough. Album: also skip ask-labels
+		// already used as the correct answer this game.
+		if (mode == MODE_ALBUM && ask_label_seen(lab)) {
+			continue;
+		}
+		if (mode == MODE_TRACK && (!lab || !lab[0] || strcmp(lab, "?") == 0)) {
+			continue;
+		}
+
+		memset(picked, 0, sizeof(quiz_track_t) * CHOICES);
+		picked[0] = correct;
+		int have = 1;
+		if (!fill_distractors_tracks(ix, count, mode, picked, &have)) {
+			continue;
+		}
+		if (mode == MODE_ALBUM) {
+			ask_label_remember(lab);
+		}
+		library_index_close(ix);
+		return true;
+	}
+	library_index_close(ix);
+	return false;
 }
 
 static bool artist_name_used(const char *const *names, int n, const char *cand, bool strict) {
@@ -1496,125 +1495,115 @@ static bool artist_name_used(const char *const *names, int n, const char *cand, 
 	return false;
 }
 
-static bool try_pick_artist_round(quiz_job_t *job, quiz_track_t picked[CHOICES], int picked_artist_i[CHOICES]) {
+static bool try_pick_artist_round(quiz_job_t *job, quiz_track_t picked[CHOICES]) {
 	(void)job;
-	if (artist_unused_count() < 1) {
+	if (!deck_ready || !deck_idx || deck_pos >= deck_n) {
 		return false;
 	}
-	const char *names[CHOICES];
-	int artist_i[CHOICES];
-	int have = 0;
 
-	int unused = artist_unused_count();
-	int pick = rand() % unused;
-	for (int i = 0; i < artist_pool_n; i++) {
-		if (artist_pool_used[i]) {
+	library_index_t *ix =
+		library_index_open(LIBRARY_LIST_ARTISTS, LIBRARY_FILTER_NONE, NULL, LIBRARY_ORDER_DEFAULT, false);
+	int count = library_index_count(ix);
+	if (count < CHOICES) {
+		library_index_close(ix);
+		return false;
+	}
+
+	char name_buf[CHOICES][256];
+	int skips = 0;
+	while (deck_pos < deck_n && skips < CORRECT_SKIP_MAX) {
+		int lib_i = deck_idx[deck_pos++];
+		skips++;
+		if (!load_artist_name(ix, lib_i, name_buf[0], sizeof(name_buf[0]))) {
 			continue;
 		}
-		if (pick-- == 0) {
-			names[0] = artist_pool[i];
-			artist_i[0] = i;
-			have = 1;
-			break;
+		if (ask_label_seen(name_buf[0])) {
+			continue;
 		}
-	}
-	if (have < 1) {
-		return false;
-	}
 
-	for (int pass = 0; pass < 2 && have < CHOICES; pass++) {
-		for (int t = 0; t < artist_pool_n * 3 && have < CHOICES; t++) {
-			int idx = rand() % artist_pool_n;
-			bool already = false;
-			for (int j = 0; j < have; j++) {
-				if (artist_i[j] == idx) {
-					already = true;
-					break;
+		const char *names[CHOICES];
+		names[0] = name_buf[0];
+		int have = 1;
+
+		for (int pass = 0; pass < 2 && have < CHOICES; pass++) {
+			for (int t = 0; t < DISTRACTOR_TRIES && have < CHOICES; t++) {
+				int idx = rand() % count;
+				char cand[256];
+				if (!load_artist_name(ix, idx, cand, sizeof(cand))) {
+					continue;
 				}
+				bool already = false;
+				for (int j = 0; j < have; j++) {
+					if (strcmp(names[j], cand) == 0) {
+						already = true;
+						break;
+					}
+				}
+				if (already) {
+					continue;
+				}
+				if (artist_name_used(names, have, cand, pass == 0)) {
+					continue;
+				}
+				snprintf(name_buf[have], sizeof(name_buf[0]), "%s", cand);
+				names[have] = name_buf[have];
+				have++;
 			}
-			if (already) {
-				continue;
-			}
-			if (artist_name_used(names, have, artist_pool[idx], pass == 0)) {
-				continue;
-			}
-			names[have] = artist_pool[idx];
-			artist_i[have] = idx;
-			have++;
 		}
-	}
-	if (have < CHOICES) {
-		return false;
-	}
+		if (have < CHOICES) {
+			continue;
+		}
 
-	memset(picked, 0, sizeof(quiz_track_t) * CHOICES);
-	for (int i = 0; i < CHOICES; i++) {
-		if (!pick_track_for_artist(names[i], &picked[i])) {
-			return false;
+		memset(picked, 0, sizeof(quiz_track_t) * CHOICES);
+		bool tracks_ok = true;
+		for (int i = 0; i < CHOICES; i++) {
+			if (!pick_track_for_artist(names[i], &picked[i])) {
+				tracks_ok = false;
+				break;
+			}
 		}
-		picked_artist_i[i] = artist_i[i];
+		if (!tracks_ok) {
+			continue;
+		}
+		ask_label_remember(names[0]);
+		library_index_close(ix);
+		return true;
 	}
-	return true;
+	library_index_close(ix);
+	return false;
 }
 
 static bool pick_round_from_pool(quiz_job_t *job) {
 	pool_failed_choices = false;
 	job->no_choices = false;
+	job->library_done = false;
 
-	if (job->mode == MODE_ARTIST) {
-		for (int try = 0; try < PICK_TRIES; try++) {
-			bool force = (try > 0) || !artist_pool_ready || artist_unused_count() < 1;
-			if (!ensure_artist_pool(job, force)) {
-				return false;
-			}
-			quiz_track_t picked[CHOICES];
-			int artist_i[CHOICES];
-			if (!try_pick_artist_round(job, picked, artist_i)) {
-				// Resample artists and try again.
-				artist_pool_ready = false;
-				continue;
-			}
-			artist_pool_used[artist_i[0]] = true;
-			int order[CHOICES] = {0, 1, 2, 3};
-			shuffle_ints(order, CHOICES);
-			for (int i = 0; i < CHOICES; i++) {
-				job->tracks[i] = picked[order[i]];
-				if (order[i] == 0) {
-					job->correct = i;
-				}
-			}
-			return true;
-		}
-		job->no_choices = true;
-		pool_failed_choices = true;
+	if (!ensure_deck(job)) {
 		return false;
 	}
 
-	for (int try = 0; try < PICK_TRIES; try++) {
-		bool force = (try > 0) || !pool_ready || pool_unused_count() < 1;
-		if (!ensure_track_pool(job, force)) {
-			return false;
+	quiz_track_t picked[CHOICES];
+	bool ok = (job->mode == MODE_ARTIST) ? try_pick_artist_round(job, picked) : try_pick_track_round(job, picked);
+	if (!ok) {
+		// Deck finished or remaining rows cannot form 4 distinct labels.
+		job->library_done = true;
+		if (session_rounds == 0) {
+			job->no_choices = true;
+			pool_failed_choices = true;
+			job->library_done = false;
 		}
-		quiz_track_t picked[CHOICES];
-		int correct_i = -1;
-		if (!try_pick_track_round(job, picked, &correct_i)) {
-			pool_ready = false;
-			continue;
-		}
-		pool_used[correct_i] = true;
-		int order[CHOICES] = {0, 1, 2, 3};
-		shuffle_ints(order, CHOICES);
-		for (int i = 0; i < CHOICES; i++) {
-			job->tracks[i] = picked[order[i]];
-			if (order[i] == 0) {
-				job->correct = i;
-			}
-		}
-		return true;
+		return false;
 	}
-	job->no_choices = true;
-	pool_failed_choices = true;
-	return false;
+
+	int order[CHOICES] = {0, 1, 2, 3};
+	shuffle_ints(order, CHOICES);
+	for (int i = 0; i < CHOICES; i++) {
+		job->tracks[i] = picked[order[i]];
+		if (order[i] == 0) {
+			job->correct = i;
+		}
+	}
+	return true;
 }
 
 static void finish_answer(bool ok, int which);
@@ -1746,10 +1735,15 @@ static void show_results(void) {
 		records_note_survival(score);
 	} else if (cfg.play == PLAY_TIMED) {
 		records_note_timed(score);
+	} else if (cfg.play == PLAY_ENDLESS) {
+		int top = best_streak > streak ? best_streak : streak;
+		records_note_endless(top);
 	}
 
 	if (results_title) {
-		if (run_end_failed) {
+		if (run_library_done) {
+			lv_label_set_text(results_title, ru() ? "Медиатека пройдена" : "Library complete");
+		} else if (run_end_failed) {
 			lv_label_set_text(results_title, ru() ? "Жизни закончились" : "Out of lives");
 		} else {
 			lv_label_set_text(results_title, ru() ? "Время вышло" : "Time's up");
@@ -1757,11 +1751,17 @@ static void show_results(void) {
 	}
 	if (results_score) {
 		char line[32];
-		snprintf(line, sizeof(line), "%d", score);
+		if (cfg.play == PLAY_ENDLESS) {
+			int top = best_streak > streak ? best_streak : streak;
+			snprintf(line, sizeof(line), "%d", top);
+		} else {
+			snprintf(line, sizeof(line), "%d", score);
+		}
 		lv_label_set_text(results_score, line);
 	}
 	if (results_score_cap) {
-		lv_label_set_text(results_score_cap, ru() ? "очков" : "points");
+		lv_label_set_text(results_score_cap,
+						  cfg.play == PLAY_ENDLESS ? (ru() ? "серия" : "streak") : (ru() ? "очков" : "points"));
 	}
 	if (results_stat_correct_val) {
 		char line[24];
@@ -1861,6 +1861,10 @@ static void end_run(bool failed) {
 	run_active = false;
 	run_needs_again = true;
 	run_end_failed = failed;
+	// Lives-out clears the library-complete flag; time-up and library-done keep theirs.
+	if (failed) {
+		run_library_done = false;
+	}
 	stop_answer_timer();
 	replay_set_available(false);
 	paint_score();
@@ -1880,6 +1884,28 @@ static void apply_round(void *user) {
 	set_loading(false);
 
 	if (!job->ok) {
+		if (job->library_done && session_rounds > 0) {
+			// Shuffled library finished mid-session — celebrate, don't error.
+			run_library_done = true;
+			stop_snippet();
+			stop_answer_timer();
+			replay_set_available(false);
+			for (int i = 0; i < CHOICES; i++) {
+				if (choice_btn[i]) {
+					lv_obj_set_hidden(choice_btn[i], true);
+				}
+			}
+			if (feedback_label) {
+				lv_obj_set_hidden(feedback_label, true);
+			}
+			if (status_label) {
+				lv_obj_set_hidden(status_label, true);
+			}
+			end_run(false);
+			show_results();
+			free(job);
+			return;
+		}
 		const char *msg;
 		if (job->no_library || pool_failed_library) {
 			msg = ru() ? "Сначала просканируйте\nбиблиотеку в Music." : "Scan the library\nunder Music first.";
@@ -1891,14 +1917,8 @@ static void apply_round(void *user) {
 		} else {
 			msg = ru() ? "Нужно хотя бы 4 трека\nв библиотеке." : "Need at least 4 tracks\nin the library.";
 		}
-		bool mid_run = game_started && score > 0;
-		if (!mid_run) {
-			game_started = false;
-			show_idle();
-		} else {
-			// Keep the session; leave the last round visible and show the error.
-			set_loading(false);
-		}
+		game_started = false;
+		show_idle();
 		lv_label_set_text(status_label, msg);
 		lv_obj_set_hidden(status_label, false);
 		free(job);
@@ -1911,6 +1931,7 @@ static void apply_round(void *user) {
 	memset(choice_missed, 0, sizeof(choice_missed));
 	round_correct = job->correct;
 	memcpy(round_tracks, job->tracks, sizeof(round_tracks));
+	session_rounds++;
 
 	hide_idle();
 	lv_label_set_text(prompt_label, mode_prompt(cfg.ask));
@@ -3394,7 +3415,6 @@ static bool quiz_addon_stop(void) {
 	best_timed_score = 0;
 	snippet_path[0] = '\0';
 	memset(round_tracks, 0, sizeof(round_tracks));
-	memset(pool, 0, sizeof(pool));
 	return true;
 }
 

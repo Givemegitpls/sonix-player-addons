@@ -9,7 +9,9 @@ INSTALL / УСТАНОВКА
 
 WHAT IT IS / ЧТО ЭТО
   Guess artist, track or album from a short library snippet. On Start pick what
-  to guess and a play mode, then Start. Gear: per-mode options. Trophy: personal
-  bests (Survival score / Endless streak / Timed score).
-  Угадайте исполнителя, трек или альбом по короткому фрагменту. На старте —
-  что угадывать, режим и Начать. Шестерёнка — настройки; кубок — рекорды.
+  to guess and a play mode, then Start. Each game shuffles the library and asks
+  every track/artist once as the correct answer; when none remain, Library
+  complete. Gear: per-mode options. Trophy: personal bests.
+  Угадайте исполнителя, трек или альбом по короткому фрагменту. За игру
+  медиатека перемешивается и каждый трек/исполнитель загадывается один раз;
+  когда вариантов не остаётся — «Медиатека пройдена».
