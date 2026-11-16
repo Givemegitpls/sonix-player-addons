@@ -808,3 +808,29 @@ the merged calculator were demonstrated rather than argued from the code.
 - The store now shows an installed addon's version from `installed.tsv`, not from
   the card's `addon.json`: updates never rewrite the manifest, so the file's
   string goes stale.
+
+## quiz: the deck and the round worker share a life (2026-11-16)
+
+`quiz/quiz.c` builds a shuffled index deck and walks it in a detached worker.
+The deck is only ever touched by the worker, and `free_deck()` must not run
+under one: `invalidate_pool()` marks it dirty and the last worker out frees it
+(`round_enter`/`round_leave`); `stop()` ends with `round_wait("stop")` and
+returns false when a worker is still inside the library. Do not "simplify" the
+deck back to a file-scope array freed by the UI thread — that was the crash.
+- Pushing to the player: it is reachable over `adb`, the card is `/mnt/sd_0`
+  (`/mnt/sd_0/Addons/<id>`), and the player's log is
+  `/mnt/sd_0/.local/sonix_player.log` (`grep -a "addon:"`). No restart is needed
+  after copying a library: `slot_files_current()` is checked when the tile is
+  tapped, so the new `.so` runs then — the log says `changed on the card,
+  reloading`. Keep `settings.ini` when overwriting an install.
+
+## quiz: records are a table, and the addon's store grew for it (2026-11-17)
+
+`quiz` keeps one best per (mode and scoring) x (difficulty the run was played
+on): 16 keys named `b_sv_*`, `b_sp_*`, `b_en_*`, `b_td_*` with the last letter
+`n`/`e`/`m`/`h` (track-album, easy, medium, hard). That pushed
+`common/store.h` `STORE_KEYS` from 16 to 32 — every addon's `store_t` grew by
+about 5 KB, so do not shrink it back without moving the records somewhere else.
+Old `best_survival_score` / `best_endless_streak` / `best_timed_score` are
+migrated into the `_n` bucket at load and written back at once (a load that
+only migrated used to lose them).

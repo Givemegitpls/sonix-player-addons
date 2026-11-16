@@ -28,6 +28,14 @@ What is here:
   uses this rather than the player's `device_config.ini`: that file belongs to
   the player, it is rewritten whole on every save, and saving it from an addon's
   worker thread races the interface.
+- `artisttag.{h,c}` — an artist tag read the way the player's library read it:
+  `[library] split_artists` and `artist_separators` decide whether "A; B" is two
+  artists or one, and the library's own `split_names()` is static, so its rules
+  live here rather than in whichever addon needs them. `artisttag_split()`
+  yields the folded names, `artisttag_credit()` says where a name stands in the
+  tag — first, the one a listener gives when the track plays, or a guest credit
+  after it. Any addon offering artist names as answers or comparing two of them
+  has to agree with the index, or it asks about a name the player does not show.
 - `listrow.{h,c}` — covers for the rows of a service's list: a row is bound to a
   URL, the picture appears in it when it arrives, and the twelve download slots
   the player has are shared out among the rows that are actually on screen. The

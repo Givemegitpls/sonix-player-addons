@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "common/artisttag.h"
+
 #include "src/system/image/stb_image_decl.h"
 
 #include "cpage.h"
@@ -177,6 +179,13 @@ static bool shown_playing;
 static char shown_artist[256];
 static char shown_note[288];
 
+// The library's own artist-separator rules, read once when the page is built
+// (config.h has no lock, and this is the UI thread). A tag the player splits
+// into several names -- "Gorillaz; Jamie Principle; Zebra Katz" -- is one line
+// wide here, and the line is the name a listener gives, not the whole tag; see
+// common/artisttag.h.
+static artisttag_rules_t tag_rules;
+
 static void apply_palette(void);
 
 // ---------------------------------------------------------------------------
@@ -338,9 +347,16 @@ static void refresh_labels(const device_state_t *st) {
 	if (artist == NULL || artist[0] == '\0') {
 		artist = st->current_file[0] ? "Unknown artist" : "--";
 	}
-	if (strcmp(shown_artist, artist) != 0) {
-		snprintf(shown_artist, sizeof(shown_artist), "%s", artist);
-		lv_label_set_text(artist_label, artist);
+	// A multi-name tag is the first of its names, as written: the page has one
+	// line for the artist and the library files the track under all of them.
+	char primary[256];
+	const char *shown = artist;
+	if (artisttag_first(&tag_rules, artist, primary, sizeof(primary)) && primary[0]) {
+		shown = primary;
+	}
+	if (strcmp(shown_artist, shown) != 0) {
+		snprintf(shown_artist, sizeof(shown_artist), "%s", shown);
+		lv_label_set_text(artist_label, shown);
 	}
 
 	// Under the artist: the record it came from. A stream has no record, and a
@@ -572,6 +588,7 @@ static void unloaded_cb(lv_event_t *e) {
 
 lv_obj_t *cpage_build(const sonix_addon_host_t *host) {
 	cfg = host->cfg;
+	tag_rules = artisttag_rules_from_player();
 	cpal_default(&pal);
 	shown_picture = 0;
 	shown_playing = false;

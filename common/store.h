@@ -26,7 +26,10 @@
 // player killed at any moment, and a half-written settings file loses the
 // session (and, for a server that needs the password, the password with it).
 
-#define STORE_KEYS 16
+// Room for the settings and for a record per modifier combination: an addon
+// that keeps best scores has to keep them apart (a run played on "hard" is not
+// the same run), and 16 filled up as soon as that started.
+#define STORE_KEYS 32
 #define STORE_KEY_MAX 32
 #define STORE_VALUE_MAX 256
 #define STORE_PATH_MAX 256

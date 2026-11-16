@@ -10,6 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "common/artisttag.h"
 #include "common/store.h"
 #include "src/addon/addon.h"
 #include "src/gui/fonts/fonts.h"
@@ -65,6 +66,48 @@
 
 typedef enum { MODE_ARTIST = 0, MODE_TRACK = 1, MODE_ALBUM = 2, MODE_COUNT } quiz_mode_t;
 typedef enum { PLAY_SURVIVAL = 0, PLAY_ENDLESS = 1, PLAY_TIMED = 2, PLAY_COUNT } play_mode_t;
+// Survival has two ways of keeping score: lives (a miss costs one) and points
+// (every answer is worth something, and a balance below zero ends the run).
+typedef enum { SCORING_LIVES = 0, SCORING_POINTS = 1, SCORING_COUNT } survival_scoring_t;
+
+// One record per (mode and scoring) x (difficulty the run was played on), where
+// the bucket is the artist level for an artist run and "track or album" for the
+// others -- those have no difficulty to speak of.
+typedef enum { REC_SURV_LIVES = 0, REC_SURV_POINTS, REC_ENDLESS, REC_TIMED, REC_COUNT } rec_profile_t;
+typedef enum { REC_NONE = 0, REC_EASY, REC_MEDIUM, REC_HARD } rec_bucket_t;
+#define REC_BUCKETS 4
+
+// Short keys: settings.ini is hand-editable and 26 of them have to fit.
+static const char *const REC_KEYS[REC_COUNT][REC_BUCKETS] = {
+	{"b_sv_n", "b_sv_e", "b_sv_m", "b_sv_h"},
+	{"b_sp_n", "b_sp_e", "b_sp_m", "b_sp_h"},
+	{"b_en_n", "b_en_e", "b_en_m", "b_en_h"},
+	{"b_td_n", "b_td_e", "b_td_m", "b_td_h"},
+};
+
+// The points variant, as asked for: an answer is worth 10 at the first second
+// and one less for every second spent listening, a miss is -10, silence -5, and
+// a balance under zero ends the run. The snippet is the clock, so the window is
+// SNIPPET_MS and nothing else runs out.
+#define POINTS_START 10
+#define POINTS_ANSWER_MAX 10
+#define POINTS_WRONG (-10)
+#define POINTS_TIMEOUT (-5)
+// Who the artist round asks about: the one a listener names when the track
+// plays (first in the tag), any credit, or only the guests. A collaboration
+// tag is "A; B" and the library files the track under both, so without this
+// the game asks "B" for a Gorillaz track and the answer looks wrong.
+typedef enum { ARTIST_LEVEL_PRIMARY = 0, ARTIST_LEVEL_MIXED = 1, ARTIST_LEVEL_GUEST = 2, ARTIST_LEVEL_COUNT } artist_level_t;
+
+// How the firmware splits a multi-name tag: [library] split_artists and
+// artist_separators (LIBRARY_SPLIT_*). A tag has to be read the way the library
+// that built ARTIST_TABLE read it -- "A; B" is two artists there, one otherwise
+// -- and only the player knows which. Copied into the job on the UI thread
+// (config.h is not thread-safe) and read by the worker alone.
+typedef struct {
+	bool split;
+	unsigned seps;
+} artist_rules_t;
 
 typedef struct {
 	char path[PATH_MAX_QUIZ];
@@ -77,6 +120,8 @@ typedef struct {
 	quiz_track_t tracks[CHOICES];
 	int correct;
 	quiz_mode_t mode;
+	int artist_level; // copied from cfg on the UI thread: the worker reads it per pick
+	artisttag_rules_t rules; // the library's separator rules, read on the UI thread
 	bool ok;
 	bool no_library;
 	bool no_tracks;		 // library genuinely too small (< CHOICES rows)
@@ -87,7 +132,9 @@ typedef struct {
 
 typedef struct {
 	quiz_mode_t ask;
+	artist_level_t artist_level;
 	play_mode_t play;
+	survival_scoring_t survival_scoring;
 	bool reveal_on;
 	int reveal_sec;
 	int survival_lives; // 1..5
@@ -117,12 +164,15 @@ static quiz_cfg_t cfg_before_settings; // snapshot when the gear opens
 static lv_obj_t *quiz_screen;
 static lv_obj_t *settings_screen;
 static lv_obj_t *records_screen;
-static lv_obj_t *records_surv_val;
-static lv_obj_t *records_end_val;
-static lv_obj_t *records_timed_val;
+// The trophy screen is a table: one row per mode and difficulty. A run played on
+// "hard" is not the same run as one on "easy", and the points against lives are
+// two different games, so each combination keeps its own best.
+static lv_obj_t *records_row[REC_COUNT][REC_BUCKETS];
+static lv_obj_t *records_val[REC_COUNT][REC_BUCKETS];
 static lv_obj_t *prompt_label;
 static lv_obj_t *meta_row;
 static lv_obj_t *score_label;
+static lv_obj_t *balance_label;
 static lv_obj_t *lives_row;
 static lv_obj_t *lives_img[LIVES_MAX];
 static lv_obj_t *timer_label;
@@ -165,6 +215,8 @@ static lv_obj_t *results_stat_lives_val;
 static lv_obj_t *results_stat_lives_lbl;
 static lv_obj_t *results_btn;
 static lv_obj_t *results_btn_lbl;
+static lv_obj_t *results_menu_btn; // "Main menu", beside "Play again"
+static lv_obj_t *results_menu_lbl;
 
 static lv_image_dsc_t heart_full_dsc;
 static lv_image_dsc_t heart_empty_dsc;
@@ -176,12 +228,20 @@ static void *trophy_px;
 static bool trophy_ready;
 static lv_obj_t *trophy_icon;
 
-static int best_survival_score;
-static int best_endless_streak;
-static int best_timed_score;
+static int best_score[REC_COUNT][REC_BUCKETS];
 
 static lv_obj_t *set_ask_pills[MODE_COUNT];
 static lv_obj_t *set_play_pills[PLAY_COUNT];
+// Difficulty of the artist round, on the start card: it is a choice for the
+// game, not a preference. Hidden while something else is what to guess.
+static lv_obj_t *idle_scoring_sec; // "Scoring" row: lives or points, Survival only
+static lv_obj_t *idle_scoring_cap;
+static lv_obj_t *idle_scoring_row;
+static lv_obj_t *idle_scoring_pills[SCORING_COUNT];
+static lv_obj_t *idle_level_sec;
+static lv_obj_t *idle_level_cap;
+static lv_obj_t *idle_level_row;
+static lv_obj_t *idle_level_pills[ARTIST_LEVEL_COUNT];
 static lv_obj_t *set_survival_box;
 static lv_obj_t *set_survival_lives_card;
 static lv_obj_t *set_survival_lives_val;
@@ -219,6 +279,14 @@ static bool pool_failed_choices;
 static bool run_library_done; // results: finished the library, not lives/time
 static int snippet_load_ticks;
 static bool force_relaxed; // one retry without near-dupe strictness
+static artisttag_rules_t round_rules; // worker only: copied from the job when a round starts
+
+// The round worker's lifetime, and the deck hanging off it -- see the comment
+// over round_enter()/round_leave()/round_wait().
+static pthread_mutex_t round_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t round_cond = PTHREAD_COND_INITIALIZER;
+static int round_threads;
+static bool deck_dirty; // the deck is to be freed: now if no worker walks it, else by the last one out
 
 static quiz_track_t round_tracks[CHOICES];
 static int round_correct = -1;
@@ -228,6 +296,7 @@ static bool revealing;
 static bool paused;
 static unsigned job_gen;
 static int score;
+static int points_balance; // only the points variant: opens at POINTS_START, under zero ends the run
 static int streak;		  // Endless: correct answers in a row
 static int best_streak;	  // Endless: best this session (for results if ever shown)
 static int run_correct;	  // correct answers in the current/last ended session
@@ -301,7 +370,9 @@ static int nearest_index(const int *vals, int n, int v) {
 
 static void cfg_defaults(void) {
 	cfg.ask = MODE_ARTIST;
+	cfg.artist_level = ARTIST_LEVEL_PRIMARY;
 	cfg.play = PLAY_SURVIVAL;
+	cfg.survival_scoring = SCORING_LIVES;
 	cfg.reveal_on = true;
 	cfg.reveal_sec = 3;
 	cfg.survival_lives = 3;
@@ -321,12 +392,24 @@ static void cfg_load(void) {
 	}
 	cfg.ask = (quiz_mode_t)ask;
 
+	int level = store_get_int(&store, "artist_level", (int)ARTIST_LEVEL_PRIMARY);
+	if (level < 0 || level >= ARTIST_LEVEL_COUNT) {
+		level = ARTIST_LEVEL_PRIMARY;
+	}
+	cfg.artist_level = (artist_level_t)level;
+
 	int play = store_get_int(&store, "play", -1);
 	if (play < 0 || play >= PLAY_COUNT) {
 		// Migrate old toggles: timed challenge → Timed, else Survival.
 		play = store_get_int(&store, "run_on", 0) != 0 ? (int)PLAY_TIMED : (int)PLAY_SURVIVAL;
 	}
 	cfg.play = (play_mode_t)play;
+
+	int scoring = store_get_int(&store, "survival_scoring", (int)SCORING_LIVES);
+	if (scoring < 0 || scoring >= SCORING_COUNT) {
+		scoring = SCORING_LIVES;
+	}
+	cfg.survival_scoring = (survival_scoring_t)scoring;
 
 	cfg.reveal_on = store_get_int(&store, "reveal_on", 1) != 0;
 	cfg.reveal_sec = REVEAL_SECS[nearest_index(REVEAL_SECS, REVEAL_N, store_get_int(&store, "reveal_sec", 3))];
@@ -341,17 +424,29 @@ static void cfg_load(void) {
 	cfg.timed_limit_sec = LIMIT_SECS[nearest_index(
 		LIMIT_SECS, LIMIT_N, store_get_int(&store, "timed_limit_sec", store_get_int(&store, "limit_sec", 15)))];
 
-	best_survival_score = store_get_int(&store, "best_survival_score", 0);
-	best_endless_streak = store_get_int(&store, "best_endless_streak", 0);
-	best_timed_score = store_get_int(&store, "best_timed_score", 0);
-	if (best_survival_score < 0) {
-		best_survival_score = 0;
+	for (int p = 0; p < REC_COUNT; p++) {
+		for (int b = 0; b < REC_BUCKETS; b++) {
+			int v = store_get_int(&store, REC_KEYS[p][b], 0);
+			best_score[p][b] = v > 0 ? v : 0;
+		}
 	}
-	if (best_endless_streak < 0) {
-		best_endless_streak = 0;
-	}
-	if (best_timed_score < 0) {
-		best_timed_score = 0;
+	// Records kept before the table existed had no difficulty: they move to the
+	// "no difficulty" bucket rather than being lost.
+	static const struct {
+		const char *key;
+		rec_profile_t profile;
+	} LEGACY[] = {
+		{"best_survival_score", REC_SURV_LIVES},
+		{"best_endless_streak", REC_ENDLESS},
+		{"best_timed_score", REC_TIMED},
+	};
+	for (size_t i = 0; i < sizeof(LEGACY) / sizeof(LEGACY[0]); i++) {
+		int v = store_get_int(&store, LEGACY[i].key, 0);
+		if (v > best_score[LEGACY[i].profile][REC_NONE]) {
+			best_score[LEGACY[i].profile][REC_NONE] = v;
+			store_set_int(&store, REC_KEYS[LEGACY[i].profile][REC_NONE], v);
+		}
+		store_set(&store, LEGACY[i].key, "");
 	}
 
 	// Drop migrated keys so STORE_KEYS room stays for records + settings.
@@ -360,6 +455,9 @@ static void cfg_load(void) {
 	store_set(&store, "lives", "");
 	store_set(&store, "run_sec", "");
 	store_set(&store, "limit_sec", "");
+	// The migration above only lives in memory until something writes the file;
+	// a launch that changed nothing would lose the records it just moved.
+	store_save(&store);
 }
 
 static void cfg_save(void) {
@@ -367,65 +465,79 @@ static void cfg_save(void) {
 		return;
 	}
 	store_set_int(&store, "ask", (int)cfg.ask);
+	store_set_int(&store, "artist_level", (int)cfg.artist_level);
 	store_set_int(&store, "play", (int)cfg.play);
+	store_set_int(&store, "survival_scoring", (int)cfg.survival_scoring);
 	store_set_int(&store, "reveal_on", cfg.reveal_on ? 1 : 0);
 	store_set_int(&store, "reveal_sec", cfg.reveal_sec);
 	store_set_int(&store, "survival_lives", cfg.survival_lives);
 	store_set_int(&store, "timed_lives", cfg.timed_lives);
 	store_set_int(&store, "timed_run_sec", cfg.timed_run_sec);
 	store_set_int(&store, "timed_limit_sec", cfg.timed_limit_sec);
-	store_set_int(&store, "best_survival_score", best_survival_score);
-	store_set_int(&store, "best_endless_streak", best_endless_streak);
-	store_set_int(&store, "best_timed_score", best_timed_score);
 	store_save(&store);
 }
+
+static bool play_points_mode(void);
 
 static void records_save(void) {
 	if (!store_ready) {
 		return;
 	}
-	store_set_int(&store, "best_survival_score", best_survival_score);
-	store_set_int(&store, "best_endless_streak", best_endless_streak);
-	store_set_int(&store, "best_timed_score", best_timed_score);
+	for (int p = 0; p < REC_COUNT; p++) {
+		for (int b = 0; b < REC_BUCKETS; b++) {
+			if (best_score[p][b] > 0) {
+				store_set_int(&store, REC_KEYS[p][b], best_score[p][b]);
+			} else {
+				store_set(&store, REC_KEYS[p][b], "");
+			}
+		}
+	}
 	store_save(&store);
 }
 
-static bool records_note_survival(int points) {
-	if (points <= best_survival_score) {
-		return false;
+// The mode and scoring the run is being played with, and the difficulty it is
+// asked at: the two halves of the record's address.
+static rec_profile_t record_profile(void) {
+	if (cfg.play == PLAY_ENDLESS) {
+		return REC_ENDLESS;
 	}
-	best_survival_score = points;
-	records_save();
-	return true;
+	if (cfg.play == PLAY_TIMED) {
+		return REC_TIMED;
+	}
+	return cfg.survival_scoring == SCORING_POINTS ? REC_SURV_POINTS : REC_SURV_LIVES;
 }
 
-static bool records_note_timed(int points) {
-	if (points <= best_timed_score) {
-		return false;
+static rec_bucket_t record_bucket(void) {
+	if (cfg.ask != MODE_ARTIST) {
+		return REC_NONE;
 	}
-	best_timed_score = points;
-	records_save();
-	return true;
+	return (rec_bucket_t)(REC_EASY + (int)cfg.artist_level);
 }
 
-static bool records_note_endless(int streak_n) {
-	if (streak_n <= best_endless_streak) {
+static bool records_note(int value) {
+	int p = record_profile();
+	int b = record_bucket();
+	if (value <= best_score[p][b]) {
 		return false;
 	}
-	best_endless_streak = streak_n;
+	best_score[p][b] = value;
 	records_save();
 	return true;
 }
 
 static void records_clear(void) {
-	best_survival_score = 0;
-	best_endless_streak = 0;
-	best_timed_score = 0;
+	memset(best_score, 0, sizeof(best_score));
 	records_save();
 }
 
+// Survival with points instead of lives: no hearts, no run clock, the snippet is
+// the answer window.
+static bool play_points_mode(void) {
+	return cfg.play == PLAY_SURVIVAL && cfg.survival_scoring == SCORING_POINTS;
+}
+
 static bool play_has_lives(void) {
-	return cfg.play == PLAY_SURVIVAL || cfg.play == PLAY_TIMED;
+	return cfg.play == PLAY_TIMED || (cfg.play == PLAY_SURVIVAL && !play_points_mode());
 }
 
 static bool play_has_session_clock(void) {
@@ -433,7 +545,7 @@ static bool play_has_session_clock(void) {
 }
 
 static bool play_has_answer_clock(void) {
-	return cfg.play == PLAY_TIMED;
+	return cfg.play == PLAY_TIMED || play_points_mode();
 }
 
 static int cfg_lives(void) {
@@ -489,111 +601,11 @@ static const char *track_label(const quiz_track_t *t, quiz_mode_t m) {
 
 // Near-duplicate filter for choices: exact match alone let through
 // "Free Flow Flava" vs "Free Flow Flava;Smuff Tha Quiz" and 1-letter typos.
-#define LABEL_FOLD_MAX 192
-#define LABEL_UNIT_MAX 6
+// Splitting and folding are common/artisttag's; what is decided here is only
+// what counts as too close to be a fair second choice.
+#define LABEL_FOLD_MAX ARTISTTAG_NAME_MAX
+#define LABEL_UNIT_MAX ARTISTTAG_MAX
 #define LABEL_DIST_MAX 64 // edit-distance window; longer labels only use units/substr
-
-static bool label_sep_char(unsigned char c) {
-	return c == ';' || c == '/' || c == '|' || c == '&' || c == ',' || c == '+';
-}
-
-// ASCII alphanumerics and every UTF-8 byte (≥0x80). Dropping high bytes folded
-// Cyrillic labels to empty strings, which then conflicted with everything.
-static bool label_char(unsigned char c) {
-	return isalnum(c) != 0 || c >= 0x80;
-}
-
-// Lowercase, map artist separators to spaces, keep letters/digits/spaces, collapse runs.
-static void label_fold(const char *in, char *out, size_t out_sz) {
-	if (!out || out_sz == 0) {
-		return;
-	}
-	size_t o = 0;
-	bool sp = true; // leading spaces dropped
-	for (const unsigned char *p = (const unsigned char *)(in ? in : ""); *p && o + 1 < out_sz; p++) {
-		unsigned char c = *p;
-		if (label_sep_char(c)) {
-			c = ' ';
-		} else if (c < 0x80) {
-			c = (unsigned char)tolower(c);
-		}
-		if (!(label_char(c) || c == ' ' || c == '\'')) {
-			continue;
-		}
-		if (c == ' ') {
-			if (sp) {
-				continue;
-			}
-			sp = true;
-			out[o++] = ' ';
-			continue;
-		}
-		sp = false;
-		out[o++] = (char)c;
-	}
-	while (o > 0 && out[o - 1] == ' ') {
-		o--;
-	}
-	out[o] = '\0';
-}
-
-// Split "A;B feat C" into folded units for overlap checks.
-static int label_units(const char *in, char units[][LABEL_FOLD_MAX], int max_units) {
-	if (!in || max_units <= 0) {
-		return 0;
-	}
-	char buf[LABEL_FOLD_MAX];
-	snprintf(buf, sizeof(buf), "%s", in);
-	for (char *p = buf; *p;) {
-		unsigned char c = (unsigned char)*p;
-		if (label_sep_char(c)) {
-			*p++ = '\n';
-			continue;
-		}
-		bool edge = (p == buf || !isalnum((unsigned char)p[-1]));
-		size_t n = 0;
-		if (edge) {
-			if (strncasecmp(p, "feat.", 5) == 0) {
-				n = 5;
-			} else if (strncasecmp(p, "feat", 4) == 0 && !isalnum((unsigned char)p[4])) {
-				n = 4;
-			} else if (strncasecmp(p, "ft.", 3) == 0) {
-				n = 3;
-			} else if (strncasecmp(p, "ft", 2) == 0 && !isalnum((unsigned char)p[2])) {
-				n = 2;
-			} else if (strncasecmp(p, "vs.", 3) == 0) {
-				n = 3;
-			} else if (strncasecmp(p, "vs", 2) == 0 && !isalnum((unsigned char)p[2])) {
-				n = 2;
-			} else if (strncasecmp(p, "x", 1) == 0 && !isalnum((unsigned char)p[1]) &&
-					   (p == buf || p[-1] == ' ' || label_sep_char((unsigned char)p[-1]))) {
-				n = 1; // "A x B"
-			}
-		}
-		if (n > 0) {
-			for (size_t i = 0; i < n; i++) {
-				p[i] = '\n';
-			}
-			p += n;
-			continue;
-		}
-		p++;
-	}
-	int n = 0;
-	for (char *tok = strtok(buf, "\n"); tok && n < max_units; tok = strtok(NULL, "\n")) {
-		label_fold(tok, units[n], LABEL_FOLD_MAX);
-		if (units[n][0]) {
-			n++;
-		}
-	}
-	if (n == 0) {
-		label_fold(in, units[0], LABEL_FOLD_MAX);
-		if (units[0][0]) {
-			n = 1;
-		}
-	}
-	return n;
-}
 
 static int edit_distance(const char *a, const char *b) {
 	size_t la = strlen(a), lb = strlen(b);
@@ -650,16 +662,16 @@ static bool labels_conflict(const char *a, const char *b, bool strict) {
 		return true;
 	}
 	char fa[LABEL_FOLD_MAX], fb[LABEL_FOLD_MAX];
-	label_fold(a, fa, sizeof(fa));
-	label_fold(b, fb, sizeof(fb));
+	artisttag_fold(a, fa, sizeof(fa));
+	artisttag_fold(b, fb, sizeof(fb));
 	if (!fa[0] || !fb[0] || strcmp(fa, fb) == 0) {
 		return true;
 	}
 
 	char ua[LABEL_UNIT_MAX][LABEL_FOLD_MAX];
 	char ub[LABEL_UNIT_MAX][LABEL_FOLD_MAX];
-	int na = label_units(a, ua, LABEL_UNIT_MAX);
-	int nb = label_units(b, ub, LABEL_UNIT_MAX);
+	int na = artisttag_split(&round_rules, a, ua, LABEL_UNIT_MAX);
+	int nb = artisttag_split(&round_rules, b, ub, LABEL_UNIT_MAX);
 	for (int i = 0; i < na; i++) {
 		for (int j = 0; j < nb; j++) {
 			if (strcmp(ua[i], ub[j]) == 0) {
@@ -860,8 +872,25 @@ static bool per_answer_timer_active(void) {
 	return play_has_answer_clock();
 }
 
+// 10 at the first second, one less for every second of the snippet spent
+// listening, never under 1 (the answer came before the snippet ended).
+static int answer_points(int left_ms) {
+	int elapsed_ms = SNIPPET_MS - left_ms;
+	if (elapsed_ms < 0) {
+		elapsed_ms = 0;
+	}
+	int points = POINTS_ANSWER_MAX - elapsed_ms / 1000;
+	if (points < 1) {
+		points = 1;
+	}
+	if (points > POINTS_ANSWER_MAX) {
+		points = POINTS_ANSWER_MAX;
+	}
+	return points;
+}
+
 static int per_answer_ms(void) {
-	return cfg.timed_limit_sec * 1000;
+	return play_points_mode() ? SNIPPET_MS : cfg.timed_limit_sec * 1000;
 }
 
 // White heart PNGs from assets/, tinted to the theme accent (same path as
@@ -960,16 +989,30 @@ static void paint_score(void) {
 	}
 	if (!game_started) {
 		lv_label_set_text(score_label, "");
+		if (balance_label) {
+			lv_obj_set_hidden(balance_label, true);
+		}
 		paint_lives();
 		return;
 	}
 	char line[64];
 	if (cfg.play == PLAY_ENDLESS) {
 		snprintf(line, sizeof(line), ru() ? "Серия %d" : "Streak %d", streak);
+	} else if (play_points_mode()) {
+		snprintf(line, sizeof(line), ru() ? "Угадано %d" : "Guessed %d", score);
 	} else {
 		snprintf(line, sizeof(line), ru() ? "Счёт %d" : "Score %d", score);
 	}
 	lv_label_set_text(score_label, line);
+	if (balance_label) {
+		if (game_started && play_points_mode()) {
+			snprintf(line, sizeof(line), "%d", points_balance);
+			lv_label_set_text(balance_label, line);
+			lv_obj_set_hidden(balance_label, false);
+		} else {
+			lv_obj_set_hidden(balance_label, true);
+		}
+	}
 	paint_lives();
 }
 
@@ -1261,8 +1304,88 @@ static void free_deck(void) {
 	used_ask_cap = 0;
 }
 
+// ---------------------------------------------------------------------------
+// The round's thread, and the wait stop() does on it
+//
+// addon.h: stop() may return only once no thread of the library is running,
+// because the player dlclose()s the mapping straight after -- code of the
+// library running on an unmapped mapping is a jump into nothing. One round is
+// one detached worker, and round_threads is what makes the answer honest.
+//
+// The same lock owns the deck's lifetime. A Back during "Loading..." runs
+// invalidate_pool() while the worker is inside build_deck()/try_pick_round();
+// freeing the deck there was a use-after-free in the allocator, so a worker
+// counts as a reader: the deck is freed at once when nobody walks it, and by the
+// last worker out otherwise.
+// ---------------------------------------------------------------------------
+#define QUIZ_THREAD_WAIT_MS 2000
+
+// Counted before pthread_create(), given back by the worker itself (or by
+// start_round() when the thread never started).
+static void round_enter(void) {
+	pthread_mutex_lock(&round_lock);
+	round_threads++;
+	pthread_mutex_unlock(&round_lock);
+}
+
+static void round_leave(void) {
+	pthread_mutex_lock(&round_lock);
+	if (round_threads > 0) {
+		round_threads--;
+	}
+	if (round_threads == 0) {
+		if (deck_dirty) {
+			free_deck();
+			deck_dirty = false;
+		}
+		pthread_cond_broadcast(&round_cond);
+	}
+	pthread_mutex_unlock(&round_lock);
+}
+
+// True when every worker has left. False is a worker still inside the library
+// index, and stop() turns that into "keep the mapping" -- a leak the player
+// accepts in place of a crash.
+static bool round_wait(const char *what) {
+	struct timespec deadline;
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_sec += QUIZ_THREAD_WAIT_MS / 1000;
+	deadline.tv_nsec += (long)(QUIZ_THREAD_WAIT_MS % 1000) * 1000000L;
+	if (deadline.tv_nsec >= 1000000000L) {
+		deadline.tv_sec++;
+		deadline.tv_nsec -= 1000000000L;
+	}
+	pthread_mutex_lock(&round_lock);
+	while (round_threads > 0) {
+		if (pthread_cond_timedwait(&round_cond, &round_lock, &deadline) != 0) {
+			break;
+		}
+	}
+	bool gone = round_threads == 0;
+	int left = round_threads;
+	if (gone && deck_dirty) {
+		free_deck();
+		deck_dirty = false;
+	}
+	pthread_mutex_unlock(&round_lock);
+	if (!gone) {
+		fprintf(stderr, "quiz: %s: %d round thread%s still in the library after %d ms\n", what, left,
+				left == 1 ? "" : "s", QUIZ_THREAD_WAIT_MS);
+	}
+	return gone;
+}
+
 static void invalidate_pool(void) {
-	free_deck();
+	// The deck belongs to the round worker (round_enter/round_leave): mark it,
+	// and let whoever is not walking it do the free.
+	pthread_mutex_lock(&round_lock);
+	if (round_threads == 0) {
+		free_deck();
+		deck_dirty = false;
+	} else {
+		deck_dirty = true;
+	}
+	pthread_mutex_unlock(&round_lock);
 	pool_failed_choices = false;
 	pool_failed_library = false;
 	pool_failed_tracks = false;
@@ -1272,7 +1395,9 @@ static void invalidate_pool(void) {
 }
 
 static bool cfg_same(const quiz_cfg_t *a, const quiz_cfg_t *b) {
-	return a->ask == b->ask && a->play == b->play && a->reveal_on == b->reveal_on && a->reveal_sec == b->reveal_sec &&
+	return a->ask == b->ask && a->artist_level == b->artist_level && a->play == b->play &&
+		   a->survival_scoring == b->survival_scoring &&
+		   a->reveal_on == b->reveal_on && a->reveal_sec == b->reveal_sec &&
 		   a->survival_lives == b->survival_lives && a->timed_run_sec == b->timed_run_sec &&
 		   a->timed_limit_sec == b->timed_limit_sec && a->timed_lives == b->timed_lives;
 }
@@ -1282,7 +1407,15 @@ static bool cfg_same(const quiz_cfg_t *a, const quiz_cfg_t *b) {
 static void abandon_session(void) {
 	stop_answer_feedback();
 	job_gen++; // drop any in-flight round worker
-	busy = false;
+	// A worker of the abandoned round may still be out (a Back during
+	// "Loading..."): busy stays set until it lands in apply_round() and drops
+	// the stale job, so a new round cannot start on top of it.
+	pthread_mutex_lock(&round_lock);
+	bool worker_out = round_threads == 0;
+	pthread_mutex_unlock(&round_lock);
+	if (worker_out) {
+		busy = false;
+	}
 	game_started = false;
 	answered = false;
 	revealing = false;
@@ -1292,6 +1425,7 @@ static void abandon_session(void) {
 	run_end_failed = false;
 	lives_left = 0;
 	score = 0;
+	points_balance = 0;
 	streak = 0;
 	best_streak = 0;
 	run_correct = 0;
@@ -1421,7 +1555,24 @@ static bool ensure_deck(quiz_job_t *job) {
 	return build_deck(job, want_artists);
 }
 
-static bool pick_track_for_artist(const char *artist_name, quiz_track_t *out) {
+static bool credit_matches_level(artisttag_credit_t credit, int level) {
+	if (credit == ARTISTTAG_NONE) {
+		return false;
+	}
+	if (level == ARTIST_LEVEL_PRIMARY) {
+		return credit == ARTISTTAG_FIRST;
+	}
+	if (level == ARTIST_LEVEL_GUEST) {
+		return credit == ARTISTTAG_GUEST;
+	}
+	return true; // mixed: either kind, which is what the library hands out
+}
+
+// A track of this artist that the level allows, or false when the artist has
+// none -- a guest-only artist is not a question on the easy level, and the deck
+// simply walks past it.
+#define ARTIST_TRACK_TRIES 12
+static bool pick_track_for_artist(const char *artist_name, int level, quiz_track_t *out) {
 	if (!artist_name || !artist_name[0] || !out) {
 		return false;
 	}
@@ -1432,10 +1583,21 @@ static bool pick_track_for_artist(const char *artist_name, quiz_track_t *out) {
 		library_index_close(ix);
 		return false;
 	}
-	int idx = rand() % count;
-	bool ok = load_track_at(ix, idx, out);
+	bool found = false;
+	for (int tries = 0; tries < ARTIST_TRACK_TRIES && !found; tries++) {
+		int idx = rand() % count;
+		quiz_track_t cand;
+		if (!load_track_at(ix, idx, &cand)) {
+			continue;
+		}
+		if (!credit_matches_level(artisttag_credit(&round_rules, cand.artist, artist_name), level)) {
+			continue;
+		}
+		*out = cand;
+		found = true;
+	}
 	library_index_close(ix);
-	if (!ok) {
+	if (!found) {
 		return false;
 	}
 	// Answer label = split artist name from ARTIST_TABLE, not the raw tag.
@@ -1536,7 +1698,6 @@ static bool artist_name_used(const char *const *names, int n, const char *cand, 
 }
 
 static bool try_pick_artist_round(quiz_job_t *job, quiz_track_t picked[CHOICES]) {
-	(void)job;
 	if (!deck_ready || !deck_idx || deck_pos >= deck_n) {
 		return false;
 	}
@@ -1595,15 +1756,15 @@ static bool try_pick_artist_round(quiz_job_t *job, quiz_track_t picked[CHOICES])
 		}
 
 		memset(picked, 0, sizeof(quiz_track_t) * CHOICES);
-		bool tracks_ok = true;
-		for (int i = 0; i < CHOICES; i++) {
-			if (!pick_track_for_artist(names[i], &picked[i])) {
-				tracks_ok = false;
-				break;
-			}
-		}
-		if (!tracks_ok) {
+		// The correct answer needs a track at this level; the distractors are
+		// names only -- a wrong option has nothing to sound, and a guest-only
+		// artist is a perfectly good distractor. One index open per round
+		// instead of four.
+		if (!pick_track_for_artist(names[0], job->artist_level, &picked[0])) {
 			continue;
+		}
+		for (int i = 1; i < CHOICES; i++) {
+			snprintf(picked[i].artist, sizeof(picked[i].artist), "%s", names[i]);
 		}
 		ask_label_remember(names[0]);
 		library_index_close(ix);
@@ -1686,13 +1847,14 @@ static void answer_tick_cb(lv_timer_t *t) {
 static void start_timers_for_round(void) {
 	uint32_t now = lv_tick_get();
 
-	// Open a scored session once at Start for Survival / Timed.
-	if (play_has_lives() && !run_active) {
+	// Open a scored session once at Start for Survival (either scoring) / Timed.
+	if ((play_has_lives() || play_points_mode()) && !run_active) {
 		run_active = true;
 		score = 0;
 		run_correct = 0;
 		run_end_failed = false;
-		lives_left = cfg_lives();
+		lives_left = play_has_lives() ? cfg_lives() : 0;
+		points_balance = POINTS_START;
 		if (play_has_session_clock()) {
 			run_deadline_ms = now + (uint32_t)cfg.timed_run_sec * 1000u;
 			run_left_ms = cfg.timed_run_sec * 1000;
@@ -1755,9 +1917,14 @@ static void keys_open(void) {
 	}
 	int fd = open(QUIZ_KEYS_NODE, O_RDONLY | O_NONBLOCK);
 	if (fd < 0) {
+		// No grab is survivable -- the quiz still plays -- but then next/previous
+		// change tracks behind the question, and the log is where that is
+		// explained (docs/ADDONS.md, "Debugging").
+		fprintf(stderr, "quiz: %s: %s\n", QUIZ_KEYS_NODE, strerror(errno));
 		return;
 	}
 	if (ioctl(fd, EVIOCGRAB, 1) != 0) {
+		fprintf(stderr, "quiz: %s: cannot take it: %s\n", QUIZ_KEYS_NODE, strerror(errno));
 		close(fd);
 		return;
 	}
@@ -1969,20 +2136,19 @@ static void show_results(void) {
 	if (!results_box) {
 		return;
 	}
-	if (cfg.play == PLAY_SURVIVAL) {
-		records_note_survival(score);
-	} else if (cfg.play == PLAY_TIMED) {
-		records_note_timed(score);
-	} else if (cfg.play == PLAY_ENDLESS) {
+	if (cfg.play == PLAY_ENDLESS) {
 		int top = best_streak > streak ? best_streak : streak;
-		records_note_endless(top);
+		records_note(top);
+	} else {
+		records_note(score);
 	}
 
 	if (results_title) {
 		if (run_library_done) {
 			lv_label_set_text(results_title, ru() ? "Медиатека пройдена" : "Library complete");
 		} else if (run_end_failed) {
-			lv_label_set_text(results_title, ru() ? "Жизни закончились" : "Out of lives");
+			lv_label_set_text(results_title, play_points_mode() ? (ru() ? "Очки в минусе" : "Out of points")
+															   : (ru() ? "Жизни закончились" : "Out of lives"));
 		} else {
 			lv_label_set_text(results_title, ru() ? "Время вышло" : "Time's up");
 		}
@@ -2010,16 +2176,25 @@ static void show_results(void) {
 		lv_label_set_text(results_stat_correct_lbl, ru() ? "угадано" : "correct");
 	}
 	if (results_stat_lives) {
+		// The second stat is what ended the run: hearts spent, or the balance.
 		int lives_total = cfg_lives();
-		bool show_lives = play_has_lives() && lives_total > 1;
-		lv_obj_set_hidden(results_stat_lives, !show_lives);
-		if (show_lives && results_stat_lives_val) {
+		bool show_points = play_points_mode();
+		bool show_lives = !show_points && play_has_lives() && lives_total > 1;
+		lv_obj_set_hidden(results_stat_lives, !show_points && !show_lives);
+		if (results_stat_lives_val) {
 			char line[24];
-			snprintf(line, sizeof(line), "%d/%d", lives_left > 0 ? lives_left : 0, lives_total);
+			if (show_points) {
+				snprintf(line, sizeof(line), "%d", points_balance);
+			} else if (show_lives) {
+				snprintf(line, sizeof(line), "%d/%d", lives_left > 0 ? lives_left : 0, lives_total);
+			} else {
+				line[0] = '\0';
+			}
 			lv_label_set_text(results_stat_lives_val, line);
 		}
-		if (show_lives && results_stat_lives_lbl) {
-			lv_label_set_text(results_stat_lives_lbl, ru() ? "жизни" : "lives");
+		if (results_stat_lives_lbl) {
+			lv_label_set_text(results_stat_lives_lbl,
+							  show_points ? (ru() ? "баланс" : "balance") : (ru() ? "жизни" : "lives"));
 		}
 	}
 	if (results_btn_lbl) {
@@ -2108,6 +2283,32 @@ static void end_run(bool failed) {
 	paint_score();
 }
 
+// Out of rounds: the shuffled deck ran out, or nothing left in it can be asked
+// (an index row with no label, an artist with no tracks). The ending is the
+// same either way -- choices away, clocks off, the result card with
+// run_library_done set, which is what tells the reveal from lives/time.
+static void finish_library(void) {
+	force_relaxed = false;
+	run_library_done = true;
+	pause_reset();
+	stop_snippet();
+	stop_answer_timer();
+	replay_set_available(false);
+	for (int i = 0; i < CHOICES; i++) {
+		if (choice_btn[i]) {
+			lv_obj_set_hidden(choice_btn[i], true);
+		}
+	}
+	if (feedback_label) {
+		lv_obj_set_hidden(feedback_label, true);
+	}
+	if (status_label) {
+		lv_obj_set_hidden(status_label, true);
+	}
+	end_run(false);
+	show_results();
+}
+
 static void apply_round(void *user) {
 	quiz_job_t *job = user;
 	busy = false;
@@ -2123,25 +2324,7 @@ static void apply_round(void *user) {
 
 	if (!job->ok) {
 		if (job->library_done && session_rounds > 0) {
-			force_relaxed = false;
-			run_library_done = true;
-			pause_reset();
-			stop_snippet();
-			stop_answer_timer();
-			replay_set_available(false);
-			for (int i = 0; i < CHOICES; i++) {
-				if (choice_btn[i]) {
-					lv_obj_set_hidden(choice_btn[i], true);
-				}
-			}
-			if (feedback_label) {
-				lv_obj_set_hidden(feedback_label, true);
-			}
-			if (status_label) {
-				lv_obj_set_hidden(status_label, true);
-			}
-			end_run(false);
-			show_results();
+			finish_library();
 			free(job);
 			return;
 		}
@@ -2156,18 +2339,7 @@ static void apply_round(void *user) {
 		force_relaxed = false;
 		// Mid-session and still cannot form a round → treat as library complete.
 		if (session_rounds > 0 && (job->no_choices || pool_failed_choices)) {
-			run_library_done = true;
-			pause_reset();
-			stop_snippet();
-			stop_answer_timer();
-			replay_set_available(false);
-			for (int i = 0; i < CHOICES; i++) {
-				if (choice_btn[i]) {
-					lv_obj_set_hidden(choice_btn[i], true);
-				}
-			}
-			end_run(false);
-			show_results();
+			finish_library();
 			free(job);
 			return;
 		}
@@ -2223,11 +2395,20 @@ static void apply_round(void *user) {
 static void *round_worker(void *arg) {
 	quiz_job_t *job = arg;
 	thread_be_background("quiz");
+	// Everything below reads tags the way the firmware's index did.
+	round_rules = job->rules;
 	job->ok = pick_round_from_pool(job);
+	// Posted, not applied: apply_round() runs on the UI thread, and it does not
+	// touch the deck, so giving the count back here is safe. A worker still in
+	// here when stop() runs is why stop() waits.
 	if (!gui_post(apply_round, job)) {
 		free(job);
+		// The queue was full, so nothing is coming to clear it: the one write a
+		// worker does to UI state, and it keeps the page from hanging on
+		// "Loading..." for the rest of the run.
 		busy = false;
 	}
+	round_leave();
 	return NULL;
 }
 
@@ -2246,12 +2427,25 @@ static void start_round(void) {
 	}
 	job->gen = ++job_gen;
 	job->mode = cfg.ask;
+	job->artist_level = (int)cfg.artist_level;
+	// config.h has no lock: read the library's rules here, on the UI thread.
+	job->rules = artisttag_rules_from_player();
 	busy = true;
 	answered = false;
 	set_loading(true);
 
+	// 256 KB of stack and detached, as the player's own workers: the default
+	// 8 MB mapping is spent on a device that has better uses for it.
 	pthread_t th;
-	if (pthread_create(&th, NULL, round_worker, job) != 0) {
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	pthread_attr_setstacksize(&attr, 256 * 1024);
+	round_enter(); // before the thread exists: one that has not reached its first line must not slip past round_wait()
+	int started = pthread_create(&th, &attr, round_worker, job);
+	pthread_attr_destroy(&attr);
+	if (started != 0) {
+		round_leave();
 		busy = false;
 		free(job);
 		set_loading(false);
@@ -2259,7 +2453,6 @@ static void start_round(void) {
 		lv_obj_set_hidden(status_label, false);
 		return;
 	}
-	pthread_detach(th);
 }
 
 static void finish_answer(bool ok, int which) {
@@ -2285,24 +2478,37 @@ static void finish_answer(bool ok, int which) {
 
 	int bonus = 0;
 	if (ok) {
-		bonus = 1;
-		if (per_answer_timer_active() && answer_left_snap > 0) {
-			bonus += answer_left_snap / 3000;
-		}
-		if (cfg.play == PLAY_ENDLESS) {
-			streak++;
-			if (streak > best_streak) {
-				best_streak = streak;
-			}
-			records_note_endless(streak);
-		} else {
-			score += bonus;
+		if (play_points_mode()) {
+			// The visible score is the tracks guessed; the points are the balance,
+			// which is what can run out.
+			bonus = answer_points(answer_left_snap);
+			points_balance += bonus;
+			score++;
 			if (run_active) {
 				run_correct++;
 			}
+		} else {
+			bonus = 1;
+			if (per_answer_timer_active() && answer_left_snap > 0) {
+				bonus += answer_left_snap / 3000;
+			}
+			if (cfg.play == PLAY_ENDLESS) {
+				streak++;
+				if (streak > best_streak) {
+					best_streak = streak;
+				}
+				records_note(streak);
+			} else {
+				score += bonus;
+				if (run_active) {
+					run_correct++;
+				}
+			}
 		}
 	} else {
-		if (cfg.play == PLAY_ENDLESS) {
+		if (play_points_mode()) {
+			points_balance += (which < 0) ? POINTS_TIMEOUT : POINTS_WRONG;
+		} else if (cfg.play == PLAY_ENDLESS) {
 			streak = 0;
 		} else if (run_active && play_has_lives() && lives_left > 0 && which >= 0) {
 			// Last life spent on this miss (timeout path uses which < 0).
@@ -2334,7 +2540,12 @@ static void finish_answer(bool ok, int which) {
 	// Survival/Timed: end when lives are gone, or Timed session clock hits zero.
 	// Endless never ends a session here.
 	bool end_session = false;
-	if (cfg.play != PLAY_ENDLESS && run_active) {
+	if (play_points_mode()) {
+		if (points_balance < 0) {
+			end_session = true;
+			run_end_failed = true;
+		}
+	} else if (cfg.play != PLAY_ENDLESS && run_active) {
 		if (session_expired) {
 			end_session = true;
 			run_end_failed = false;
@@ -2387,6 +2598,17 @@ static void choice_cb(lv_event_t *e) {
 		return;
 	}
 	finish_answer(false, which);
+}
+
+// Out of the run, back to the start card (the same place the chevron goes).
+static void results_menu_cb(lv_event_t *e) {
+	(void)e;
+	if (switcher_back_drag_active()) {
+		return;
+	}
+	hide_results();
+	abandon_session();
+	show_idle();
 }
 
 static void results_restart_cb(lv_event_t *e) {
@@ -2532,6 +2754,8 @@ static void replay_cb(lv_event_t *e) {
 	start_snippet(round_tracks[round_correct].path);
 }
 
+static void refresh_level_pills(void);
+
 static void refresh_ask_pills(void) {
 	for (int i = 0; i < MODE_COUNT; i++) {
 		if (set_ask_pills[i]) {
@@ -2541,7 +2765,10 @@ static void refresh_ask_pills(void) {
 			settingsrow_pill_active(idle_ask_pills[i], i == (int)cfg.ask);
 		}
 	}
+	refresh_level_pills();
 }
+
+static void refresh_scoring_pills(void);
 
 static void refresh_play_pills(void) {
 	for (int i = 0; i < PLAY_COUNT; i++) {
@@ -2558,17 +2785,22 @@ static void refresh_play_pills(void) {
 	if (set_timed_box) {
 		lv_obj_set_hidden(set_timed_box, cfg.play != PLAY_TIMED);
 	}
+	refresh_scoring_pills();
 }
 
 static void paint_idle_blurb(void) {
 	if (!idle_mode_blurb) {
 		return;
 	}
-	char line[192];
-	if (cfg.play == PLAY_SURVIVAL) {
+	char line[320];
+	if (cfg.play == PLAY_SURVIVAL && play_points_mode()) {
 		snprintf(line, sizeof(line),
-				 ru() ? "Жизни: %d. Ошибки тратят жизни.\nСчёт растёт за верные ответы."
-					  : "Lives: %d. Misses cost a life.\nScore grows with correct answers.",
+				 ru() ? "Без жизней: +10, −1 за каждую секунду; −10 за ошибку, −5 за молчание. Ниже нуля — конец."
+					  : "No lives: +10, one less per second; -10 for a miss, -5 for silence. Under zero ends it.");
+	} else if (cfg.play == PLAY_SURVIVAL) {
+		snprintf(line, sizeof(line),
+				 ru() ? "Жизни: %d. Ошибка тратит жизнь.\nСчёт растёт за верные ответы."
+					  : "Lives: %d. A miss costs a life.\nScore grows with correct answers.",
 				 cfg.survival_lives);
 	} else if (cfg.play == PLAY_ENDLESS) {
 		snprintf(line, sizeof(line),
@@ -2579,6 +2811,23 @@ static void paint_idle_blurb(void) {
 				 ru() ? "Сессия %d с, ответ %d с, жизни: %d.\nНаберите очки до конца времени."
 					  : "Session %d s, answer %d s, lives: %d.\nScore before the clock runs out.",
 				 cfg.timed_run_sec, cfg.timed_limit_sec, cfg.timed_lives);
+	}
+
+	// One short line for the artist difficulty, which the pills alone do not
+	// explain -- and only while it is the artist being asked.
+	if (cfg.ask == MODE_ARTIST) {
+		const char *who;
+		if (cfg.artist_level == ARTIST_LEVEL_PRIMARY) {
+			who = ru() ? "Ответ — тот, за кем закреплён трек." : "Answer: the artist the track is filed under.";
+		} else if (cfg.artist_level == ARTIST_LEVEL_GUEST) {
+			who = ru() ? "Ответ — только гость." : "Answer: a guest only.";
+		} else {
+			who = ru() ? "Ответ — любое имя из тега." : "Answer: any name the tag credits.";
+		}
+		size_t used = strlen(line);
+		if (used + 2 < sizeof(line)) {
+			snprintf(line + used, sizeof(line) - used, "\n%s", who);
+		}
 	}
 	lv_label_set_text(idle_mode_blurb, line);
 }
@@ -2597,6 +2846,52 @@ static void ask_pill_cb(lv_event_t *e) {
 	cfg.ask = (quiz_mode_t)v;
 	cfg_save();
 	sync_cfg_ui();
+}
+
+static void scoring_pill_cb(lv_event_t *e) {
+	int v = (int)(intptr_t)lv_event_get_user_data(e);
+	if (v < 0 || v >= SCORING_COUNT) {
+		return;
+	}
+	cfg.survival_scoring = (survival_scoring_t)v;
+	cfg_save();
+	sync_cfg_ui();
+}
+
+static void refresh_scoring_pills(void) {
+	for (int i = 0; i < SCORING_COUNT; i++) {
+		if (idle_scoring_pills[i]) {
+			settingsrow_pill_active(idle_scoring_pills[i], i == (int)cfg.survival_scoring);
+		}
+	}
+	// Lives or points is a Survival question: Endless has a streak, Timed a clock.
+	if (idle_scoring_sec) {
+		lv_obj_set_hidden(idle_scoring_sec, cfg.play != PLAY_SURVIVAL);
+	}
+}
+
+static void level_pill_cb(lv_event_t *e) {
+	int v = (int)(intptr_t)lv_event_get_user_data(e);
+	if (v < 0 || v >= ARTIST_LEVEL_COUNT) {
+		return;
+	}
+	cfg.artist_level = (artist_level_t)v;
+	cfg_save();
+	sync_cfg_ui();
+}
+
+static void refresh_level_pills(void) {
+	for (int i = 0; i < ARTIST_LEVEL_COUNT; i++) {
+		if (idle_level_pills[i]) {
+			settingsrow_pill_active(idle_level_pills[i], i == (int)cfg.artist_level);
+		}
+	}
+	// The row belongs to the artist round only: on Track and Album there is no
+	// question whose difficulty it could be.
+	bool show = (cfg.ask == MODE_ARTIST);
+	if (idle_level_sec) {
+		lv_obj_set_hidden(idle_level_sec, !show);
+	}
 }
 
 static void play_pill_cb(lv_event_t *e) {
@@ -2705,31 +3000,49 @@ static void open_settings_cb(lv_event_t *e) {
 	switch_screen(settings_screen);
 }
 
+static const char *record_profile_label(int p) {
+	switch (p) {
+	case REC_SURV_POINTS:
+		return ru() ? "очки" : "points";
+	case REC_ENDLESS:
+		return ru() ? "серия" : "streak";
+	case REC_TIMED:
+		return ru() ? "время" : "timed";
+	default:
+		return ru() ? "жизни" : "lives";
+	}
+}
+
+static const char *record_bucket_label(int b) {
+	switch (b) {
+	case REC_EASY:
+		return ru() ? "лёгкий" : "easy";
+	case REC_MEDIUM:
+		return ru() ? "средний" : "medium";
+	case REC_HARD:
+		return ru() ? "сложный" : "hard";
+	default:
+		return ru() ? "трек/альбом" : "track/album";
+	}
+}
+
 static void paint_records(void) {
-	char line[48];
-	if (records_surv_val) {
-		if (best_survival_score > 0) {
-			snprintf(line, sizeof(line), ru() ? "%d очк." : "%d pts", best_survival_score);
-		} else {
-			snprintf(line, sizeof(line), "—");
+	char line[32];
+	for (int p = 0; p < REC_COUNT; p++) {
+		for (int b = 0; b < REC_BUCKETS; b++) {
+			if (!records_row[p][b] || !records_val[p][b]) {
+				continue;
+			}
+			// A row with nothing on it is not a record: only what was played is
+			// shown, which keeps the table short until the modes are tried.
+			bool has = best_score[p][b] > 0;
+			lv_obj_set_hidden(records_row[p][b], !has);
+			if (!has) {
+				continue;
+			}
+			snprintf(line, sizeof(line), "%d", best_score[p][b]);
+			lv_label_set_text(records_val[p][b], line);
 		}
-		lv_label_set_text(records_surv_val, line);
-	}
-	if (records_end_val) {
-		if (best_endless_streak > 0) {
-			snprintf(line, sizeof(line), ru() ? "серия %d" : "streak %d", best_endless_streak);
-		} else {
-			snprintf(line, sizeof(line), "—");
-		}
-		lv_label_set_text(records_end_val, line);
-	}
-	if (records_timed_val) {
-		if (best_timed_score > 0) {
-			snprintf(line, sizeof(line), ru() ? "%d очк." : "%d pts", best_timed_score);
-		} else {
-			snprintf(line, sizeof(line), "—");
-		}
-		lv_label_set_text(records_timed_val, line);
 	}
 }
 
@@ -2766,6 +3079,33 @@ static void quiz_chrome(bool on) {
 	// which still parks below the bar height. Our own back sits with the header.
 	topbar_set_hidden(on);
 	back_btn_force_hidden(on);
+}
+
+// True while the results card is on screen.
+static bool results_visible(void) {
+	return results_box && !lv_obj_is_hidden(results_box);
+}
+
+// Back steps up one level: out of a round, the reveal or the result card to the
+// start screen, and from the start screen out of the addon, which is what back
+// did everywhere before. Registered as the page's back guard, so the chevron
+// and the swipe-back both come through here -- and the swipe commits through
+// back_btn_cb(), which is what runs the guard.
+static bool quiz_back_guard(void) {
+	if (game_started || busy || revealing || results_visible()) {
+		hide_results();
+		hide_reveal();
+		abandon_session();
+		show_idle();
+		return true; // dealt with: the page stays
+	}
+	return false; // at the start screen: let the shell take us out
+}
+
+// What the swipe draws underneath: the same page (a neutral panel), because the
+// step back stays here.
+static bool quiz_back_peek(void) {
+	return game_started || busy || revealing || results_visible();
 }
 
 static lv_obj_t *quiz_header_back(lv_obj_t *screen) {
@@ -2840,9 +3180,15 @@ static void build_records(void) {
 	lv_obj_t *page = settingsrow_page(records_screen, gui_cfg, ru() ? "Рекорды" : "Records");
 	quiz_lift_settingsrow(records_screen, page);
 
-	settingsrow_add(page, ru() ? "Выживание" : "Survival", &records_surv_val, NULL, NULL);
-	settingsrow_add(page, ru() ? "Бесконечный" : "Endless", &records_end_val, NULL, NULL);
-	settingsrow_add(page, ru() ? "На время" : "Timed", &records_timed_val, NULL, NULL);
+	// One row per mode and difficulty, labelled "mode · difficulty" in short
+	// words; a row appears once that combination has a record.
+	for (int p = 0; p < REC_COUNT; p++) {
+		for (int b = 0; b < REC_BUCKETS; b++) {
+			char name[64];
+			snprintf(name, sizeof(name), "%s · %s", record_profile_label(p), record_bucket_label(b));
+			records_row[p][b] = settingsrow_add(page, name, &records_val[p][b], NULL, NULL);
+		}
+	}
 	settingsrow_action(page, ru() ? "Сбросить рекорды" : "Clear records", records_clear_cb, NULL);
 	paint_records();
 	lv_obj_add_event_cb(records_screen, sub_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
@@ -2939,6 +3285,9 @@ static void theme_cb(void) {
 	if (timer_label) {
 		lv_obj_set_style_text_color(timer_label, theme()->accent, 0);
 	}
+	if (balance_label) {
+		lv_obj_set_style_text_color(balance_label, theme()->accent, 0);
+	}
 	if (idle_box) {
 		lv_obj_set_style_bg_color(idle_box, theme()->surface, 0);
 	}
@@ -3007,6 +3356,9 @@ static void theme_cb(void) {
 	}
 	if (results_btn) {
 		lv_obj_set_style_bg_color(results_btn, theme()->accent, 0);
+	}
+	if (results_menu_btn) {
+		lv_obj_set_style_bg_color(results_menu_btn, theme()->screen_bg, 0);
 	}
 	if (!answered) {
 		reset_choice_styles();
@@ -3221,6 +3573,14 @@ static lv_obj_t *quiz_addon_init(const sonix_addon_host_t *host) {
 		lives_img[i] = img;
 	}
 
+	// The points variant's balance: the hearts' slot, because a run has one or
+	// the other and never both.
+	balance_label = lv_label_create(meta_row);
+	lv_obj_set_style_text_font(balance_label, &font_ui_22, 0);
+	lv_obj_set_style_text_color(balance_label, theme()->accent, 0);
+	lv_label_set_text(balance_label, "");
+	lv_obj_set_hidden(balance_label, true);
+
 	timer_label = lv_label_create(meta_row);
 	lv_obj_set_width(timer_label, TIMER_SLOT_W);
 	lv_obj_set_style_text_align(timer_label, LV_TEXT_ALIGN_RIGHT, 0);
@@ -3243,7 +3603,10 @@ static lv_obj_t *quiz_addon_init(const sonix_addon_host_t *host) {
 	lv_obj_set_style_pad_row(idle_box, SC(10), 0);
 	lv_obj_set_flex_flow(idle_box, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_flex_align(idle_box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-	lv_obj_set_scrollable(idle_box, false);
+	// Three pill rows plus Start: on the artist round the card is taller than
+	// the page, so it may be scrolled rather than clipped.
+	lv_obj_set_scrollable(idle_box, true);
+	lv_obj_set_scrollbar_mode(idle_box, LV_SCROLLBAR_MODE_AUTO);
 
 	idle_title = lv_label_create(idle_box);
 	lv_obj_set_width(idle_title, lv_pct(100));
@@ -3257,12 +3620,29 @@ static lv_obj_t *quiz_addon_init(const sonix_addon_host_t *host) {
 	idle_ask_pills[MODE_TRACK] = idle_pill(idle_ask_row, ru() ? "Трек" : "Track", MODE_TRACK, ask_pill_cb);
 	idle_ask_pills[MODE_ALBUM] = idle_pill(idle_ask_row, ru() ? "Альбом" : "Album", MODE_ALBUM, ask_pill_cb);
 
+	idle_level_sec =
+		idle_section(idle_box, ru() ? "Сложность" : "Difficulty", &idle_level_cap, &idle_level_row);
+	idle_level_pills[ARTIST_LEVEL_PRIMARY] =
+		idle_pill(idle_level_row, ru() ? "Лёгкий" : "Easy", ARTIST_LEVEL_PRIMARY, level_pill_cb);
+	idle_level_pills[ARTIST_LEVEL_MIXED] =
+		idle_pill(idle_level_row, ru() ? "Средний" : "Medium", ARTIST_LEVEL_MIXED, level_pill_cb);
+	idle_level_pills[ARTIST_LEVEL_GUEST] =
+		idle_pill(idle_level_row, ru() ? "Сложный" : "Hard", ARTIST_LEVEL_GUEST, level_pill_cb);
+
 	idle_section(idle_box, ru() ? "Режим" : "Mode", &idle_play_cap, &idle_play_row);
 	idle_play_pills[PLAY_SURVIVAL] =
 		idle_pill(idle_play_row, ru() ? "Выжив." : "Survival", PLAY_SURVIVAL, play_pill_cb);
 	idle_play_pills[PLAY_ENDLESS] =
 		idle_pill(idle_play_row, ru() ? "Бескон." : "Endless", PLAY_ENDLESS, play_pill_cb);
 	idle_play_pills[PLAY_TIMED] = idle_pill(idle_play_row, ru() ? "Время" : "Timed", PLAY_TIMED, play_pill_cb);
+
+	// Survival's other way of keeping score, beside the mode it belongs to.
+	idle_scoring_sec =
+		idle_section(idle_box, ru() ? "Подсчёт" : "Scoring", &idle_scoring_cap, &idle_scoring_row);
+	idle_scoring_pills[SCORING_LIVES] =
+		idle_pill(idle_scoring_row, ru() ? "Жизни" : "Lives", SCORING_LIVES, scoring_pill_cb);
+	idle_scoring_pills[SCORING_POINTS] =
+		idle_pill(idle_scoring_row, ru() ? "Очки" : "Points", SCORING_POINTS, scoring_pill_cb);
 
 	idle_mode_blurb = lv_label_create(idle_box);
 	lv_label_set_long_mode(idle_mode_blurb, LV_LABEL_LONG_WRAP);
@@ -3492,6 +3872,21 @@ static lv_obj_t *quiz_addon_init(const sonix_addon_host_t *host) {
 	lv_label_set_text(results_btn_lbl, ru() ? "Ещё раз" : "Play again");
 	lv_obj_center(results_btn_lbl);
 
+	// The other way out of the run: back to the start card -- the game's own main
+	// menu -- where what to guess, the difficulty and the mode can be changed
+	// before starting again.
+	results_menu_btn = make_tool_btn(results_card, results_menu_cb);
+	lv_obj_set_width(results_menu_btn, lv_pct(100));
+	lv_obj_set_height(results_menu_btn, CHOICE_H);
+	lv_obj_set_style_radius(results_menu_btn, SC(14), 0);
+	// The card is surface too: the second way out is an inset, not a link.
+	lv_obj_set_style_bg_color(results_menu_btn, theme()->screen_bg, 0);
+	results_menu_lbl = lv_label_create(results_menu_btn);
+	lv_obj_set_style_text_font(results_menu_lbl, &font_ui_20, 0);
+	lv_obj_set_style_text_color(results_menu_lbl, theme()->text_primary, 0);
+	lv_label_set_text(results_menu_lbl, ru() ? "В главное меню" : "Main menu");
+	lv_obj_center(results_menu_lbl);
+
 	// Pause cover above choices / reveal / results; back stays above it.
 	pause_box = lv_obj_create(quiz_screen);
 	lv_obj_remove_style_all(pause_box);
@@ -3569,10 +3964,13 @@ static lv_obj_t *quiz_addon_init(const sonix_addon_host_t *host) {
 	lv_obj_add_event_cb(quiz_screen, loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
 	lv_obj_add_event_cb(quiz_screen, unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
 	switcher_attach_back_gesture(quiz_screen);
+	switcher_set_back_guard(quiz_screen, quiz_back_guard);
+	switcher_set_back_guard_peek(quiz_screen, quiz_back_peek);
 
 	build_settings();
 	build_records();
 	show_idle();
+
 
 	if (!theme_hook) {
 		theme_register_refresh(theme_cb);
@@ -3647,11 +4045,15 @@ static bool quiz_addon_stop(void) {
 	pause_box = NULL;
 	settings_screen = NULL;
 	records_screen = NULL;
-	records_surv_val = NULL;
-	records_end_val = NULL;
-	records_timed_val = NULL;
+	for (int p = 0; p < REC_COUNT; p++) {
+		for (int b = 0; b < REC_BUCKETS; b++) {
+			records_row[p][b] = NULL;
+			records_val[p][b] = NULL;
+		}
+	}
 	prompt_label = NULL;
 	score_label = NULL;
+	balance_label = NULL;
 	for (int i = 0; i < LIVES_MAX; i++) {
 		if (lives_img[i]) {
 			lv_image_set_src(lives_img[i], NULL);
@@ -3718,6 +4120,8 @@ static bool quiz_addon_stop(void) {
 	results_stat_lives_lbl = NULL;
 	results_btn = NULL;
 	results_btn_lbl = NULL;
+	results_menu_btn = NULL;
+	results_menu_lbl = NULL;
 	for (int i = 0; i < CHOICES; i++) {
 		choice_btn[i] = NULL;
 		choice_lbl[i] = NULL;
@@ -3727,6 +4131,18 @@ static bool quiz_addon_stop(void) {
 	}
 	for (int i = 0; i < PLAY_COUNT; i++) {
 		set_play_pills[i] = NULL;
+	}
+	idle_scoring_sec = NULL;
+	idle_scoring_cap = NULL;
+	idle_scoring_row = NULL;
+	for (int i = 0; i < SCORING_COUNT; i++) {
+		idle_scoring_pills[i] = NULL;
+	}
+	idle_level_sec = NULL;
+	idle_level_cap = NULL;
+	idle_level_row = NULL;
+	for (int i = 0; i < ARTIST_LEVEL_COUNT; i++) {
+		idle_level_pills[i] = NULL;
 	}
 	set_survival_box = NULL;
 	set_survival_lives_card = set_survival_lives_val = set_survival_lives_slider = NULL;
@@ -3756,12 +4172,13 @@ static bool quiz_addon_stop(void) {
 	we_started_playback = false;
 	invalidate_pool();
 	store_ready = false;
-	best_survival_score = 0;
-	best_endless_streak = 0;
-	best_timed_score = 0;
+	memset(best_score, 0, sizeof(best_score));
 	snippet_path[0] = '\0';
 	memset(round_tracks, 0, sizeof(round_tracks));
-	return true;
+	// The round worker last: stop() may only say true once nothing of this
+	// library is running, and invalidate_pool() above leaves the deck to whoever
+	// stops walking it.
+	return round_wait("stop");
 }
 
 static const sonix_addon_t quiz = {

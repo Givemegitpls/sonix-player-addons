@@ -13,7 +13,8 @@ WHAT IT IS
   shell takes its colour from the artwork, the label carries the artist, and the
   hubs turn while the music plays. The tape wound on the hubs moves from one to
   the other as the track runs. The artist and the record are one line each on
-  the label; what does not fit is cut and ends in "..." .
+  the label; what does not fit is cut and ends in "..." . When the artist tag
+  names several artists, the label shows the first one.
 
 CONTROLS
   tap          play / pause
@@ -38,7 +39,8 @@ NOTHING TO SET UP
   цвет с картинки, на ярлыке - исполнитель, катушки крутятся, пока играет
   музыка. Намотка ленты на катушках переезжает с одной на другую по ходу трека.
   Исполнитель и альбом занимают на ярлыке по одной строке; что не влезает -
-  обрезается и заканчивается на "...".
+  обрезается и заканчивается на "...". Если в теге несколько исполнителей, на
+  ярлыке показывается первый.
 
 УПРАВЛЕНИЕ
   касание      пауза / играть

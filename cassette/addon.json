@@ -3,6 +3,6 @@
 	"title": "Cassette",
 	"titles": { "Russian": "Кассета", "Italiano": "Cassetta" },
 	"section": "music",
-	"version": "0.2",
+	"version": "0.3.0",
 	"icon": "icon.png"
 }
