@@ -56,8 +56,21 @@ bool http_get_ex(const char *url, const char *extra_headers, bool want_error_bod
 	(void)timeout_secs;
 
 	const char *index_file = getenv("AS_TEST_INDEX");
-	if (index_file && index_file[0] && url && strstr(url, "/releases/download/store/index.json")) {
+	if (index_file && index_file[0] && url && strstr(url, "/releases/download/latest/index.json")) {
 		if (!read_all(index_file, out, out_len)) {
+			return false;
+		}
+		if (status_out) {
+			*status_out = 200;
+		}
+		return true;
+	}
+
+	// The compatibility release itself, for the case the catalogue file is
+	// missing: {"tag_name":"latest","assets":[...]}.
+	const char *bundle_file = getenv("AS_TEST_BUNDLE");
+	if (bundle_file && bundle_file[0] && url && strstr(url, "/releases/tags/latest")) {
+		if (!read_all(bundle_file, out, out_len)) {
 			return false;
 		}
 		if (status_out) {

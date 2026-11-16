@@ -814,13 +814,15 @@ commit — bump `"version"` in `<id>/addon.json`, then tag `<id>-v<that version>
 and a tag that does not match cannot produce a release. Locally the same check
 is `make release ADDON_IDS=<id> VERSION=<that version>`.
 
-After every release one more job rebuilds the store's catalogue: `index.json`,
-published in a release tagged **`store`** (`tools/publish_index.py`). It takes
-the newest version of each addon out of the releases, and the store fetches it
-straight from
+After every release one more job publishes the store's catalogue, `index.json`,
+and the copy old clients read, in the same release. It is built out of the
+releases by `tools/publish_index.py` — the newest version of each addon — and
+then `tools/rolling_release.py` copies the current archive of every addon into
+one release tagged **`latest`** beside that file, so both are always the same
+answer:
 
 ```
-https://github.com/<owner>/<name>/releases/download/store/index.json
+https://github.com/<owner>/<name>/releases/download/latest/index.json
 ```
 
 which is why opening the store needs no API call and no zip download. A
@@ -829,17 +831,31 @@ hundred newest releases, newest per addon — so the file is an optimisation for
 its own repository and not a requirement of the format.
 
 **The copy for old clients.** Store builds released before per-addon tags read
-`releases?per_page=1` and treat that one release's `.zip` assets as the
-catalogue, so a per-addon tag leaves them with one addon and the `store` release
-leaves them with none. A job after the catalogue therefore copies the current
-archive of every addon into one release tagged **`latest`**, recreated last so it
-is the newest. Nothing is rebuilt or repacked: each file is downloaded from the
-release that publishes it and uploaded byte for byte, so its size and `sha256`
-are unchanged and a client that is already current is offered nothing — which is
-the point of copying rather than zipping again. The cost is the transfer (a few
-megabytes per release), not the build. The catalogue and the new store's API
-fallback both skip `store` and `latest`; the repository variable
-`ROLLING_RELEASE=off` stops the job.
+the single newest release and treat its `.zip` assets as the catalogue, so a
+per-addon tag leaves them with one addon. The `latest` release therefore carries
+a copy of every current archive; a build that cannot read `index.json` gets the
+same list out of its assets in one request. Nothing is rebuilt or repacked: each
+file is downloaded from the release that publishes it and uploaded byte for
+byte, so its size and `sha256` are unchanged and a client that is already
+current is offered nothing — which is the point of copying rather than zipping
+again. The cost is the transfer (a few megabytes per release), not the build.
+The catalogue and the store's API fallback both skip `latest` (and the `store`
+tag older builds left behind); the repository variable `ROLLING_RELEASE=off`
+stops the job.
+
+**Why the release is tagged on its own commit.** The release list is not ordered
+by when a release was made. GitHub sets `created_at` from the ref the release
+hangs on — the tagged commit's date, or the tagger's date for an annotated tag —
+and releases dated the same second are ordered by tag name, descending. Both
+were read off the live list (2026-11-16): `latest` and `addonstore-v0.2.0` share
+`18:35:54Z` because both tags point at the same commit, while `latest` was
+created two minutes after that date. The consequence is that a bundle sharing a
+commit with an addon release can lose to it — `yandex-v0.2.0` sorts above
+`latest` — and the separate `store` release did exactly that: `store` sorts
+above `latest`, so old clients were handed a release holding `index.json` and no
+archives. Tagging the bundle on a fresh commit of the `releases` branch makes its
+date newer than any addon release's, which is the only way to be newest that
+does not depend on names.
 
 The old all-in-one tags (`0.0.7`) still work: they build every releasable addon
 and publish every zip beside its fragment, and the catalogue picks them up. What
@@ -852,7 +868,8 @@ git tag dino-v0.2.0 && git push origin dino-v0.2.0
 ```
 
 `workflow_dispatch` takes `addons` (space separated; empty means every addon)
-and `index` (rebuild the catalogue without releasing anything, for a repair).
+and `index` (republish the catalogue and the bundle without releasing an addon,
+for a repair).
 
 ## The addons in this tree
 
@@ -1567,20 +1584,22 @@ invalidated rectangle per frame, which is the hub's 60x60 when it is turning.
 and one tap between them. Install, update, update everything, delete, search and
 read the README, from the device.
 
-**The catalogue first.** A repository in this shape publishes `index.json` in a
-release tagged `store`, and that one file names every addon with its title,
+**The catalogue first.** A repository in this shape publishes `index.json` in
+the release tagged `latest`, and that one file names every addon with its title,
 section, version, size, `sha256` of the zip and `sha256` of the `addon.so`
 inside it. The store requests it directly
-(`https://github.com/<repo>/releases/download/store/index.json`): no API call,
+(`https://github.com/<repo>/releases/download/latest/index.json`): no API call,
 no rate limit, and **no zip downloads** — which is what used to make the page
 slow, since it used to fetch every release archive just to read its manifest.
-A repository without a catalogue (or one whose file does not parse) falls back
-to the GitHub API: its hundred newest releases are read and the newest release
-that carries an addon is that addon's, so one tag per addon still lists them all
-— only the manifests then come out of the archives, the old slow way. A
-third-party repository with a single release works exactly as before. Both
-paths skip the `store` and `latest` tags: one is this catalogue, the other a
-copy of the real releases for older clients.
+That release carries the archives as well, so a repository whose catalogue file
+cannot be read is answered from its assets in one API call — the same list, one
+request, and nothing that depends on the order of the release list.
+A repository with neither falls back to the GitHub API: its hundred newest
+releases are read and the newest release that carries an addon is that addon's,
+so one tag per addon still lists them all — only the manifests then come out of
+the archives, the old slow way. A third-party repository with a single release
+works exactly as before. All three paths skip the `latest` tag (and the `store`
+tag older builds left behind): both are copies of the real releases.
 
 How the catalogue is produced is under "Releasing an addon" below.
 

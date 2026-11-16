@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """The store's catalogue: one index.json built out of the repository's releases.
 
-    tools/publish_index.py --repo owner/name --out index.json
-    tools/publish_index.py --repo owner/name --publish
+    tools/publish_index.py --repo owner/name --out build/index.json
 
 Every release that carries a per-addon metadata fragment (`<id>.json`, written
 by tools/release_zip.py) contributes one entry; a release that only carries
@@ -10,16 +9,19 @@ by tools/release_zip.py) contributes one entry; a release that only carries
 
 The newest version of each addon wins: the version is taken from the tag
 `<id>-v<semver>`, else from the fragment, else from the zip's manifest, and a
-tie goes to the newer release. Drafts, prereleases and the catalogue's own
-`store` release are skipped.
+tie goes to the newer release. Drafts, prereleases and the compatibility
+`latest` release are skipped.
 
-With --publish the file is uploaded as `index.json` into a release tagged
-`store`, which is what the addon requests directly:
+This script only writes the file: the catalogue is published as an asset of the
+compatibility release, which is what the addon requests directly:
 
-    https://github.com/<owner>/<name>/releases/download/store/index.json
+    https://github.com/<owner>/<name>/releases/download/latest/index.json
 
-No API call on the device, no zip downloads, and no rate limit -- one request
-for the whole catalogue.
+That is `tools/rolling_release.py`'s job -- it copies the current archives and
+this file into one release tagged on a fresh commit, so the file and the
+archives can never disagree about which version is current. No API call on the
+device, no zip downloads, and no rate limit: one request for the whole
+catalogue.
 """
 
 from __future__ import annotations
@@ -263,28 +265,10 @@ def build_index(repo: str, workdir: Path) -> dict[str, object]:
     return {"schema": SCHEMA, "repo": repo, "addons": addons}
 
 
-def publish(repo: str, path: Path) -> None:
-    if not gh("release", "view", STORE_TAG, "--repo", repo, check=False).strip():
-        gh(
-            "release",
-            "create",
-            STORE_TAG,
-            "--repo",
-            repo,
-            "--title",
-            "Addon index",
-            "--notes",
-            "The store's catalogue. Published by CI; the addon reads it from "
-            "/releases/download/store/index.json.",
-        )
-    gh("release", "upload", STORE_TAG, str(path), "--repo", repo, "--clobber")
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""))
-    parser.add_argument("--out", default="build/release/index.json")
-    parser.add_argument("--publish", action="store_true")
+    parser.add_argument("--out", default="build/index.json")
     args = parser.parse_args()
 
     if "/" not in args.repo:
@@ -300,9 +284,6 @@ def main() -> int:
         json.dumps(index, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     print(f"publish_index: {len(index['addons'])} addon(s) in {out}")
-    if args.publish:
-        publish(args.repo, out)
-        print(f"publish_index: uploaded to the {STORE_TAG} release")
     return 0
 
 

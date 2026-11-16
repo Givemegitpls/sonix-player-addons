@@ -156,16 +156,19 @@ git push origin main dino-v0.2.0
 ```
 
 The release carries `<id>.zip` and `<id>.json` (its metadata). A job after it
-rebuilds `index.json`, the store's catalogue, in the release tagged `store`, so
-the store learns about the new version without an API call. Old all-in-one tags
-still build and publish every releasable addon. `docs/ADDONS.md`, "Releasing an
-addon", has the details.
+builds `index.json`, the store's catalogue, and publishes it — together with a
+copy of every current archive — in one release tagged `latest`, so the store
+learns about the new version without an API call and older store builds still
+find the zips. Old all-in-one tags still build and publish every releasable
+addon. `docs/ADDONS.md`, "Releasing an addon", has the details.
 
-A `latest` release is recreated after every tag with **byte copies** of all
-current zips, because store builds released before per-addon tags read only the
-newest release. Nothing is rebuilt for it and the copies keep their size and
-`sha256`, so a client that is already current is not asked to update. Set the
-repository variable `ROLLING_RELEASE=off` to stop it.
+The `latest` tag is put on a fresh commit each time, which is what keeps that
+release the newest in the list: GitHub orders releases by the date of the commit
+their tag points at, and a tie by tag name, so a bundle sharing a commit with an
+addon release would lose to it. Nothing is rebuilt for the bundle — the files are
+copies and keep their size and `sha256`, so a client that is already current is
+not asked to update. Set the repository variable `ROLLING_RELEASE=off` to stop
+the job.
 
 ## Licence
 

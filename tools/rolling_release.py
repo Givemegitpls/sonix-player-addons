@@ -1,24 +1,33 @@
 #!/usr/bin/env python3
-"""A compatibility release: every current zip in one release, tagged `latest`.
+"""The one compatibility release: every current archive plus the catalogue.
 
-Old store builds (0.0.x) ask GitHub for the single newest release and treat its
-`.zip` assets as the catalogue. Per-addon tags leave them with one addon -- or
-none, once the `store` release exists -- so this job copies the current archive
-of every addon into one `latest` release, recreated last so it is the newest.
+Store builds from before per-addon tags ask GitHub for the single newest release
+and treat its `.zip` assets as the catalogue. The same release is where the
+catalogue file itself lives -- `index.json`, which the current store fetches
+instead of walking the release list. So one release, tagged `latest`, carries
+both.
+
+Ordering is the reason this file exists at all. GitHub dates a release by the
+commit its tag points at (`created_at` is the ref's date, not the moment the
+release was made), and two releases dated the same second are ordered by tag
+name, descending. A bundle sharing a commit with an addon release therefore
+loses to it -- `yandex-v0.2.0` sorts above `latest`, and the release tagged
+`store` used to sit above it for the same reason, leaving old clients with a
+catalogue file and no archives. The tag is therefore put on a fresh commit of
+the `releases` branch: no addon release can be newer than a commit made after
+all of them.
 
 Nothing is rebuilt or repacked: each archive is downloaded from the release that
-publishes it and uploaded byte for byte, so its size and sha256 are exactly what
-they were. A client that is already current compares equal and is offered
-nothing -- copying rather than zipping again is what makes that true, and it
-costs no build time at all, only the transfer.
+publishes it and uploaded byte for byte, so its size and `sha256` are exactly
+what they were, and a client that is already current is offered nothing.
 
-    tools/rolling_release.py --repo owner/name --dry-run
-    tools/rolling_release.py --repo owner/name --publish
+    tools/rolling_release.py --repo owner/name --index build/index.json --dry-run
+    tools/rolling_release.py --repo owner/name --index build/index.json --publish
 
-`--publish` deletes the previous `latest` release (with its tag) and creates it
-again, so its `created_at` is the newest one in the repository. The catalogue
-(`index.json`) and the new store's API fallback both skip this tag: it is a copy
-of the real releases, not a release of its own.
+`--publish` deletes the previous `latest` release (with its tag), commits
+`index.json` on a fresh `releases` commit, tags that commit and creates the
+release there. The catalogue (`index.json`) and the store's own API fallback
+both skip this tag: it is a copy of the real releases, not a release of its own.
 
 Disable it with the repository variable ROLLING_RELEASE=off.
 """
@@ -29,13 +38,31 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-STORE_TAG = "store"
 ROLLING_TAG = "latest"
+RELEASES_BRANCH = "releases"
+INDEX_NAME = "index.json"
+NOTES = (
+    "Every addon's current archive in one release, and the store's catalogue "
+    "(`index.json`) for the builds that read it. The files are copies: their "
+    "size and sha256 are the ones of the releases they came from."
+)
+
+
+def run(argv: list[str], cwd: Path) -> str:
+    """Run a command that is not `gh`, without echoing an argument list that may
+    carry the token."""
+    result = subprocess.run(argv, cwd=cwd, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"{argv[0]} {argv[1] if len(argv) > 1 else ''}: {result.stderr.strip()}"
+        )
+    return result.stdout
 
 
 def gh(*args: str, check: bool = True) -> str:
@@ -53,23 +80,12 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def current_catalogue(repo: str, workdir: Path) -> list[dict[str, object]]:
-    gh(
-        "release",
-        "download",
-        STORE_TAG,
-        "--repo",
-        repo,
-        "--pattern",
-        "index.json",
-        "--dir",
-        str(workdir),
-        "--clobber",
-    )
-    path = workdir / "index.json"
-    if not path.is_file():
-        raise RuntimeError(f"no index.json in the {STORE_TAG} release")
-    doc = json.loads(path.read_text(encoding="utf-8"))
+def load_entries(index_path: Path) -> list[dict[str, object]]:
+    if not index_path.is_file():
+        raise RuntimeError(
+            f"no catalogue at {index_path} (tools/publish_index.py writes it)"
+        )
+    doc = json.loads(index_path.read_text(encoding="utf-8"))
     addons = doc.get("addons")
     if not isinstance(addons, list) or not addons:
         raise RuntimeError("the catalogue names no addons")
@@ -109,7 +125,59 @@ def fetch_copy(repo: str, entry: dict[str, object], workdir: Path) -> Path:
     return path
 
 
-def publish(repo: str, files: list[Path]) -> None:
+def token() -> str:
+    value = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
+    if not value:
+        raise RuntimeError("GH_TOKEN is required to publish")
+    return value
+
+
+def commit_catalogue(repo: str, index_path: Path) -> str:
+    """One fresh commit carrying `index.json`, so the release's date is now.
+
+    The branch is pushed with --force: its history is not read by anything, and
+    one commit per release is enough to keep the git tree small.
+    """
+    url = f"https://x-access-token:{token()}@github.com/{repo}.git"
+    with tempfile.TemporaryDirectory() as tmp:
+        tree = Path(tmp)
+        shutil.copy(index_path, tree / INDEX_NAME)
+        run(["git", "init", "--quiet", "--initial-branch", RELEASES_BRANCH], tree)
+        run(["git", "add", INDEX_NAME], tree)
+        run(
+            [
+                "git",
+                "-c",
+                "user.name=github-actions[bot]",
+                "-c",
+                "user.email=41898282+github-actions[bot]@users.noreply.github.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "catalogue: the current release of every addon",
+            ],
+            tree,
+        )
+        run(["git", "tag", ROLLING_TAG], tree)
+        sha = run(["git", "rev-parse", "HEAD"], tree).strip()
+        run(
+            [
+                "git",
+                "push",
+                "--force",
+                "--quiet",
+                url,
+                f"HEAD:refs/heads/{RELEASES_BRANCH}",
+            ],
+            tree,
+        )
+        run(
+            ["git", "push", "--force", "--quiet", url, f"refs/tags/{ROLLING_TAG}"], tree
+        )
+    return sha
+
+
+def publish(repo: str, files: list[Path], index_path: Path) -> None:
     gh(
         "release",
         "delete",
@@ -120,6 +188,18 @@ def publish(repo: str, files: list[Path]) -> None:
         "--cleanup-tag",
         check=False,
     )
+    # A release that is still there would get the new tag (a release is not moved
+    # by re-pointing its tag), so the next step is doomed: say why instead of
+    # "release already exists".
+    if gh("release", "view", ROLLING_TAG, "--repo", repo, check=False).strip():
+        raise RuntimeError(f"the previous {ROLLING_TAG} release could not be deleted")
+    sha = commit_catalogue(repo, index_path)
+    ref = json.loads(gh("api", f"repos/{repo}/git/ref/tags/{ROLLING_TAG}"))
+    pointed = ref.get("object", {}).get("sha") if isinstance(ref, dict) else None
+    if pointed != sha:
+        raise RuntimeError(
+            f"the {ROLLING_TAG} tag points at {pointed}, not at the new commit {sha}"
+        )
     gh(
         "release",
         "create",
@@ -129,9 +209,7 @@ def publish(repo: str, files: list[Path]) -> None:
         "--title",
         "Latest",
         "--notes",
-        "Every addon's current archive in one release, for store builds that "
-        "only read the newest release. The files are copies: their size and "
-        "sha256 are the ones of the releases they came from.",
+        NOTES,
         *[str(path) for path in files],
     )
 
@@ -140,12 +218,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""))
     parser.add_argument(
+        "--index",
+        default="build/index.json",
+        help="the catalogue tools/publish_index.py wrote",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="fetch and check, but do not touch the release",
     )
     parser.add_argument(
-        "--publish", action="store_true", help="recreate the `latest` release"
+        "--publish", action="store_true", help=f"recreate the `{ROLLING_TAG}` release"
     )
     args = parser.parse_args()
 
@@ -153,18 +236,24 @@ def main() -> int:
         print("rolling_release: --repo owner/name is required", file=sys.stderr)
         return 1
 
-    with tempfile.TemporaryDirectory() as tmp:
-        workdir = Path(tmp)
-        entries = current_catalogue(args.repo, workdir)
-        files = [fetch_copy(args.repo, entry, workdir) for entry in entries]
-        total = sum(path.stat().st_size for path in files)
-        print(
-            f"rolling_release: {len(files)} archive(s), {total} bytes, verified against the catalogue"
-        )
-        if args.dry_run or not args.publish:
-            return 0
-        publish(args.repo, files)
+    index_path = Path(args.index)
+    try:
+        entries = load_entries(index_path)
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            files = [fetch_copy(args.repo, entry, workdir) for entry in entries]
+            total = sum(path.stat().st_size for path in files)
+            print(
+                f"rolling_release: {len(files)} archive(s), {total} bytes, "
+                "verified against the catalogue"
+            )
+            if args.dry_run or not args.publish:
+                return 0
+            publish(args.repo, [*files, index_path], index_path)
         print(f"rolling_release: {ROLLING_TAG} release recreated")
+    except RuntimeError as failure:
+        print(f"rolling_release: {failure}", file=sys.stderr)
+        return 1
     return 0
 
 

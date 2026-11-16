@@ -241,6 +241,27 @@ int main(int argc, char **argv) {
 		  "one listed entry, with its own library fingerprint");
 	unsetenv("AS_TEST_INDEX");
 
+	// The catalogue file gone -- deleted by hand, or a half-finished upload -- and
+	// the release it lives in answering instead: one request, the same archives,
+	// and the entry is read from the archive like the API's own (not `listed`).
+	char bundle_text[420];
+	snprintf(bundle_text, sizeof(bundle_text),
+			 "{\"tag_name\":\"latest\",\"assets\":["
+			 "{\"name\":\"index.json\",\"size\":12,\"browser_download_url\":\"https://test.invalid/index.json\"},"
+			 "{\"name\":\"dino.zip\",\"size\":%ld,\"digest\":\"sha256:%s\","
+			 "\"browser_download_url\":\"https://test.invalid/dino.zip\"}]}",
+			 zip_len, zip_hex);
+	snprintf(path, sizeof(path), "%s/bundle.json", cache);
+	write_file(path, bundle_text, strlen(bundle_text));
+	setenv("AS_TEST_BUNDLE", path, 1);
+	error[0] = '\0';
+	check(as_fetch_releases("testowner/testrepo", fetched, AS_MAX, &fetched_count, error, sizeof(error), &progress),
+		  "the bundle answers when the catalogue file is missing");
+	check(fetched_count == 1 && strcmp(fetched[0].id, "dino") == 0 && strcmp(fetched[0].tag, "latest") == 0 &&
+			  fetched[0].size == zip_len && !fetched[0].listed,
+		  "one entry out of the release's assets, and index.json is not an addon");
+	unsetenv("AS_TEST_BUNDLE");
+
 	check(as_fetch_releases("testowner/testrepo", found, AS_MAX, &found_count, error, sizeof(error), &progress),
 		  "the release list is fetched");
 	const char *real_json = getenv("AS_TEST_JSON");

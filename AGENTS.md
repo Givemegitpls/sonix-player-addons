@@ -49,17 +49,23 @@ number". It builds and publishes that addon alone: the release carries `<id>.zip
 and `<id>.json` (title, section, version, zip size/`sha256`, `addon.so`
 `sha256`), both written by `tools/release_zip.py` — the same thing `make release`
 writes locally (`make release ADDON_IDS=<id> VERSION=<ver>` checks the match too).
-After the release, `tools/publish_index.py` rebuilds `index.json` in the release
-tagged `store`, which is the catalogue the store fetches directly:
-`https://github.com/<owner>/<name>/releases/download/store/index.json`. The old
+After the release, `tools/publish_index.py` builds `index.json` and
+`tools/rolling_release.py` publishes it — together with byte copies of every
+current archive — in one release tagged `latest`, which is the catalogue the
+store fetches directly:
+
+`https://github.com/<owner>/<name>/releases/download/latest/index.json`. The old
 all-in-one tags still build and publish every releasable addon. `docs/ADDONS.md`,
 "Releasing an addon".
 
-A `latest` release is recreated last with byte copies of every current zip: store
-builds released before per-addon tags read only the newest release, and the
-copies keep their size and `sha256`, so no client is offered an update for an
-addon that did not change. `ROLLING_RELEASE=off` in the repository variables
-turns that job off (the catalogue and the new store do not need it).
+The `latest` release is the copy older store builds read as "the newest
+release", and its tag is put on a fresh commit of the `releases` branch: the
+release list is ordered by the date of the tagged commit, and releases dated the
+same second are ordered by tag name, descending, so a bundle sharing a commit
+with an addon release loses to it (`yandex-v0.2.0` sorts above `latest`; the old
+`store` release climbed above everything for that reason). The files are
+byte copies, so no client is offered an update for an addon that did not change.
+`ROLLING_RELEASE=off` in the repository variables turns that job off.
 
 ## Rules that keep biting
 

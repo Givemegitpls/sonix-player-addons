@@ -8,14 +8,23 @@
 
 // The two network calls the store makes, both on the worker.
 //
-// The first thing asked of a repository is its catalogue -- index.json in a
-// release tagged `store`, at
-// https://github.com/<repo>/releases/download/store/index.json -- which names
+// The first thing asked of a repository is its catalogue -- index.json in the
+// compatibility release tagged `latest`, at
+// https://github.com/<repo>/releases/download/latest/index.json -- which names
 // every addon with its title, section, version, size and sha256 already in it.
-// A repository that does not publish one (or has no release yet) falls back to
-// the GitHub API: its latest hundred releases, newest first, one entry per addon
-// (the newest release that carries it). The manifests of those entries then have
-// to be read from the archives themselves.
+// That release also carries a copy of every current archive, so a repository
+// whose catalogue cannot be read is answered from its assets in one API call.
+// Only a repository that publishes neither is walked the old way: its latest
+// hundred releases, newest first, one entry per addon (the newest release that
+// carries it). The manifests of those entries then have to be read from the
+// archives themselves.
+//
+// Why the catalogue lives in the same release as the archives: the release list
+// is ordered by the date of the commit a tag points at, and two releases dated
+// the same second are ordered by tag name, descending. A separate catalogue
+// release therefore climbed above the bundle (the tag `store` sorts above
+// `latest`) and left old clients reading a file with no archives in it. One
+// release, tagged on a fresh commit, has neither problem.
 //
 // GitHub answers the release list as JSON at api.github.com and the asset
 // itself with a 302 to objects.githubusercontent.com; the player's http client

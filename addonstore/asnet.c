@@ -54,12 +54,56 @@ static void api_error(const char *body, int status, char *error, size_t size) {
 	}
 }
 
+// The zip assets of one release: the asset's name is the addon's id, and the
+// size, digest and URL come from the API. `listed` stays false -- the title and
+// the section live inside the archive, so a row read this way has to open it
+// later (as_read_manifest()).
+static void entries_from_release(const json_doc_t *doc, int release, const char *repo, const char *tag,
+								 as_release_t *out, int max, int *count) {
+	int assets = json_get(doc, release, "assets");
+	int n = assets >= 0 ? json_len(doc, assets) : 0;
+	for (int i = 0; i < n && *count < max; i++) {
+		int asset = json_at(doc, assets, i);
+		if (asset < 0) {
+			continue;
+		}
+		as_release_t item;
+		memset(&item, 0, sizeof(item));
+		if (!json_obj_str(doc, asset, "name", item.asset, sizeof(item.asset))) {
+			continue;
+		}
+		as_id_from_asset(item.asset, item.id, sizeof(item.id));
+		if (!item.id[0]) {
+			continue;
+		}
+		bool seen = false;
+		for (int k = 0; k < *count; k++) {
+			if (strcmp(out[k].id, item.id) == 0) {
+				seen = true;
+			}
+		}
+		if (seen) {
+			continue;
+		}
+		snprintf(item.repo, sizeof(item.repo), "%s", repo);
+		snprintf(item.tag, sizeof(item.tag), "%s", tag);
+		item.size = json_obj_long(doc, asset, "size", 0);
+		json_obj_str(doc, asset, "digest", item.digest, sizeof(item.digest));
+		json_obj_str(doc, asset, "browser_download_url", item.url, sizeof(item.url));
+		if (!item.url[0] || strncmp(item.url, "https://", 8) != 0 || item.size <= 0) {
+			continue;
+		}
+		out[(*count)++] = item;
+	}
+}
+
 // The repository's own catalogue, if it publishes one: one file with every
 // addon's row already in it, so nothing has to be downloaded and no API call is
-// made. It lives in a release tagged `store`, at a URL that never changes.
+// made. It is an asset of the compatibility release, at a URL that never
+// changes.
 static bool fetch_index(const char *repo, as_release_t *out, int max, int *count) {
 	char url[320];
-	snprintf(url, sizeof(url), "https://github.com/%s/releases/download/store/index.json", repo);
+	snprintf(url, sizeof(url), "https://github.com/%s/releases/download/latest/index.json", repo);
 	char *body = NULL;
 	size_t body_len = 0;
 	int status = 0;
@@ -77,6 +121,42 @@ static bool fetch_index(const char *repo, as_release_t *out, int max, int *count
 	return true;
 }
 
+// The release the catalogue lives in: `index.json` beside a byte copy of every
+// current archive, rebuilt by the CI on a fresh commit, which is what keeps it
+// the newest release in the list. Read when that `index.json` cannot be had --
+// deleted by hand, a partial upload -- and cheaper than the walk below in every
+// way: one request for the whole list, no release ordering to depend on.
+static bool fetch_latest(const char *repo, as_release_t *out, int max, int *count) {
+	char url[256];
+	snprintf(url, sizeof(url), "https://api.github.com/repos/%s/releases/tags/latest", repo);
+	char *body = NULL;
+	size_t body_len = 0;
+	int status = 0;
+	if (!http_get_ex(url, "Accept: application/vnd.github+json\r\n", false, &body, &body_len, LIST_LIMIT,
+					 LIST_TIMEOUT_SECS, &status)) {
+		free(body);
+		return false;
+	}
+	json_doc_t doc;
+	if (!body || !json_parse(body, &doc)) {
+		free(body);
+		return false;
+	}
+	int root = json_root(&doc);
+	char tag[AS_TAG_MAX];
+	bool usable = root >= 0 && json_obj_str(&doc, root, "tag_name", tag, sizeof(tag)) && strcmp(tag, "latest") == 0;
+	if (!usable) {
+		json_free(&doc);
+		free(body);
+		return false;
+	}
+	int before = *count;
+	entries_from_release(&doc, root, repo, tag, out, max, count);
+	json_free(&doc);
+	free(body);
+	return *count > before;
+}
+
 bool as_fetch_releases(const char *repo, as_release_t *out, int max, int *count, char *error, size_t errsz,
 					   as_progress_t *pg) {
 	*count = 0;
@@ -92,6 +172,11 @@ bool as_fetch_releases(const char *repo, as_release_t *out, int max, int *count,
 	// single GET, where the API path below costs a call per repository and then
 	// a download per addon just to learn its title.
 	if (fetch_index(repo, out, max, count)) {
+		return true;
+	}
+	// Then the release it lives in: one API call, every current archive, and no
+	// dependence on which release the list puts first.
+	if (fetch_latest(repo, out, max, count)) {
 		return true;
 	}
 
@@ -146,46 +231,13 @@ bool as_fetch_releases(const char *repo, as_release_t *out, int max, int *count,
 		if (!json_obj_str(&doc, release, "tag_name", tag, sizeof(tag))) {
 			tag[0] = '\0';
 		}
-		// `store` is the catalogue and `latest` is a copy of the real releases
-		// for older store builds: neither is a release of its own.
+		// `latest` is the compatibility release read above, and a `store`
+		// release may still be left over from the builds that published the
+		// catalogue separately: neither is a release of its own.
 		if (strcmp(tag, "store") == 0 || strcmp(tag, "latest") == 0) {
 			continue;
 		}
-		int assets = json_get(&doc, release, "assets");
-		int n = assets >= 0 ? json_len(&doc, assets) : 0;
-		for (int i = 0; i < n && *count < max; i++) {
-			int asset = json_at(&doc, assets, i);
-			if (asset < 0) {
-				continue;
-			}
-			as_release_t item;
-			memset(&item, 0, sizeof(item));
-			if (!json_obj_str(&doc, asset, "name", item.asset, sizeof(item.asset))) {
-				continue;
-			}
-			as_id_from_asset(item.asset, item.id, sizeof(item.id));
-			if (!item.id[0]) {
-				continue;
-			}
-			bool seen = false;
-			for (int k = 0; k < *count; k++) {
-				if (strcmp(out[k].id, item.id) == 0) {
-					seen = true;
-				}
-			}
-			if (seen) {
-				continue;
-			}
-			snprintf(item.repo, sizeof(item.repo), "%s", repo);
-			snprintf(item.tag, sizeof(item.tag), "%s", tag);
-			item.size = json_obj_long(&doc, asset, "size", 0);
-			json_obj_str(&doc, asset, "digest", item.digest, sizeof(item.digest));
-			json_obj_str(&doc, asset, "browser_download_url", item.url, sizeof(item.url));
-			if (!item.url[0] || strncmp(item.url, "https://", 8) != 0 || item.size <= 0) {
-				continue;
-			}
-			out[(*count)++] = item;
-		}
+		entries_from_release(&doc, release, repo, tag, out, max, count);
 	}
 	json_free(&doc);
 	free(body);

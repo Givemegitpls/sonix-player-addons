@@ -19,11 +19,20 @@ name: addons
 # nothing. The old all-in-one tags (`0.0.7`) still build and publish every
 # releasable addon, so nothing that already exists stops working.
 #
-# The store's catalogue is a separate release tagged `store` whose `index.json`
-# names, for every addon, the release and file that are current. The addon reads
-# it directly from /releases/download/store/index.json -- no API call, no rate
-# limit, no zip downloads -- so publishing a new addon release also refreshes
-# the store's view of the world (tools/publish_index.py).
+# The catalogue the store fetches and the bundle old clients read are the same
+# release, tagged `latest`: `index.json` (tools/publish_index.py) and a byte copy
+# of every current archive (tools/rolling_release.py). The addon requests the
+# file directly from that release -- no API call, no rate limit, no zip
+# downloads -- and store builds that read "the newest release" get the archives
+# out of the same place:
+#
+#     https://github.com/<owner>/<name>/releases/download/latest/index.json
+#
+# The tag is put on a fresh commit of the `releases` branch, because the release
+# list is ordered by the tagged commit's date and a tie is broken by tag name: a
+# bundle sharing a commit with an addon release loses to `yandex-v0.2.0`, and the
+# separate `store` release lost to `latest` for the same reason
+# (docs/ADDONS.md, "The copy for old clients").
 #
 # check-exports is not here on purpose: it compares the addons' undefined
 # symbols with the player binary's dynamic symbol table, so it needs a built
@@ -34,7 +43,9 @@ name: addons
 on:
   push:
     branches: [main]
-    tags: ['*']
+    # `latest` is pushed by the job that publishes the catalogue, so it must not
+    # start a run of its own (it would build nothing: a tag that names no addon).
+    tags: ['*', '!latest']
   pull_request:
   workflow_dispatch:
     inputs:
@@ -108,8 +119,9 @@ jobs:
                   ;;
               esac
               # The old shape: a version tag, one release with every releasable
-              # addon in it. Any other tag (the catalogue's own `store`, the
-              # compatibility `latest`) releases nothing.
+              # addon in it. Any other tag (the compatibility `latest`, the
+              # `releases` branch the catalogue lives on, the `store` tag old
+              # builds left behind) releases nothing.
               if [[ "$tag" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
                 printf 'ids=%s\npack=%s\nany=true\ntag=%s\n' "$RELEASE" "$RELEASE" "$tag" >> "$GITHUB_OUTPUT"
                 exit 0
@@ -275,44 +287,36 @@ jobs:
               --title "$TAG" --generate-notes
           fi
 
-  # One catalogue for every repository that publishes releases in this shape.
-  # It reads the release list, takes the newest version of each addon, and puts
-  # index.json into the `store` release; the addon fetches that file directly.
-  index:
+  # The store's catalogue and the copy old clients read, in one release. The
+  # catalogue (`index.json`) is built out of the release list -- the newest
+  # version of each addon -- and `latest` then carries it beside byte copies of
+  # every current archive: those files keep their size and sha256, so a client
+  # that is already current is offered nothing, and nothing is rebuilt, only
+  # transferred. The release is recreated on a fresh commit of the `releases`
+  # branch, which is what puts it above every addon release in the list;
+  # ROLLING_RELEASE=off in the repository variables stops the job.
+  latest:
     needs: [changes, build]
     if: |
       always() &&
       (needs.changes.outputs.tag != '' || inputs.index) &&
-      (needs.build.result == 'success' || needs.build.result == 'skipped')
-    runs-on: ubuntu-latest
-    concurrency: addon-index
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build and publish the catalogue
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 tools/publish_index.py --repo "$GITHUB_REPOSITORY" --out build/index.json --publish
-
-  # Old store builds (0.0.x) read the single newest release and treat its .zip
-  # assets as the catalogue, so per-addon tags leave them with one addon. This
-  # release is a copy of the current archives, recreated last so it is the
-  # newest one; the files are uploaded byte for byte and keep their size and
-  # sha256, so a client that is already current is not offered an update.
-  # Nothing is rebuilt -- only transferred. Turn it off with the repository
-  # variable ROLLING_RELEASE=off.
-  latest:
-    needs: [changes, build, index]
-    if: |
-      always() &&
-      (needs.changes.outputs.tag != '' || inputs.index) &&
-      needs.build.result == 'success' && needs.index.result == 'success' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
       vars.ROLLING_RELEASE != 'off'
     runs-on: ubuntu-latest
     concurrency: addon-index
     steps:
       - uses: actions/checkout@v4
-      - name: Copy every current archive into the newest release
+
+      - name: Build the catalogue
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 tools/rolling_release.py --repo "$GITHUB_REPOSITORY" --publish
+        run: python3 tools/publish_index.py --repo "$GITHUB_REPOSITORY" --out build/index.json
+
+      # The tag goes on a new commit of `releases` and the files are the ones the
+      # catalogue names, verified by size and sha256 before they are uploaded.
+      - name: Publish the catalogue and the archives it names
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 tools/rolling_release.py --repo "$GITHUB_REPOSITORY" \
+            --index build/index.json --publish

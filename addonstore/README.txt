@@ -34,8 +34,9 @@ REPOSITORIES
   same file from the device: type owner/name (a pasted github.com URL works too)
   and the store starts reading it at once. Where the repository publishes an
   index.json catalogue, the whole list arrives in one request and no archive is
-  downloaded; otherwise the newest hundred releases are read and the newest one
-  that carries each addon is that addon's.
+  downloaded; that release also carries the archives themselves, so a list comes
+  back even when the catalogue file is gone. Otherwise the newest hundred
+  releases are read and the newest one that carries each addon is that addon's.
 
 UPDATING ITSELF
   When the repository publishes addonstore.zip, the store appears in its own
@@ -49,11 +50,12 @@ AFTER AN INSTALL
   A delete is the same from the other side: the tile goes at the next read.
 
 NETWORK
-  The catalogue first: <repository>/releases/download/store/index.json is one
-  request and no zip downloads. A repository without one is read through the
-  GitHub API, which allows sixty anonymous requests an hour per address; that
-  list is cached and refreshed at most once per open (or on "Check for
-  updates").
+  The catalogue first: <repository>/releases/download/latest/index.json is one
+  request and no zip downloads. That release also carries a copy of every current
+  archive, so when the file itself cannot be read the same list is answered from
+  its assets in one call. A repository with neither is read through the GitHub
+  API, which allows sixty anonymous requests an hour per address; that list is
+  cached and refreshed at most once per open (or on "Check for updates").
 
 FILES
   installed.tsv    which release each installed addon came from
@@ -99,8 +101,9 @@ Store - аддон для Sonix Player (TempoTec V3 Analog)
   «Репозитории» правит тот же файл с устройства: наберите owner/name
   (вставленный адрес github.com тоже понимается), и магазин сразу начнёт его
   читать. Если репозиторий публикует каталог index.json, весь список приходит
-  одним запросом и ни один архив не скачивается; иначе читаются последние сто
-  релизов, и для каждого аддона берётся самый новый из них.
+  одним запросом и ни один архив не скачивается; в том же релизе лежат и сами
+  архивы, так что список придёт даже без файла каталога. Иначе читаются
+  последние сто релизов, и для каждого аддона берётся самый новый из них.
 
 ОБНОВЛЕНИЕ САМОГО МАГАЗИНА
   Когда в репозитории появится addonstore.zip, магазин появится в собственном
@@ -114,10 +117,12 @@ Store - аддон для Sonix Player (TempoTec V3 Analog)
   Удаление — то же с другой стороны: плитка исчезнет при следующем чтении.
 
 СЕТЬ
-  Сначала каталог: <репозиторий>/releases/download/store/index.json — один
-  запрос и ни одного скачанного zip. Репозиторий без каталога читается через
-  API GitHub, а он разрешает шестьдесят анонимных запросов в час на адрес; этот
-  список кэшируется и обновляется не чаще раза за открытие (или по кнопке
+  Сначала каталог: <репозиторий>/releases/download/latest/index.json — один
+  запрос и ни одного скачанного zip. В том же релизе лежит копия каждого
+  текущего архива, поэтому если сам файл прочитать не удалось, тот же список
+  приходит одним запросом из его ассетов. Репозиторий без каталога читается
+  через API GitHub, а он разрешает шестьдесят анонимных запросов в час на адрес;
+  этот список кэшируется и обновляется не чаще раза за открытие (или по кнопке
   «Проверить обновления»).
 
 ФАЙЛЫ

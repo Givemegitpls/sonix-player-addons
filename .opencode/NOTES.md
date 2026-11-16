@@ -155,6 +155,30 @@ The player's addon layer exists only on branch `feature/addons-system` (not on
 - `.gitmodules` must keep an `https://` URL — GitHub Actions has no SSH key and
   the repository is public; `git@github.com:` URLs make `submodules: recursive`
   produce an empty checkout (the failure is later, `context ... not found`).
+- **The releases list is ordered by `created_at`, and GitHub takes that date from
+  the ref, not from the moment the release is created**: a lightweight tag gives
+  the tagged commit's committer date, an annotated one gives the *tagger* date.
+  Measured 2026-11-16: `latest` (job ran 18:37:51) has `created_at` 18:35:54Z =
+  the date of `61803a5`; `0.0.6` 12:58:41Z while its run started 12:58:47Z.
+  **Equal dates are ordered by tag name, descending** — so recreating a release
+  last wins nothing: `store` > `latest` > `addonstore-v0.2.0`, and every tag the
+  same run creates sits on the same commit, i.e. the same date. Measured on
+  repos whose tooling publishes many releases per commit (`changesets/changesets`
+  9 tie groups, `expo/expo` all ties): in every group the order is tag-name
+  descending, while the list as a whole is `created_at` descending.
+  A hand-made **annotated** tag takes its tagger date instead: the deleted
+  `0.0.7` (`39fa43d` → commit `db9961d` 14:37:20Z) had tagger 14:39:15Z.
+- `store` was a release like any other, so it competed for "the newest release"
+  that old 0.0.x builds read -- and won, leaving them a release with `index.json`
+  and no archives. Since 2026-11-16 the catalogue is an asset of the same
+  `latest` release as the archives, its tag is pushed on a fresh commit of the
+  `releases` branch (so its date is newer than any addon release's), and the job
+  that used to create `store` is gone (`tools/rolling_release.py`,
+  `tools/publish_index.py`). The addon reads
+  `/releases/download/latest/index.json`, falls back to the `latest` release's
+  assets, then to the release list (`addonstore/asnet.c`).
+  Deleting a release by hand never fixes anything here: the `store` URL 404s the
+  whole catalogue until the next `latest` run.
 
 ## Docker images
 

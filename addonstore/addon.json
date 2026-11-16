@@ -3,7 +3,7 @@
   "title": "Store",
   "titles": { "Russian": "Магазин" },
   "section": "more",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "icon": "icon.png",
   "owns_paths": ["Addons/addonstore/"],
   "cache_path": "Addons/addonstore/cache/"
