@@ -1,3 +1,4 @@
+#include <ctype.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -437,13 +438,203 @@ static const char *track_label(const quiz_track_t *t, quiz_mode_t m) {
 	}
 }
 
-static bool label_used(const quiz_track_t *tracks, int n, quiz_mode_t m, const quiz_track_t *cand) {
+// Near-duplicate filter for choices: exact match alone let through
+// "Free Flow Flava" vs "Free Flow Flava;Smuff Tha Quiz" and 1-letter typos.
+#define LABEL_FOLD_MAX 192
+#define LABEL_UNIT_MAX 6
+#define LABEL_DIST_MAX 64 // edit-distance window; longer labels only use units/substr
+
+static bool label_sep_char(unsigned char c) {
+	return c == ';' || c == '/' || c == '|' || c == '&' || c == ',' || c == '+';
+}
+
+// Lowercase, map artist separators to spaces, keep letters/digits/spaces, collapse runs.
+static void label_fold(const char *in, char *out, size_t out_sz) {
+	if (!out || out_sz == 0) {
+		return;
+	}
+	size_t o = 0;
+	bool sp = true; // leading spaces dropped
+	for (const unsigned char *p = (const unsigned char *)(in ? in : ""); *p && o + 1 < out_sz; p++) {
+		unsigned char c = *p;
+		if (label_sep_char(c)) {
+			c = ' ';
+		} else {
+			c = (unsigned char)tolower(c);
+		}
+		if (!(isalnum(c) || c == ' ' || c == '\'')) {
+			continue;
+		}
+		if (c == ' ') {
+			if (sp) {
+				continue;
+			}
+			sp = true;
+			out[o++] = ' ';
+			continue;
+		}
+		sp = false;
+		out[o++] = (char)c;
+	}
+	while (o > 0 && out[o - 1] == ' ') {
+		o--;
+	}
+	out[o] = '\0';
+}
+
+// Split "A;B feat C" into folded units for overlap checks.
+static int label_units(const char *in, char units[][LABEL_FOLD_MAX], int max_units) {
+	if (!in || max_units <= 0) {
+		return 0;
+	}
+	char buf[LABEL_FOLD_MAX];
+	snprintf(buf, sizeof(buf), "%s", in);
+	for (char *p = buf; *p;) {
+		unsigned char c = (unsigned char)*p;
+		if (label_sep_char(c)) {
+			*p++ = '\n';
+			continue;
+		}
+		bool edge = (p == buf || !isalnum((unsigned char)p[-1]));
+		size_t n = 0;
+		if (edge) {
+			if (strncasecmp(p, "feat.", 5) == 0) {
+				n = 5;
+			} else if (strncasecmp(p, "feat", 4) == 0 && !isalnum((unsigned char)p[4])) {
+				n = 4;
+			} else if (strncasecmp(p, "ft.", 3) == 0) {
+				n = 3;
+			} else if (strncasecmp(p, "ft", 2) == 0 && !isalnum((unsigned char)p[2])) {
+				n = 2;
+			} else if (strncasecmp(p, "vs.", 3) == 0) {
+				n = 3;
+			} else if (strncasecmp(p, "vs", 2) == 0 && !isalnum((unsigned char)p[2])) {
+				n = 2;
+			} else if (strncasecmp(p, "x", 1) == 0 && !isalnum((unsigned char)p[1]) &&
+					   (p == buf || p[-1] == ' ' || label_sep_char((unsigned char)p[-1]))) {
+				n = 1; // "A x B"
+			}
+		}
+		if (n > 0) {
+			for (size_t i = 0; i < n; i++) {
+				p[i] = '\n';
+			}
+			p += n;
+			continue;
+		}
+		p++;
+	}
+	int n = 0;
+	for (char *tok = strtok(buf, "\n"); tok && n < max_units; tok = strtok(NULL, "\n")) {
+		label_fold(tok, units[n], LABEL_FOLD_MAX);
+		if (units[n][0]) {
+			n++;
+		}
+	}
+	if (n == 0) {
+		label_fold(in, units[0], LABEL_FOLD_MAX);
+		if (units[0][0]) {
+			n = 1;
+		}
+	}
+	return n;
+}
+
+static int edit_distance(const char *a, const char *b) {
+	size_t la = strlen(a), lb = strlen(b);
+	if (la > LABEL_DIST_MAX) {
+		la = LABEL_DIST_MAX;
+	}
+	if (lb > LABEL_DIST_MAX) {
+		lb = LABEL_DIST_MAX;
+	}
+	int prev[LABEL_DIST_MAX + 1], cur[LABEL_DIST_MAX + 1];
+	for (size_t j = 0; j <= lb; j++) {
+		prev[j] = (int)j;
+	}
+	for (size_t i = 1; i <= la; i++) {
+		cur[0] = (int)i;
+		for (size_t j = 1; j <= lb; j++) {
+			int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+			int del = prev[j] + 1;
+			int ins = cur[j - 1] + 1;
+			int sub = prev[j - 1] + cost;
+			int best = del < ins ? del : ins;
+			cur[j] = best < sub ? best : sub;
+		}
+		memcpy(prev, cur, (lb + 1) * sizeof(prev[0]));
+	}
+	return prev[lb];
+}
+
+static bool labels_near(const char *fa, const char *fb) {
+	size_t la = strlen(fa), lb = strlen(fb);
+	size_t mn = la < lb ? la : lb;
+	size_t mx = la > lb ? la : lb;
+	if (mn < 4) {
+		return strcmp(fa, fb) == 0;
+	}
+	if (mx > LABEL_DIST_MAX) {
+		return false; // long titles: rely on units/substring only
+	}
+	int d = edit_distance(fa, fb);
+	if (d <= 1) {
+		return true;
+	}
+	if (d <= 2 && mx >= 8) {
+		return true;
+	}
+	return d * 10 <= (int)mx; // roughly ≤10% edits
+}
+
+static bool labels_conflict(const char *a, const char *b, bool strict) {
+	if (!a || !b || !a[0] || !b[0] || strcmp(a, "?") == 0 || strcmp(b, "?") == 0) {
+		return true;
+	}
+	if (strcmp(a, b) == 0) {
+		return true;
+	}
+	char fa[LABEL_FOLD_MAX], fb[LABEL_FOLD_MAX];
+	label_fold(a, fa, sizeof(fa));
+	label_fold(b, fb, sizeof(fb));
+	if (!fa[0] || !fb[0] || strcmp(fa, fb) == 0) {
+		return true;
+	}
+
+	char ua[LABEL_UNIT_MAX][LABEL_FOLD_MAX];
+	char ub[LABEL_UNIT_MAX][LABEL_FOLD_MAX];
+	int na = label_units(a, ua, LABEL_UNIT_MAX);
+	int nb = label_units(b, ub, LABEL_UNIT_MAX);
+	for (int i = 0; i < na; i++) {
+		for (int j = 0; j < nb; j++) {
+			if (strcmp(ua[i], ub[j]) == 0) {
+				return true; // shared credit unit
+			}
+		}
+	}
+
+	// One folded label contained in the other (collab vs solo).
+	size_t la = strlen(fa), lb = strlen(fb);
+	if (la >= 5 && lb > la && strstr(fb, fa)) {
+		return true;
+	}
+	if (lb >= 5 && la > lb && strstr(fa, fb)) {
+		return true;
+	}
+
+	if (strict && labels_near(fa, fb)) {
+		return true;
+	}
+	return false;
+}
+
+static bool label_used(const quiz_track_t *tracks, int n, quiz_mode_t m, const quiz_track_t *cand, bool strict) {
 	const char *lab = track_label(cand, m);
 	if (!lab || !lab[0] || strcmp(lab, "?") == 0) {
 		return true;
 	}
 	for (int i = 0; i < n; i++) {
-		if (strcmp(track_label(&tracks[i], m), lab) == 0) {
+		if (labels_conflict(track_label(&tracks[i], m), lab, strict)) {
 			return true;
 		}
 	}
@@ -1145,7 +1336,8 @@ static bool pick_round_from_pool(quiz_job_t *job) {
 			if (dup_path) {
 				continue;
 			}
-			if (pass == 0 && label_used(picked, have, mode, &pool[idx])) {
+			// pass 0: strict near-dupes; pass 1: still block shared units / containment
+			if (label_used(picked, have, mode, &pool[idx], pass == 0)) {
 				continue;
 			}
 			picked[have++] = pool[idx];
