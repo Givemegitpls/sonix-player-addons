@@ -1,0 +1,10 @@
+{
+	"api": 1,
+	"title": "Store",
+	"titles": { "Russian": "Магазин" },
+	"section": "more",
+	"version": "0.1",
+	"icon": "icon.png",
+	"owns_paths": ["Addons/addonstore/"],
+	"cache_path": "Addons/addonstore/cache/"
+}

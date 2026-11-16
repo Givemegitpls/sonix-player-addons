@@ -1,6 +1,6 @@
 ---
 name: sonix-addon
-description: Use when creating, building, debugging or porting an addon for the Sonix Player on the TempoTec V3 Analog — an app in Addons/ on the card that appears as a tile in Streaming or More. Covers where an addon keeps its files (its own folder, `<addon>/cache`, addon.json owns_paths/cache_path, migrations with common/addonfs.h), the stop hook and unloading, and the two audio paths (radio_play vs the download-cache queue). Trigger keywords: аддон, addon, Addons folder, addon.json, addon.so, dlopen, exports.list, dynamic-list, sonix_addon_entry, sonix_addon_stop_entry, addonfs, owns_paths, cache_path, saves, аддонные сейвы, unload, subsonic addon, Yandex Music addon, Zvuk addon.
+description: Use when creating, building, debugging or porting an addon for the Sonix Player on the TempoTec V3 Analog — an app in Addons/ on the card that appears as a tile in Streaming or More. Covers where an addon keeps its files (its own folder, `<addon>/cache`, addon.json owns_paths/cache_path, migrations with common/addonfs.h), the stop hook and unloading, the two audio paths (radio_play vs the download-cache queue), and how the addon's README.txt is laid out (one English block, then one Russian block). Trigger keywords: аддон, addon, Addons folder, addon.json, addon.so, dlopen, exports.list, dynamic-list, sonix_addon_entry, sonix_addon_stop_entry, addonfs, owns_paths, cache_path, saves, аддонные сейвы, unload, subsonic addon, Yandex Music addon, Zvuk addon, README.txt аддона, addon readme, readme two languages.
 ---
 
 # Addons on the card
@@ -110,6 +110,35 @@ addon_cache_dir(host, cache, sizeof cache);               // <addon>/cache, crea
    the public registry; `host` stays host-only.
 5. **Try it in the simulator** (see below), then `make pack` → copy
    `build/Addons/*` to `<card>/Addons/`.
+
+## README.txt: two blocks, English then Russian
+
+Every shipped addon carries `<id>/README.txt`. `make pack` copies `*.txt` beside
+`addon.so`, so it lands at the root of the release zip and in the folder on the
+card; the loader never reads it. It is for the person who unzipped the archive,
+often on a phone.
+
+The file is **two separate documents, in this order, one blank line between
+them**:
+
+1. English — the title line, then every section: `INSTALL`, `WHAT IT IS`,
+   `CONTROLS`, `SETTINGS`, `FILES`, `FULL INSTRUCTIONS`, …
+2. Russian — the same document, heading by heading: `УСТАНОВКА`, `ЧТО ЭТО`,
+   `УПРАВЛЕНИЕ`, `НАСТРОЙКИ`, `ФАЙЛЫ`, `ПОДРОБНАЯ ИНСТРУКЦИЯ`, …
+
+Never put a sentence and its translation on adjacent lines and never write
+`INSTALL / УСТАНОВКА`. Someone reading one language reads the file top to
+bottom; the other block is simply below it. Section names stay in their block's
+language; labels the addon itself shows (`"Sign in"`, `"Add your own..."`,
+`Games/GB`) stay verbatim in both, because that is what is on screen.
+
+Keep it short: what the addon is, where its files go, controls, where its
+settings live, and the `docs/SETUP.md#…` link for the long version. If the addon
+has a provenance/licence note (Gravity Defied), translate it too — do not leave
+it English-only in a file that is otherwise bilingual.
+
+The rule was adopted 2026-11-16: the earlier interleaved files were hard to read
+next to the player.
 
 ## Interface rules
 

@@ -54,7 +54,11 @@ Addons/
 `addon.so` is the fixed name; the loader does not read it from the manifest.
 `README.txt` is not read by anything either: `make pack` copies an addon's
 `*.txt`, `*.png` and `*.ini` along, so the instructions ride in the release zip
-(and on the card beside the code) without the loader knowing about them.
+(and on the card beside the code) without the loader knowing about them. Its
+layout is a convention, not a format: **one English document, then the same in
+Russian**, separated by a blank line — never a sentence followed by its
+translation, never `INSTALL / УСТАНОВКА`. The skill `.opencode/skills/sonix-addon`
+carries the full rule.
 `assets/` is not a keyword either — Flappy Bird asks `host->dir` for it because
 that is where `make pack` put it; an addon may call its folder anything.
 
@@ -774,6 +778,7 @@ this is the state behind it:
 | `spotify` | no | the C half builds, but the addon means nothing without its Rust engine, and the engine's session was never checked on a device |
 | `piped` | no | checked in the simulator and on a device against a live Piped instance; what it depends on is a third party (see `### piped`) |
 | `cassette` | yes | a decorative page: it has run on a device, and what it adds to a build is a small `.so` and its sprites |
+| `addonstore` | yes | installed, updated and removed addons on a device (owner, 2026-11-16); its self-update is the same rename path |
 
 A plain `make` still builds all of them, and that is deliberate: a developer's
 machine is where the unverified ones are supposed to be tried. What the whitelist
@@ -1485,6 +1490,137 @@ writing on the paper.
 corner, a soft shadow in the other) composited with LVGL's own arithmetic over
 the page previews as expected; the two layers cost one more blend of the
 invalidated rectangle per frame, which is the hub's 60x60 when it is turning.
+
+### addonstore
+
+`addonstore/` – the **Store**: what this card has, what a repository publishes,
+and one tap between them. Install, update, delete and read the README, from the device.
+
+The list is grouped the way the player is: **Music**, **Streaming**, **Wireless**,
+**More**, in that order, from each addon's own manifest `section`. A section the
+card and the releases have nothing for is not drawn at all, so a card with no
+wireless addon has no Wireless heading. A release whose manifest has not been
+read yet, or which names a section this player does not have, goes under
+**Other**. The section and the tile's name are read out of the release zip once
+per published file (digest) and cached in `cache/releases.tsv` with the rest of
+the list: that is a one-off download of the asset, and the download does not
+count against GitHub's API limit. Installed addons take their section from
+`Addons/<id>/addon.json`, so moving an addon between pages on the card moves it
+in the store too.
+
+It reads the latest GitHub release of every repository named in
+`<card>/Addons/addonstore/repos.txt` (one `owner/name` per line; the file is
+written with `Givemegitpls/sonix-player-addons` on the first start) and offers
+each `.zip` asset in it as an addon. It is not a catalogue: the asset names are
+the addon ids, and a folder copied onto the card by hand shows up in the same
+list without a record.
+
+**What "update" means**, and it is two answers because the card can tell two
+things about itself:
+
+- **installed by the store** — the record in `installed.tsv` holds the asset's
+  size and `sha256:` from the API, and those cover **every file in the zip**.
+  The addon is out of date exactly when the latest release's asset is not the
+  recorded one. No card read, no download, and an assets-only release is caught.
+- **copied by hand** — there is no record, so the evidence is the code: the store
+  reads `addon.so` out of the release zip when it reads the manifest (once per
+  published digest, cached in `releases.tsv`) and compares its `sha256` with
+  `Addons/<id>/addon.so`. Equal means `up to date`. The limit is honest: a
+  release that changes only artwork and no code is not detected for a
+  hand-installed folder — the store has never seen that folder's contents, and
+  hashing every asset on every page build is not worth the card reads.
+
+`version` strings are deliberately not compared: those are hand-written `0.1`s
+in every manifest and say nothing about a release.
+
+**Installing** (`asinst.c`): the asset is downloaded into the store's own
+`cache/`, paced by `common/cardpace.h` at 1 MB/s like every other write to this
+card, and checked against the published size and digest. The zip is unpacked by
+`aszip.c` — a reader for exactly what a release archive is: central directory,
+stored or deflated entries, no zip64; the inflate is miniz's, already compiled
+into every addon by `common/gunzip.c`. One directory around the entries is
+stripped, so a source archive with `repo-tag/addon.json` installs the same way as
+a release zip. Names with `..`, an absolute path or a backslash refuse the
+archive; a missing `addon.json` or `addon.so` does too.
+
+A **first install** is atomic: the files are written into
+`Addons/.addonstore-new-<id>/` and put in place with `rename()`, the old folder
+moved to `.addonstore-old-<id>` and restored if the switch fails. An **update is
+in place**, and which file may change is a fixed rule:
+
+- **replaced**: `addon.so`, `icon.png`, `README.txt`, everything under
+  `assets/` — the code and the artwork it draws with;
+- **written only when absent**: every other name. `addon.json` is the first of
+  those, which is why the card keeps its own manifest; so do `settings.ini`
+  (Yandex Music ships one filled in, and an update must not put the published
+  keys over the user's edits), `token.txt` and other credentials,
+  `servers/*.ini`, `zvuk_saved.tsv`, a database, a save directory, a cache —
+  anything a release happens to carry under a name the card already has.
+
+Each file goes through a staged `.asnew` file and a `rename()`, with `addon.so`
+last so the library switches after its assets. A failed stage leaves the old
+version intact; a failure between the renames leaves a mixed folder, which is why
+the library goes last. New files a release brings are added; files it stopped
+shipping are not deleted from the card.
+
+**Deleting** removes `Addons/<id>/` whole, after the shell's confirmation. It
+refuses its own folder, and refuses to install a release over itself for the same
+reason: the library is mapped from that folder. An addon whose `.so` the player has already mapped
+cannot be unmapped from the store (there is no exported `addon_unload`), so its
+files go and the mapping stays until the next player start — the page warns
+about that in the confirmation.
+
+**Updating itself.** The store is an addon like the ones it installs, and it
+updates itself with the same code path: `rename()` puts the new `addon.so` in
+place, the mapping the process is running from keeps the old inode alive and
+executable, and the player opens the new library when the tile is tapped again
+(`slot_files_current()`). So the process is: a release with `addonstore.zip` in
+it, **Update** in the store's own page, then reopen the tile — no card read and no
+restart. Deleting itself stays refused: there would be nothing to open.
+`addon.json`, `repos.txt`, `installed.tsv` and `cache/` all survive, as with any
+update; a release that changes the manifest (a new section, order or title)
+therefore needs a fresh folder, because the manifest on the card is the user's.
+
+The store is released like every other addon: it is in the CI whitelist
+(`.github/workflows/addons.yml`), so a tag publishes `addonstore.zip` beside the
+rest. The first copy arrives the usual way — a zip unzipped into
+`Addons/addonstore/` — and a store whose folder was copied by hand has no record
+for itself, so its own row reads **Update** like any other; once the card's library is the
+release's, the row says `up to date` instead.
+
+**What is checked before anything is replaced.** A release is refused unless its
+`addon.so` is a 32-bit little-endian MIPS ELF and its manifest's `api` is the one
+this player speaks (1). That covers every addon, and it is what keeps a source
+zip, a build for another board or an addon for a newer ABI from replacing a
+working tile with something `dlopen()` will not open. A store release that is
+broken in a way this check cannot see leaves the old library mapped; recovery is
+the same as for a bricked addon — copy the previous zip's folder back by hand.
+
+**A new tile needs a card read.** The player scans `Addons/` when the card is
+attached; `addon_scan()`/`addon_card_changed()` are not part of the ABI, and
+exporting them would mean a firmware update to install an addon. So an install
+says "reinsert the card" and a delete says the tile goes at the next read.
+That is the one thing this addon cannot do for the user.
+
+**Network.** `https://api.github.com/repos/<repo>/releases?per_page=1`, with
+`Accept: application/vnd.github+json`; anonymous calls allow sixty an hour per
+address, so the parsed list is cached in `cache/releases.tsv` and refreshed at
+most once per open, or on "Check for updates". A 403 shows the API's own sentence
+(`API rate limit exceeded for …`) rather than "network failed".
+
+**Threads and unloading.** One job at a time: the worker fetches or downloads,
+the page polls it with an `lv_timer` every 400 ms and never touches LVGL from the
+worker. `stop()` raises the cancel flag (checked between download chunks), waits
+up to three seconds for the worker, and answers false while a request is still on
+the wire — then the shell keeps the mapping instead of unmapping code that is
+executing.
+
+`addonstore/tools/` holds the host checks, not part of the build: `test_zip.c`
+lists and extracts a zip (`7z` is the reference), `test_store.c` with
+`stub_net.c` runs the release parsing, install, README and removal against a
+fake card, and `run_store_test.sh` builds them. It verified `dino.zip` from
+release 0.0.6 byte for byte against `7z x`, a nested source archive, stored and
+deflated entries, a `../` entry being refused, and the real release JSON.
 
 ## Covers on the rows of a list
 

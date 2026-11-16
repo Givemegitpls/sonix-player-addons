@@ -88,6 +88,7 @@ saves in `Games/` are the user's, not an addon's.
 sonix-player/       the player's repository, as a submodule; its source tree
                     (headers, ABI, toolchain, image) is sonix-player/sonix-player/
 common/             compiled into every addon (store, addonfs, listrow, gunzip)
+addonstore/         installs and updates addons from GitHub releases
 dino/               the Chrome offline game
 flappybird/         the game from the More page
 gearboy/            Game Boy / Game Boy Color, from src/gb

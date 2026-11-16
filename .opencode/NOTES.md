@@ -193,10 +193,16 @@ it keyed on `sonix-player/sonix-player/docker/Dockerfile` + `rockboxdev/**`.
   (`ya.ru/device`, scheme stripped), **Waiting** the countdown. `token.txt` is a
   legacy import only (no refresh token) — docs must not present it as a way to
   type a token in.
-- Each released addon carries its own `<id>/README.txt` (English + Russian, link
-  to `docs/SETUP.md#<n>-<slug>`): `make pack` copies `*.txt`/`*.png`/`*.ini` and
+- Each released addon carries its own `<id>/README.txt` (link to
+  `docs/SETUP.md#<n>-<slug>`): `make pack` copies `*.txt`/`*.png`/`*.ini` and
   `assets/` from the addon folder, so the file lands at the root of the release
   zip and on the card. It is not read by the loader; keep it short.
+  **Layout since 2026-11-16:** two separate documents, English first, then the
+  same in Russian after one blank line. Never a sentence followed by its
+  translation, never `INSTALL / УСТАНОВКА`; section headings stay in their
+  block's language. The rule lives in `.opencode/skills/sonix-addon`,
+  "README.txt: two blocks". gravity's README repeats the licence note in the
+  Russian block as well.
 
 ## Building without docker (this machine, 2026-11-06)
 
@@ -671,3 +677,53 @@ the merged calculator were demonstrated rather than argued from the code.
   `make ADDON_IDS=daily pack` -> `adb push build/Addons/daily/{addon.json,addon.so,icon.png,README.txt} /mnt/sd_0/Addons/daily/`.
   `settings.ini` аддона в папке не перезаписывать — там его собственное состояние
   (трек дня, сессии сервисов).
+
+## addonstore: установка аддонов из GitHub releases (2026-11-16)
+- Плитка в More, называется **Store** (папка/id осталась `addonstore`). `repos.txt` (owner/name на строку) → `GET /repos/<r>/releases?per_page=1`,
+  каждый `.zip` ассет = аддон; id = имя ассета без `.zip`.
+- Обновление определяется по `size`+`digest` ассета из API, записанным в
+  `Addons/addonstore/installed.tsv` при установке, а не по `version` в манифесте
+  (там у всех `0.1`). Аддон, поставленный вручную, записи не имеет и апдейт не предлагает.
+- Загрузка: `http_stream_open` в `Addons/addonstore/cache/*.part`, запись через
+  `common/cardpace` 1 МБ/с, проверка `sha256:` из `digest`, распаковка в
+  `Addons/.addonstore-new-<id>` и `rename()` (старое — в `.addonstore-old-<id>`).
+- **`aszip.c` не должен включать `tinfl_impl.inc`**: `common/gunzip.c` уже кладёт tinfl в
+  каждый аддон, повторное включение даёт multiple definition на линковке. Достаточно
+  `extern void *tinfl_decompress_mem_to_heap(...)`.
+- Новые/удалённые плитки появляются только после перескана карты: `addon_scan`/
+  `addon_card_changed` не экспортируются. Об этом сказано в UI и docs/SETUP.md.
+- Хостовые проверки: `addonstore/tools/run_store_test.sh <zip> [releases.json]` — сеть
+  застаблена (`tools/stub_net.c`), проверены извлечение `dino.zip` побайтно против `7z x`,
+  вложенный префикс каталога, stored/deflate, отказ на `../`, реальный JSON релиза.
+- Симулятор на этой машине не собирается (нет wavpack), поэтому UI-часть на девайсе
+  ещё не проверялась.
+- Обновление теперь **по месту** (2026-11-16): первая установка — как раньше через
+  `Addons/.addonstore-new-<id>` + `rename()`, а поверх существующего аддона пишутся только
+  файлы из архива, через `<name>.asnew` + `rename()`, `addon.so` последним. `addon.json`
+  не перезаписывается, настройки/сессии/сейвы/кэш и файлы, которых нет в архиве, остаются.
+  Проверено в `run_store_test.sh` вторым zip: кастомный манифест, settings.ini и файл в cache/
+  выживают, `addon.so` и README заменяются.
+- Самообновление разрешено: `rename()` подменяет `addon.so`, старый inode остаётся
+  смапленным и работающим, плеер загружает новый код при следующем тапе (удаление себя
+  по-прежнему запрещено). Тост после self-install: «откройте плитку заново».
+- До подмены проверяется payload любого релиза: `addon.so` — ELF 32-bit LE MIPS (e_machine=8),
+  `addon.json` — `api` == 1. Иначе установка отклоняется, установленный аддон не тронут.
+- `addonstore` добавлен в CI whitelist (`.github/workflows/addons.yml`), значит тег публикует
+  `addonstore.zip` наравне со всеми; впервые руками скопированный магазин показывает
+  «Update», а если его `addon.so` уже совпадает с релизным — «актуально» (up to date).
+- Категории в списке — по `section` из манифеста, в порядке Music/Streaming/Wireless/More,
+  неизвестное — в Other; пустая категория не рисуется. У установленных секция читается с карты,
+  у опубликованных — из zip релиза один раз на digest (скачивание не тратит лимит API,
+  результат кэшируется в `releases.tsv`: 8 колонок, старый 6-колоночный кэш читается).
+- «Актуально»: два пути. Поставленный магазином — digest/size ассета из записи
+  `installed.tsv` против последнего релиза (покрывает весь zip, включая assets и
+  settings.ini). Скопированный вручную — sha256 `addon.so` **из zip релиза**
+  (`so_sha256`, читается в `as_read_manifest`, 10 колонок в releases.tsv, старые 6/8
+  читаются) против файла на карте. Ограничение: assets-only релиз для ручной копии не
+  виден — задокументировано.
+- Правило обновления файлов (asinst.c `update_replaces`/`update_keeps`): заменяются только
+  `addon.so`, `icon.png`, `README.txt`, `assets/**`; любой другой файл пишется лишь если его
+  нет. Поэтому `addon.json`, `settings.ini` (yandex везёт свой с ключами), `token.txt`,
+  сессии, `*.tsv`, `cache/`, `saves/` переживают апдейт; сохранения gravity —
+  `Addons/gravity/saves/` (platform/canvas.cpp), в архив не входят; gearboy — `Games/Saves`
+  вне аддона. Удаление по-прежнему сносит папку целиком.

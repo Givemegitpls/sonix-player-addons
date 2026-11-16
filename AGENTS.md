@@ -23,8 +23,9 @@ The documentation lives in
 
 ## What the CI builds
 
-`ADDON_IDS` in `.github/workflows/addons.yml` is the whitelist: `dino flappybird
-gearboy hello qobuz subsonic yandex`. `zvuk`, `tidal` and `spotify` are excluded
+`ADDON_IDS` in `.github/workflows/addons.yml` is the whitelist: `2048
+addonstore cassette daily dino flappybird gearboy gravity hello qobuz
+subsonic tictactoe yandex`. `zvuk`, `tidal` and `spotify` are excluded
 because none has been verified on a device; `spotify` also because its Rust
 engine must be built with its C half, and that pair has not been checked. Do not
 add an addon to the whitelist without a device run to point at — `docs/ADDONS.md`,

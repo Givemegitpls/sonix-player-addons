@@ -24,6 +24,7 @@ This is the user's side. The interface, the card layout and the internals are in
 8. [Piped](#8-piped)
 9. [What is on the card / Что лежит на карте](#9-what-is-on-the-card--что-лежит-на-карте)
 10. [When it does not work / Если не работает](#10-when-it-does-not-work--если-не-работает)
+11. [Installing addons from the device / Установка аддонов с устройства](#11-installing-addons-from-the-device--установка-аддонов-с-устройства)
 
 ## 1. Installing / Установка
 
@@ -567,6 +568,9 @@ copy of the instructions.)
 | `Addons/gearboy/settings.ini` | Gearboy | palette, shader, colour correction, boot ROM |
 | `Addons/flappybird/state.ini` | Flappy Bird | best score, sound |
 | `Addons/dino/settings.ini` | Dino | best score |
+| `Addons/addonstore/installed.tsv` | Addons | which release each addon on the card came from |
+| `Addons/addonstore/repos.txt` | Addons | the GitHub repositories the store reads |
+| `Addons/addonstore/cache/` | Addons | the release list, downloaded zips and READMEs |
 
 `Games/GB`, `Games/GBC`, `Games/Saves`, `Games/Bios` are the user's, not an
 addon's: Gearboy reads them and writes only the saves.
@@ -611,3 +615,103 @@ name or password».** Неверное имя или пароль, аккаун�
 **The session is not kept.** The card is read-only or full; the page says so. /
 **Сессия не сохраняется.** Карта только для чтения или заполнена; страница об
 этом пишет.
+
+## 11. Installing addons from the device / Установка аддонов с устройства
+
+**English.** `addonstore` is an addon that installs addons: the More page gets a
+`Store` tile, and inside it is a list of what this card has and what the
+configured GitHub repositories publish, grouped by the player page each addon
+belongs to (Music, Streaming, Wireless, More); a page with nothing on it has no
+heading. A tap on a row opens the addon's page:
+
+- **Install / Update** — downloads the release's zip and unpacks it into
+  `Addons/<id>/`. An update replaces only the files the release carries:
+  `addon.json`, settings, tokens, saves and caches in the folder are left alone:
+  an update replaces only `addon.so`, `icon.png`, `README.txt` and `assets/`,
+  and writes any other file only if the card does not have it. Gravity Defied's
+  `Addons/gravity/saves/`, a resumed game, a signed-in session and a theme
+  choice all survive; Gearboy's saves are in `Games/Saves`, outside the addon,
+  and are never part of an update or a delete.
+  "Update" appears when what is on the card is not the release. For an addon the
+  store installed, that is the published file's size and `sha256` against what
+  was recorded at install (it covers the whole zip, artwork included); for one
+  copied by hand it is the release's `addon.so` against the file on the card.
+  When they match the row says `up to date` and there is nothing to press;
+- **Delete** — removes the folder, settings and cache included, after asking.
+  The addon cannot remove itself;
+- **README** — the addon's own `README.txt`, from the card when it is there and
+  from the release zip otherwise.
+
+The repositories are listed in `<card>/Addons/addonstore/repos.txt`, one
+`owner/name` per line; the file is created on the first start with
+`Givemegitpls/sonix-player-addons`. Edit it on a computer and open the addon
+again — every `.zip` asset in a repository's latest release becomes a row, so a
+repository that publishes one zip per addon works without any other setup.
+
+The store updates itself like any addon: once the repository publishes
+`addonstore.zip`, it appears in its own list. **Update** replaces only the code
+(it keeps `addon.json`, `repos.txt` and the release records), and the new version
+starts when the tile is opened again — no restart. A store built from the
+published release says `up to date` instead. The store cannot delete itself.
+
+Магазин обновляет себя как обычный аддон: когда в репозитории появится
+`addonstore.zip`, он будет и в своём списке. **Обновить** заменит только код
+(`addon.json`, `repos.txt` и записи о релизах останутся), а новая версия начнёт
+работать при следующем открытии плитки — перезапуск не нужен. Магазин,
+собранный из опубликованного релиза, показывает «актуально». Удалить себя
+магазин не может.
+
+Два момента:
+
+- **A new or removed tile shows up after the player reads the card again.** Take
+  the card out and put it back, or restart. The player scans `Addons/` when the
+  card is attached, and an addon cannot ask for that scan;
+- GitHub allows sixty anonymous API requests an hour per address. The list is
+  cached and refreshed once per open, or when you tap **Check for updates**.
+
+**Русский.** `addonstore` — аддон, который ставит аддоны: на странице More
+появляется плитка `Store` («Магазин»), а в ней — список того, что есть
+на карте, и того, что публикуют настроенные репозитории GitHub, сгруппированный
+по страницам плеера (Music, Streaming, Wireless, More); пустая страница не
+показывается. Касание строки
+открывает страницу аддона:
+
+- **Установить / Обновить** — скачивает zip релиза и распаковывает его в
+  `Addons/<id>/`. Обновление заменяет только те файлы, которые есть в релизе:
+  `addon.json`, настройки, токены, сохранения и кэш в папке остаются: обновление
+  заменяет только `addon.so`, `icon.png`, `README.txt` и `assets/`, а любой
+  другой файл пишет лишь тогда, когда его на карте нет. Сохранения Gravity
+  Defied в `Addons/gravity/saves/`, незакрытая игра, сессия и выбранная тема
+  переживают обновление; сохранения Gearboy лежат в `Games/Saves`, вне аддона,
+  и не трогаются ни обновлением, ни удалением.
+  «Обновить» появляется, когда на карте не тот файл, что в релизе. Для аддона,
+  поставленного магазином, это размер и `sha256` опубликованного файла против
+  записи об установке (покрывает весь zip, включая картинки); для
+  скопированного вручную — `addon.so` из релиза против файла на карте. Если они
+  совпадают, строка говорит «актуально» и нажимать нечего;
+- **Удалить** — удаляет папку вместе с настройками и кэшем, спросив
+  подтверждение. Себя аддон удалить не может;
+- **README** — собственный `README.txt` аддона: с карты, если он там есть, иначе
+  из zip релиза.
+
+Репозитории перечислены в `<card>/Addons/addonstore/repos.txt`, по одному
+`owner/name` в строке; при первом запуске файл создаётся с
+`Givemegitpls/sonix-player-addons`. Правится на компьютере, после чего аддон
+открывается заново — каждый `.zip` в последнем релизе репозитория становится
+строкой списка, поэтому репозиторий с одним zip на аддон работает без
+дополнительной настройки.
+
+Магазин обновляет себя как обычный аддон: когда в репозитории появится
+`addonstore.zip`, он будет и в своём списке. **Обновить** заменит только код
+(`addon.json`, `repos.txt` и записи о релизах останутся), а новая версия начнёт
+работать при следующем открытии плитки — перезапуск не нужен. Магазин,
+собранный из опубликованного релиза, показывает «актуально». Удалить себя
+магазин не может.
+
+Два момента:
+
+- **Новая или удалённая плитка появится, когда плеер снова прочитает карту.**
+  Выньте карту и вставьте обратно или перезапустите плеер. Плеер сканирует
+  `Addons/` при подключении карты, а попросить его об этом из аддона нельзя;
+- GitHub разрешает шестьдесят анонимных запросов к API в час на адрес. Список
+  кэшируется и обновляется раз за открытие или по кнопке «Проверить обновления».
