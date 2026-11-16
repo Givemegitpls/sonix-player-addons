@@ -1,0 +1,9 @@
+{
+  "api": 1,
+  "title": "Quiz",
+  "titles": { "Russian": "Викторина", "Italiano": "Quiz" },
+  "section": "more",
+  "order": 12,
+  "version": "0.10.2",
+  "icon": "icon.png"
+}
