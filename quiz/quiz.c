@@ -104,8 +104,6 @@ static quiz_cfg_t cfg;
 static quiz_cfg_t cfg_before_settings; // snapshot when the gear opens
 
 static lv_obj_t *quiz_screen;
-static lv_obj_t *quiz_back_btn;
-static lv_obj_t *quiz_back_icon;
 static lv_obj_t *settings_screen;
 static lv_obj_t *records_screen;
 static lv_obj_t *records_surv_val;
@@ -2461,19 +2459,6 @@ static void records_clear_cb(lv_event_t *e) {
 	paint_records();
 }
 
-static void build_records(void) {
-	records_screen = lv_obj_create(NULL);
-	sonix_addon_own_screen(addon_id, records_screen);
-	lv_obj_t *page = settingsrow_page(records_screen, gui_cfg, ru() ? "Рекорды" : "Records");
-
-	settingsrow_add(page, ru() ? "Выживание" : "Survival", &records_surv_val, NULL, NULL);
-	settingsrow_add(page, ru() ? "Бесконечный" : "Endless", &records_end_val, NULL, NULL);
-	settingsrow_add(page, ru() ? "На время" : "Timed", &records_timed_val, NULL, NULL);
-	settingsrow_action(page, ru() ? "Сбросить рекорды" : "Clear records", records_clear_cb, NULL);
-	paint_records();
-	switcher_attach_back_gesture(records_screen);
-}
-
 // Fullscreen quiz chrome: no status bar, header sits at the top padding.
 static int quiz_header_y(const gui_config_t *cfg) {
 	return cfg ? cfg->padding + SC(4) : SC(8);
@@ -2481,6 +2466,62 @@ static int quiz_header_y(const gui_config_t *cfg) {
 
 static int quiz_content_top(const gui_config_t *cfg) {
 	return quiz_header_y(cfg) + SC(56) + (cfg ? cfg->padding : SC(12));
+}
+
+static bool quiz_own_screen(lv_obj_t *screen) {
+	return screen && (screen == quiz_screen || screen == settings_screen || screen == records_screen);
+}
+
+static void quiz_chrome(bool on) {
+	// Hide the status bar (no quickpanel spoiler) and the system chevron,
+	// which still parks below the bar height. Our own back sits with the header.
+	topbar_set_hidden(on);
+	back_btn_force_hidden(on);
+}
+
+static lv_obj_t *quiz_header_back(lv_obj_t *screen) {
+	lv_obj_t *btn = lv_btn_create(screen);
+	lv_obj_set_size(btn, SC(56), SC(56));
+	lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_border_width(btn, 0, 0);
+	lv_obj_set_style_shadow_width(btn, 0, 0);
+	lv_obj_set_style_pad_all(btn, 0, 0);
+	lv_obj_align(btn, LV_ALIGN_TOP_LEFT, gui_cfg->padding, quiz_header_y(gui_cfg));
+	lv_obj_add_event_cb(btn, back_btn_cb, LV_EVENT_CLICKED, NULL);
+
+	lv_obj_t *icon = lv_image_create(btn);
+	lv_image_set_src(icon, &icon_chevron_left);
+	lv_obj_add_style(icon, &theme_style_icon, 0);
+	lv_obj_center(icon);
+	return btn;
+}
+
+// settingsrow_page parks below the status bar; pull title + body up for fullscreen
+// and draw our own left chevron (system back stays hidden while chrome is on).
+static void quiz_lift_settingsrow(lv_obj_t *screen, lv_obj_t *page) {
+	lv_obj_t *title = settingsrow_page_title(screen);
+	if (title && gui_cfg) {
+		int left = gui_cfg->padding + SC(56) + 14;
+		lv_obj_align(title, LV_ALIGN_TOP_LEFT, left, quiz_header_y(gui_cfg) + SC(10));
+	}
+	if (page && gui_cfg) {
+		int top = quiz_content_top(gui_cfg);
+		lv_obj_set_size(page, lv_pct(100), (int)gui_cfg->screen_height - top);
+		lv_obj_align(page, LV_ALIGN_TOP_LEFT, 0, top);
+	}
+	quiz_header_back(screen);
+}
+
+static void sub_loaded_cb(lv_event_t *e) {
+	(void)e;
+	quiz_chrome(true);
+}
+
+static void sub_unloaded_cb(lv_event_t *e) {
+	(void)e;
+	if (!quiz_own_screen(lv_screen_active())) {
+		quiz_chrome(false);
+	}
 }
 
 static lv_obj_t *corner_button(lv_obj_t *screen, gui_config_t *cfg, int slot, const lv_image_dsc_t *glyph,
@@ -2504,6 +2545,22 @@ static lv_obj_t *corner_button(lv_obj_t *screen, gui_config_t *cfg, int slot, co
 	return button;
 }
 
+static void build_records(void) {
+	records_screen = lv_obj_create(NULL);
+	sonix_addon_own_screen(addon_id, records_screen);
+	lv_obj_t *page = settingsrow_page(records_screen, gui_cfg, ru() ? "Рекорды" : "Records");
+	quiz_lift_settingsrow(records_screen, page);
+
+	settingsrow_add(page, ru() ? "Выживание" : "Survival", &records_surv_val, NULL, NULL);
+	settingsrow_add(page, ru() ? "Бесконечный" : "Endless", &records_end_val, NULL, NULL);
+	settingsrow_add(page, ru() ? "На время" : "Timed", &records_timed_val, NULL, NULL);
+	settingsrow_action(page, ru() ? "Сбросить рекорды" : "Clear records", records_clear_cb, NULL);
+	paint_records();
+	lv_obj_add_event_cb(records_screen, sub_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
+	lv_obj_add_event_cb(records_screen, sub_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
+	switcher_attach_back_gesture(records_screen);
+}
+
 static lv_obj_t *make_settings_section(lv_obj_t *page) {
 	lv_obj_t *box = lv_obj_create(page);
 	lv_obj_remove_style_all(box);
@@ -2518,6 +2575,7 @@ static void build_settings(void) {
 	settings_screen = lv_obj_create(NULL);
 	sonix_addon_own_screen(addon_id, settings_screen);
 	lv_obj_t *page = settingsrow_page(settings_screen, gui_cfg, ru() ? "Настройки" : "Settings");
+	quiz_lift_settingsrow(settings_screen, page);
 
 	lv_obj_t *ask_row = NULL;
 	settingsrow_pills(page, ru() ? "Что угадывать" : "What to guess", &ask_row);
@@ -2568,6 +2626,8 @@ static void build_settings(void) {
 
 	refresh_ask_pills();
 	refresh_play_pills();
+	lv_obj_add_event_cb(settings_screen, sub_loaded_cb, LV_EVENT_SCREEN_LOADED, NULL);
+	lv_obj_add_event_cb(settings_screen, sub_unloaded_cb, LV_EVENT_SCREEN_UNLOADED, NULL);
 	switcher_attach_back_gesture(settings_screen);
 }
 
@@ -2675,16 +2735,9 @@ static void poll_cb(lv_timer_t *t) {
 
 static lv_timer_t *poll_timer;
 
-static void quiz_chrome_game(bool on) {
-	// Hide the status bar (no quickpanel spoiler) and the system chevron,
-	// which still parks below the bar height. Our own back sits with gear/trophy.
-	topbar_set_hidden(on);
-	back_btn_force_hidden(on);
-}
-
 static void loaded_cb(lv_event_t *e) {
 	(void)e;
-	quiz_chrome_game(true);
+	quiz_chrome(true);
 	if (poll_timer) {
 		lv_timer_resume(poll_timer);
 	}
@@ -2724,10 +2777,10 @@ static void unloaded_cb(lv_event_t *e) {
 	if (poll_timer) {
 		lv_timer_pause(poll_timer);
 	}
-	quiz_chrome_game(false);
-	// Leaving the addon (More, etc.) — not a detour into Settings/Records.
-	// Next entry must open on Start, not resume a half-finished run.
-	if (lv_screen_active() != settings_screen && lv_screen_active() != records_screen) {
+	// Keep fullscreen while hopping to Settings/Records; only restore chrome
+	// (and abandon the run) when leaving the addon entirely.
+	if (!quiz_own_screen(lv_screen_active())) {
+		quiz_chrome(false);
 		abandon_session();
 	}
 }
@@ -2789,18 +2842,7 @@ static lv_obj_t *quiz_addon_init(const sonix_addon_host_t *host) {
 		lv_obj_align(title, LV_ALIGN_TOP_LEFT, left, quiz_header_y(gui_cfg) + SC(10));
 	}
 
-	quiz_back_btn = lv_btn_create(quiz_screen);
-	lv_obj_set_size(quiz_back_btn, SC(56), SC(56));
-	lv_obj_set_style_bg_opa(quiz_back_btn, LV_OPA_TRANSP, 0);
-	lv_obj_set_style_border_width(quiz_back_btn, 0, 0);
-	lv_obj_set_style_shadow_width(quiz_back_btn, 0, 0);
-	lv_obj_set_style_pad_all(quiz_back_btn, 0, 0);
-	lv_obj_align(quiz_back_btn, LV_ALIGN_TOP_LEFT, gui_cfg->padding, quiz_header_y(gui_cfg));
-	lv_obj_add_event_cb(quiz_back_btn, back_btn_cb, LV_EVENT_CLICKED, NULL);
-	quiz_back_icon = lv_image_create(quiz_back_btn);
-	lv_image_set_src(quiz_back_icon, &icon_chevron_left);
-	lv_obj_add_style(quiz_back_icon, &theme_style_icon, 0);
-	lv_obj_center(quiz_back_icon);
+	quiz_header_back(quiz_screen);
 
 	corner_button(quiz_screen, gui_cfg, 0, &icon_music_settings, open_settings_cb, NULL);
 	trophy_ready = heart_sprite_load("trophy.png", &trophy_dsc, &trophy_px);
@@ -3184,6 +3226,7 @@ static lv_obj_t *quiz_addon_init(const sonix_addon_host_t *host) {
 
 static bool quiz_addon_stop(void) {
 	job_gen++;
+	quiz_chrome(false);
 	stop_snippet();
 	stop_answer_timer();
 	hide_reveal();
@@ -3235,8 +3278,6 @@ static bool quiz_addon_stop(void) {
 	}
 
 	quiz_screen = NULL;
-	quiz_back_btn = NULL;
-	quiz_back_icon = NULL;
 	settings_screen = NULL;
 	records_screen = NULL;
 	records_surv_val = NULL;
