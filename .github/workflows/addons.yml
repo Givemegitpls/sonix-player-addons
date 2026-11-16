@@ -1,9 +1,29 @@
 name: addons
 
-# Builds the whitelist, checks the ABI, and uploads the folder that goes on a
-# card. Why a whitelist and not everything with an addon.json: docs/ADDONS.md,
-# "What is built, and what is not" -- zvuk, tidal and spotify compile but have
-# never been verified on a device, and an artifact is not the place to find out.
+# Builds what changed, checks the ABI, and uploads the folder that goes on a
+# card. Everything with an addon.json is built when it changes -- compiling an
+# addon is how its code is kept honest -- but only the addons named in
+# RELEASE_ADDONS below are packed or published. That is the gate the old
+# whitelist was: docs/ADDONS.md, "What is built, and what is released" --
+# piped, zvuk, tidal and spotify compile but have never been verified on a
+# device, and a release is not the place to find out.
+#
+# Only what changed is built. The first job turns the commit range (or the tag)
+# into a list of addon ids; `common/`, the player submodule and the Makefile are
+# compiled into every addon or decide how, so they mean every addon. See
+# tools/changed_addons.py.
+#
+# Releases are per addon. A tag named `<id>-v<version>` (dino-v0.2.0) builds
+# that one addon and publishes `dino.zip` beside its metadata fragment
+# `dino.json`; a tag naming an addon outside RELEASE_ADDONS fails and releases
+# nothing. The old all-in-one tags (`0.0.7`) still build and publish every
+# releasable addon, so nothing that already exists stops working.
+#
+# The store's catalogue is a separate release tagged `store` whose `index.json`
+# names, for every addon, the release and file that are current. The addon reads
+# it directly from /releases/download/store/index.json -- no API call, no rate
+# limit, no zip downloads -- so publishing a new addon release also refreshes
+# the store's view of the world (tools/publish_index.py).
 #
 # check-exports is not here on purpose: it compares the addons' undefined
 # symbols with the player binary's dynamic symbol table, so it needs a built
@@ -17,6 +37,15 @@ on:
     tags: ['*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      addons:
+        description: 'Addon ids to build, space separated (empty = everything that changed)'
+        required: false
+        default: ''
+      index:
+        description: 'Rebuild and publish the store catalogue'
+        type: boolean
+        default: false
 
 # gh release create/upload writes to the repository's releases; the build itself
 # needs no permission at all.
@@ -25,10 +54,98 @@ permissions:
 
 env:
   IMAGE: tempotec-player-build:ci
-  ADDON_IDS: 2048 addonstore cassette daily dino flappybird gearboy gravity hello qobuz subsonic tictactoe yandex
+  # The only addons that are packed or published. Everything else still builds.
+  RELEASE_ADDONS: 2048 addonstore cassette daily dino flappybird gearboy gravity qobuz subsonic tictactoe yandex
 
 jobs:
-  addons:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      ids: ${{ steps.pick.outputs.ids }}
+      pack: ${{ steps.pick.outputs.pack }}
+      any: ${{ steps.pick.outputs.any }}
+      tag: ${{ steps.pick.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Four answers, in order: a tag names one addon (or, in the old shape,
+      # everything); a dispatch names what it was given; otherwise the diff
+      # decides. `ids` is what is built; `pack` is that intersected with
+      # RELEASE_ADDONS, which is what is packed and can be published.
+      - name: Which addons
+        id: pick
+        env:
+          RELEASE: ${{ env.RELEASE_ADDONS }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BEFORE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          DISPATCH: ${{ inputs.addons }}
+        run: |
+          set -eu
+          case "$REF" in
+            refs/tags/*)
+              tag="${REF#refs/tags/}"
+              case "$tag" in
+                *-v[0-9]*)
+                  id="${tag%-v*}"
+                  if [ ! -d "$id" ]; then
+                    echo "::error::tag $tag names $id, which is not an addon folder here" >&2
+                    printf 'ids=\npack=\nany=false\ntag=\n' >> "$GITHUB_OUTPUT"
+                    exit 1
+                  fi
+                  case " $RELEASE " in
+                    *" $id "*)
+                      printf 'ids=%s\npack=%s\nany=true\ntag=%s\n' "$id" "$id" "$tag" >> "$GITHUB_OUTPUT"
+                      exit 0
+                      ;;
+                  esac
+                  echo "::error::tag $tag names $id, which is not in RELEASE_ADDONS: nothing is built or released" >&2
+                  printf 'ids=\npack=\nany=false\ntag=\n' >> "$GITHUB_OUTPUT"
+                  exit 1
+                  ;;
+              esac
+              # The old shape: a version tag, one release with every releasable
+              # addon in it. Any other tag (the catalogue's own `store`, the
+              # compatibility `latest`) releases nothing.
+              if [[ "$tag" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+                printf 'ids=%s\npack=%s\nany=true\ntag=%s\n' "$RELEASE" "$RELEASE" "$tag" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              printf 'ids=\npack=\nany=false\ntag=\n' >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          if [ "$EVENT" = "workflow_dispatch" ] && [ -n "$DISPATCH" ]; then
+            pack=""
+            for id in $DISPATCH; do
+              case " $RELEASE " in
+                *" $id "*) pack="$pack $id" ;;
+              esac
+            done
+            printf 'ids=%s\npack=%s\nany=true\ntag=\n' "$DISPATCH" "$pack" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            python3 tools/changed_addons.py --all --release "$RELEASE" --github-output "$GITHUB_OUTPUT"
+            printf 'tag=\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          base="$BEFORE"
+          if [ "$EVENT" = "pull_request" ]; then
+            base="$PR_BASE"
+          fi
+          python3 tools/changed_addons.py --base "$base" --head "$GITHUB_SHA" --release "$RELEASE" \
+            --github-output "$GITHUB_OUTPUT"
+          printf 'tag=\n' >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: changes
+    if: needs.changes.outputs.any == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -82,16 +199,24 @@ jobs:
       - name: LVGL
         run: make lvgl
 
-      - name: Build the whitelist
-        run: make target
+      - name: Build what changed
+        env:
+          IDS: ${{ needs.changes.outputs.ids }}
+        run: make target ADDON_IDS="$IDS"
 
       - name: ABI check (nothing newer than glibc 2.16)
         run: make check-abi
 
-      - name: Pack
-        run: make pack
+      # Packing is the release gate: an addon outside RELEASE_ADDONS compiles
+      # above and is then left out of the card folder and of every release.
+      - name: Pack what may be released
+        if: needs.changes.outputs.pack != ''
+        env:
+          PACK: ${{ needs.changes.outputs.pack }}
+        run: make pack ADDON_IDS="$PACK"
 
       - name: Upload the card folder
+        if: needs.changes.outputs.pack != ''
         uses: actions/upload-artifact@v4
         with:
           name: addons
@@ -102,33 +227,92 @@ jobs:
       # already produced exactly what belongs in <card>/Addons/<id>/, so the
       # archive is that folder's contents and nothing else. Unzip it into
       # <card>/Addons/<id>/ -- the addon.json, the .so, the icon, and assets/
-      # where an addon has one.
-      - name: Zip each addon
-        if: startsWith(github.ref, 'refs/tags/')
+      # where an addon has one. Next to it goes <id>.json, the fragment the
+      # store's catalogue is built from.
+      #
+      # A per-addon tag also pins the version: what is in addon.json must be the
+      # number in the tag, so the catalogue, the release and the card agree.
+      - name: Zip and metadata
+        if: needs.changes.outputs.tag != ''
+        env:
+          PACK: ${{ needs.changes.outputs.pack }}
+          TAG: ${{ needs.changes.outputs.tag }}
         run: |
-          mkdir -p release
-          for dir in build/Addons/*/; do
-            id="$(basename "$dir")"
-            # python3 -m zipfile rather than zip(1): the module puts the names
-            # at the root of the archive as they are, and python3 is a
-            # dependency of this repository's tools already.
-            ( cd "$dir" && python3 -m zipfile -c "$GITHUB_WORKSPACE/release/$id.zip" . )
-            [ -s "release/$id.zip" ] || { echo "release: $id.zip is empty" >&2; exit 1; }
-            echo "release/$id.zip:"
-            python3 -m zipfile -l "release/$id.zip"
-          done
+          set -eu
+          case "$TAG" in
+            *-v*) version="${TAG##*-v}" ;;
+            *) version="" ;;
+          esac
+          if [ -n "$version" ]; then
+            python3 tools/release_zip.py --build build/Addons --out build/release --ids "$PACK" \
+              --expect-version "$version"
+          else
+            python3 tools/release_zip.py --build build/Addons --out build/release --ids "$PACK"
+          fi
+
+      - name: Upload the release files
+        if: needs.changes.outputs.tag != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: build/release
+          if-no-files-found: error
 
       # The tag is what the release is called, and re-running the same tag
       # replaces the files rather than failing on "already exists".
       - name: Publish the release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: needs.changes.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.changes.outputs.tag }}
+        run: |
+          set -eu
+          test -n "$(ls build/release/*.zip 2>/dev/null)"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" build/release/*.zip build/release/*.json --clobber
+          else
+            gh release create "$TAG" build/release/*.zip build/release/*.json \
+              --title "$TAG" --generate-notes
+          fi
+
+  # One catalogue for every repository that publishes releases in this shape.
+  # It reads the release list, takes the newest version of each addon, and puts
+  # index.json into the `store` release; the addon fetches that file directly.
+  index:
+    needs: [changes, build]
+    if: |
+      always() &&
+      (needs.changes.outputs.tag != '' || inputs.index) &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ubuntu-latest
+    concurrency: addon-index
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and publish the catalogue
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          tag="$GITHUB_REF_NAME"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" release/*.zip --clobber
-          else
-            gh release create "$tag" release/*.zip \
-              --title "$tag" --generate-notes
-          fi
+          python3 tools/publish_index.py --repo "$GITHUB_REPOSITORY" --out build/index.json --publish
+
+  # Old store builds (0.0.x) read the single newest release and treat its .zip
+  # assets as the catalogue, so per-addon tags leave them with one addon. This
+  # release is a copy of the current archives, recreated last so it is the
+  # newest one; the files are uploaded byte for byte and keep their size and
+  # sha256, so a client that is already current is not offered an update.
+  # Nothing is rebuilt -- only transferred. Turn it off with the repository
+  # variable ROLLING_RELEASE=off.
+  latest:
+    needs: [changes, build, index]
+    if: |
+      always() &&
+      (needs.changes.outputs.tag != '' || inputs.index) &&
+      needs.build.result == 'success' && needs.index.result == 'success' &&
+      vars.ROLLING_RELEASE != 'off'
+    runs-on: ubuntu-latest
+    concurrency: addon-index
+    steps:
+      - uses: actions/checkout@v4
+      - name: Copy every current archive into the newest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/rolling_release.py --repo "$GITHUB_REPOSITORY" --publish

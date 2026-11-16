@@ -17,6 +17,7 @@
 #include "src/gui/nowplaying/player.h"
 #include "src/gui/shell/confirm.h"
 #include "src/gui/shell/gui.h"
+#include "src/gui/shell/keyboard.h"
 #include "src/gui/shell/scale.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/switcher.h"
@@ -64,6 +65,7 @@ typedef enum {
 	JOB_REFRESH,
 	JOB_INSTALL,
 	JOB_README,
+	JOB_UPDATE_ALL,
 } job_kind_t;
 
 typedef struct {
@@ -71,9 +73,32 @@ typedef struct {
 } row_ref_t;
 
 typedef struct {
+	char repo[AS_REPO_MAX];
+} repo_ref_t;
+
+typedef struct {
 	int count;
 	as_release_t rel[AS_MAX];
 } refresh_result_t;
+
+// What "Update all" did, per addon. The worker only fills this; the records
+// are written on the UI thread, because installed.tsv is the page's own file.
+typedef struct {
+	char id[AS_ID_MAX];
+	bool ok;
+	char version[AS_VERSION_MAX];
+	char error[AS_ERROR_MAX];
+} update_result_t;
+
+typedef struct {
+	int count;
+	update_result_t item[AS_MAX];
+} update_result_set_t;
+
+typedef enum {
+	ENTRY_SEARCH = 0,
+	ENTRY_REPO,
+} entry_mode_t;
 
 static const sonix_addon_host_t *host;
 static gui_config_t *cfg;
@@ -90,10 +115,21 @@ static lv_obj_t *detail_status;
 static lv_obj_t *readme_screen;
 static lv_obj_t *readme_container;
 static lv_obj_t *readme_title;
+static lv_obj_t *repos_screen;
+static lv_obj_t *repos_container;
+static lv_obj_t *repos_status;
+static lv_obj_t *entry_screen;
+static lv_obj_t *entry_field;
+static lv_obj_t *entry_title;
+static keyboard_t *entry_kb;
+static entry_mode_t entry_mode;
 
 static row_ref_t rows[AS_MAX];
 static int row_count;
+static repo_ref_t repo_rows[AS_REPOS_MAX];
+static int repo_row_count;
 static char detail_id[AS_ID_MAX];
+static char query[AS_QUERY_MAX];
 
 // The job, and the one lock between the worker and the UI thread. The worker
 // fills `job_*` and sets job_done last; the poll timer reads them after that.
@@ -109,6 +145,16 @@ static char job_error[AS_ERROR_MAX];
 static char job_version[AS_VERSION_MAX];
 static as_release_t job_release;
 static refresh_result_t *job_refresh;
+static update_result_set_t *job_updates;
+static char job_step_id[AS_ID_MAX]; // the addon the update-all worker is on
+static int job_step;
+static int job_steps;
+
+// The "Update all" plan, made on the UI thread and walked by the worker: ids
+// only, resolved against the (unchanged while busy) cache, so this costs a few
+// kilobytes rather than a copy of every release.
+static char update_plan[AS_MAX][AS_ID_MAX];
+static int update_plan_count;
 
 static lv_timer_t *poll_timer;
 static bool busy; // UI thread only: a job is running and the timer is awake
@@ -264,12 +310,19 @@ static void *refresh_worker(void *unused) {
 		}
 	}
 	// A published file that has not changed keeps what its manifest said last
-	// time: the cache is the whole point of not downloading it again.
+	// time: the cache is the whole point of not downloading it again. An entry
+	// that came from the repository's index already has all of it.
 	for (int j = 0; j < result->count; j++) {
+		if (result->rel[j].listed) {
+			continue;
+		}
 		const as_release_t *old = as_release_find(&model, result->rel[j].id);
 		if (old && old->size == result->rel[j].size && strcmp(old->digest, result->rel[j].digest) == 0) {
 			memcpy(result->rel[j].title, old->title, sizeof(result->rel[j].title));
 			memcpy(result->rel[j].section, old->section, sizeof(result->rel[j].section));
+			memcpy(result->rel[j].so_sha256, old->so_sha256, sizeof(result->rel[j].so_sha256));
+			result->rel[j].so_size = old->so_size;
+			memcpy(result->rel[j].version, old->version, sizeof(result->rel[j].version));
 		}
 	}
 
@@ -349,6 +402,59 @@ static void *readme_worker(void *unused) {
 	return NULL;
 }
 
+// Update all: the plan was made on the UI thread (update_plan) and this only
+// walks it. The store's own release is last -- its library is the one this page
+// is running from, and the others should land even if that one cannot.
+static void *update_all_worker(void *unused) {
+	(void)unused;
+	update_result_set_t *result = calloc(1, sizeof(*result));
+	if (!result) {
+		job_finish(false, "out of memory");
+		worker_ended();
+		return NULL;
+	}
+	char first_error[AS_ERROR_MAX] = "";
+	pthread_mutex_lock(&job_lock);
+	job_steps = update_plan_count;
+	job_step = 0;
+	pthread_mutex_unlock(&job_lock);
+
+	for (int i = 0; i < update_plan_count && !progress.stop; i++) {
+		const as_release_t *release = as_release_find(&model, update_plan[i]);
+		if (!release) {
+			continue;
+		}
+		pthread_mutex_lock(&job_lock);
+		job_step = i;
+		lv_snprintf(job_step_id, sizeof(job_step_id), "%s", release->id);
+		pthread_mutex_unlock(&job_lock);
+
+		update_result_t *r = &result->item[result->count];
+		memset(r, 0, sizeof(*r));
+		lv_snprintf(r->id, sizeof(r->id), "%s", release->id);
+		char error[AS_ERROR_MAX] = "";
+		r->ok = as_install(&model, release, &progress, r->version, sizeof(r->version), error, sizeof(error));
+		if (!r->ok) {
+			lv_snprintf(r->error, sizeof(r->error), "%s", error);
+			if (!first_error[0]) {
+				lv_snprintf(first_error, sizeof(first_error), "%s: %s", r->id, error);
+			}
+		}
+		result->count++;
+		printf("addonstore: update-all %s %s%s%s\n", r->id, r->ok ? "ok" : "failed", error[0] ? ": " : "", error);
+	}
+
+	pthread_mutex_lock(&job_lock);
+	job_updates = result;
+	job_step = update_plan_count;
+	job_ok = !progress.stop && result->count > 0;
+	lv_snprintf(job_error, sizeof(job_error), "%s", progress.stop ? "cancelled" : first_error);
+	job_done = true;
+	pthread_mutex_unlock(&job_lock);
+	worker_ended();
+	return NULL;
+}
+
 static bool job_start(job_kind_t kind, const as_release_t *release) {
 	if (busy || stopping) {
 		return false;
@@ -360,6 +466,10 @@ static bool job_start(job_kind_t kind, const as_release_t *release) {
 	job_error[0] = '\0';
 	job_version[0] = '\0';
 	job_refresh = NULL;
+	job_updates = NULL;
+	job_step = 0;
+	job_steps = 0;
+	job_step_id[0] = '\0';
 	if (release) {
 		job_release = *release;
 	} else {
@@ -371,7 +481,14 @@ static bool job_start(job_kind_t kind, const as_release_t *release) {
 	job_reading = false;
 	pthread_mutex_unlock(&job_lock);
 
-	void *(*fn)(void *) = kind == JOB_REFRESH ? refresh_worker : kind == JOB_INSTALL ? install_worker : readme_worker;
+	void *(*fn)(void *) = refresh_worker;
+	if (kind == JOB_INSTALL) {
+		fn = install_worker;
+	} else if (kind == JOB_README) {
+		fn = readme_worker;
+	} else if (kind == JOB_UPDATE_ALL) {
+		fn = update_all_worker;
+	}
 	worker_started();
 	pthread_t thread;
 	if (pthread_create(&thread, NULL, fn, NULL) != 0) {
@@ -447,6 +564,7 @@ static lv_obj_t *status_label(lv_obj_t *parent) {
 
 // What the row's value says, and whether it is worth the accent colour.
 static const char *row_value(const char *id, bool *highlight) {
+	static char version[AS_VERSION_MAX];
 	const as_installed_t *inst = as_installed_find(&model, id);
 	const as_release_t *rel = as_release_find(&model, id);
 	*highlight = false;
@@ -455,7 +573,11 @@ static const char *row_value(const char *id, bool *highlight) {
 		return t("update", "обновить");
 	}
 	if (inst) {
-		return inst->version[0] ? inst->version : t("installed", "установлен");
+		// The record's version, not the manifest's: an update keeps addon.json
+		// as it is, so the file on the card would still say what it said when
+		// the folder was first copied there.
+		as_installed_version(&model, id, version, sizeof(version));
+		return version[0] ? version : t("installed", "установлен");
 	}
 	if (rel) {
 		*highlight = true;
@@ -466,6 +588,10 @@ static const char *row_value(const char *id, bool *highlight) {
 
 static void open_detail(const char *id);
 static void open_readme_page(const char *id);
+static void build_list(void);
+static void build_repos(void);
+static void entry_open(entry_mode_t mode);
+static void set_refresh_status(const char *text);
 
 static void row_cb(lv_event_t *e) {
 	row_ref_t *ref = lv_event_get_user_data(e);
@@ -480,8 +606,102 @@ static void refresh_cb(lv_event_t *e) {
 		return;
 	}
 	if (job_start(JOB_REFRESH, NULL)) {
-		set_status(list_status, t("asking GitHub…", "запрашиваю GitHub…"));
+		set_refresh_status(t("asking GitHub…", "запрашиваю GitHub…"));
 	}
+}
+
+static void clear_query_cb(lv_event_t *e) {
+	(void)e;
+	query[0] = '\0';
+	build_list();
+}
+
+static void search_cb(lv_event_t *e) {
+	(void)e;
+	entry_open(ENTRY_SEARCH);
+}
+
+static void repos_cb(lv_event_t *e) {
+	(void)e;
+	build_repos();
+	if (repos_screen) {
+		switch_screen(repos_screen);
+	}
+}
+
+static void add_repo_cb(lv_event_t *e) {
+	(void)e;
+	entry_open(ENTRY_REPO);
+}
+
+static void repos_refresh_cb(lv_event_t *e) {
+	(void)e;
+	if (busy) {
+		return;
+	}
+	if (job_start(JOB_REFRESH, NULL)) {
+		set_refresh_status(t("asking GitHub…", "запрашиваю GitHub…"));
+	}
+}
+
+// How many released addons are newer than the card. Cheap now that the card's
+// libraries are fingerprinted once (as_local_sha), and it is what the "Update
+// all" row counts.
+static int updates_available(void) {
+	int count = 0;
+	for (int i = 0; i < model.release_count; i++) {
+		if (as_update_available(&model, model.release[i].id)) {
+			count++;
+		}
+	}
+	return count;
+}
+
+static void update_all_confirmed(void *user) {
+	(void)user;
+	if (busy || update_plan_count == 0) {
+		return;
+	}
+	if (job_start(JOB_UPDATE_ALL, NULL)) {
+		char line[64];
+		lv_snprintf(line, sizeof(line), t("updating %d…", "обновляю %d…"), update_plan_count);
+		set_status(list_status, line);
+	}
+}
+
+static void update_all_cb(lv_event_t *e) {
+	(void)e;
+	if (busy) {
+		toast_error(t("another job is running", "уже идёт другая задача"));
+		return;
+	}
+	// The plan is made here, on the UI thread: two passes so the store's own
+	// release is last, then one confirmation for the whole batch.
+	update_plan_count = 0;
+	for (int pass = 0; pass < 2; pass++) {
+		for (int i = 0; i < model.release_count && update_plan_count < AS_MAX; i++) {
+			const char *id = model.release[i].id;
+			bool own = addon_id && strcmp(id, addon_id) == 0;
+			if (own != (pass == 1)) {
+				continue;
+			}
+			if (!as_update_available(&model, id)) {
+				continue;
+			}
+			lv_snprintf(update_plan[update_plan_count++], AS_ID_MAX, "%s", id);
+		}
+	}
+	if (update_plan_count == 0) {
+		toast_plain(t("everything is up to date", "всё актуально"));
+		return;
+	}
+	char message[200];
+	lv_snprintf(message, sizeof(message),
+				t("%d addon(s) will be downloaded and replaced. Settings, tokens and saves stay.",
+				  "%d аддон(ов) будут скачаны и заменены. Настройки, токены и сохранения останутся."),
+				update_plan_count);
+	confirm_show(t("Update everything?", "Обновить всё?"), message, t("update", "обновить"), update_all_confirmed,
+				 NULL);
 }
 
 static void build_list(void) {
@@ -491,9 +711,20 @@ static void build_list(void) {
 	lv_obj_clean(list_container);
 	row_count = 0;
 
-	lv_obj_t *refresh = settingsrow_action(list_container, t("Check for updates", "Проверить обновления"),
-										   refresh_cb, NULL);
-	(void)refresh;
+	settingsrow_action(list_container, t("Search", "Поиск"), search_cb, NULL);
+	int updates = updates_available();
+	if (updates > 0) {
+		char label[64];
+		lv_snprintf(label, sizeof(label), t("Update all (%d)", "Обновить всё (%d)"), updates);
+		settingsrow_action(list_container, label, update_all_cb, NULL);
+	}
+	settingsrow_action(list_container, t("Repositories", "Репозитории"), repos_cb, NULL);
+	settingsrow_action(list_container, t("Check for updates", "Проверить обновления"), refresh_cb, NULL);
+	if (query[0]) {
+		char label[AS_QUERY_MAX + 40];
+		lv_snprintf(label, sizeof(label), t("Clear search: %s", "Сбросить поиск: %s"), query);
+		settingsrow_action(list_container, label, clear_query_cb, NULL);
+	}
 
 	// The union of what is installed and what is published, by id.
 	char ids[AS_MAX][AS_ID_MAX];
@@ -525,10 +756,15 @@ static void build_list(void) {
 		}
 	}
 
+	int shown = 0;
 	for (int s = 0; s < SECTION_COUNT; s++) {
 		bool header = false;
 		for (int i = 0; i < count; i++) {
 			if (strcmp(section_of(ids[i]), sections[s].key) != 0) {
+				continue;
+			}
+			const char *title = title_of(ids[i], a, sizeof(a));
+			if (!as_matches(ids[i], title, query)) {
 				continue;
 			}
 			if (!header) {
@@ -540,17 +776,21 @@ static void build_list(void) {
 			bool highlight = false;
 			const char *status = row_value(ids[i], &highlight);
 			lv_obj_t *value = NULL;
-			settingsrow_add(list_container, title_of(ids[i], a, sizeof(a)), &value, row_cb, ref);
+			settingsrow_add(list_container, title, &value, row_cb, ref);
 			if (value) {
 				lv_label_set_text(value, status);
 				if (highlight) {
 					lv_obj_set_style_text_color(value, theme()->accent, 0);
 				}
 			}
+			shown++;
 		}
 	}
 
 	list_status = status_label(list_container);
+	if (query[0] && shown == 0) {
+		set_status(list_status, t("nothing matches", "ничего не нашлось"));
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -622,7 +862,9 @@ static void open_detail(const char *id) {
 	lv_obj_t *value = NULL;
 	settingsrow_add(detail_container, t("on the card", "на карте"), &value, NULL, NULL);
 	if (value) {
-		lv_label_set_text(value, inst ? (inst->version[0] ? inst->version : t("yes", "есть")) : t("no", "нет"));
+		char shown[AS_VERSION_MAX];
+		as_installed_version(&model, id, shown, sizeof(shown));
+		lv_label_set_text(value, inst ? (shown[0] ? shown : t("yes", "есть")) : t("no", "нет"));
 	}
 	settingsrow_add(detail_container, t("in the release", "в релизе"), &value, NULL, NULL);
 	if (value) {
@@ -715,6 +957,138 @@ static void open_readme_page(const char *id) {
 }
 
 // ---------------------------------------------------------------------------
+// Repositories, and the one text field both "search" and "add a repository" use
+// ---------------------------------------------------------------------------
+
+static char pending_repo[AS_REPO_MAX];
+
+// A refresh can be started from either page and finishes while either one is
+// open, so its sentence goes to both.
+static void set_refresh_status(const char *text) {
+	set_status(list_status, text);
+	set_status(repos_status, text);
+}
+
+static void repo_removed(void *user) {
+	const char *name = user;
+	for (int i = 0; i < model.repo_count; i++) {
+		if (strcmp(model.repo[i], name) == 0) {
+			as_repos_remove(&model, i);
+			break;
+		}
+	}
+	printf("addonstore: repo %s removed\n", name);
+	build_repos();
+	build_list();
+	if (!busy && job_start(JOB_REFRESH, NULL)) {
+		set_refresh_status(t("asking GitHub…", "запрашиваю GitHub…"));
+	}
+}
+
+static void repo_row_cb(lv_event_t *e) {
+	repo_ref_t *ref = lv_event_get_user_data(e);
+	if (!ref || !ref->repo[0]) {
+		return;
+	}
+	lv_snprintf(pending_repo, sizeof(pending_repo), "%s", ref->repo);
+	char message[200];
+	lv_snprintf(message, sizeof(message),
+				t("Its addons stay on the card; only this repository stops being read.",
+				  "Его аддоны останутся на карте, читаться перестанет только этот репозиторий."));
+	confirm_show(t("Stop reading this repository?", "Больше не читать этот репозиторий?"), message,
+				 t("remove", "удалить"), repo_removed, pending_repo);
+}
+
+static void build_repos(void) {
+	if (!repos_container) {
+		return;
+	}
+	lv_obj_clean(repos_container);
+	repo_row_count = 0;
+	for (int i = 0; i < model.repo_count && repo_row_count < AS_REPOS_MAX; i++) {
+		repo_ref_t *ref = &repo_rows[repo_row_count++];
+		lv_snprintf(ref->repo, sizeof(ref->repo), "%s", model.repo[i]);
+		lv_obj_t *value = NULL;
+		settingsrow_add(repos_container, model.repo[i], &value, repo_row_cb, ref);
+		if (value) {
+			lv_label_set_text(value, t("remove", "удалить"));
+		}
+	}
+	settingsrow_action(repos_container, t("Add repository", "Добавить репозиторий"), add_repo_cb, NULL);
+	settingsrow_action(repos_container, t("Check for updates", "Проверить обновления"), repos_refresh_cb, NULL);
+	repos_status = status_label(repos_container);
+}
+
+// The field is shared: "search" and "add a repository" differ in the title, the
+// placeholder and what accept does, not in the screen or the keyboard, and this
+// device cannot afford a keyboard per page.
+static void entry_open(entry_mode_t mode) {
+	entry_mode = mode;
+	if (!entry_screen) {
+		return;
+	}
+	lv_label_set_text(entry_title,
+					  mode == ENTRY_SEARCH ? t("Search", "Поиск") : t("Add repository", "Добавить репозиторий"));
+	lv_textarea_set_placeholder_text(entry_field, mode == ENTRY_SEARCH ? t("name or id", "имя или id")
+																	   : t("owner/name", "владелец/имя"));
+	lv_textarea_set_text(entry_field, mode == ENTRY_SEARCH ? query : "");
+	keyboard_reset(entry_kb);
+	keyboard_set_visible(entry_kb, true);
+	switch_screen(entry_screen);
+}
+
+static void trim_text(char *s) {
+	char *p = s;
+	while (*p == ' ') {
+		p++;
+	}
+	if (p != s) {
+		memmove(s, p, strlen(p) + 1);
+	}
+	size_t len = strlen(s);
+	while (len > 0 && s[len - 1] == ' ') {
+		s[--len] = '\0';
+	}
+}
+
+static void entry_accept_cb(lv_event_t *e) {
+	(void)e;
+	if (!entry_field) {
+		return;
+	}
+	char text[AS_URL_MAX];
+	lv_snprintf(text, sizeof(text), "%s", lv_textarea_get_text(entry_field));
+	trim_text(text);
+	if (entry_mode == ENTRY_SEARCH) {
+		lv_snprintf(query, sizeof(query), "%s", text);
+		keyboard_set_visible(entry_kb, false);
+		build_list();
+		if (list_screen) {
+			switch_screen(list_screen);
+		}
+		return;
+	}
+	if (busy) {
+		toast_error(t("another job is running", "уже идёт другая задача"));
+		return;
+	}
+	if (!as_repos_add(&model, text)) {
+		toast_error(t("that is not owner/name", "это не owner/name"));
+		return;
+	}
+	printf("addonstore: repo %s added\n", text);
+	lv_textarea_set_text(entry_field, "");
+	keyboard_set_visible(entry_kb, false);
+	build_repos();
+	if (repos_screen) {
+		switch_screen(repos_screen);
+	}
+	if (!busy && job_start(JOB_REFRESH, NULL)) {
+		set_refresh_status(t("asking GitHub…", "запрашиваю GitHub…"));
+	}
+}
+
+// ---------------------------------------------------------------------------
 // What the page does
 // ---------------------------------------------------------------------------
 
@@ -741,7 +1115,7 @@ static void list_loaded_cb(lv_event_t *e) {
 	as_scan_installed(&model);
 	build_list();
 	if (!busy && !refreshed_this_session && job_start(JOB_REFRESH, NULL)) {
-		set_status(list_status, t("asking GitHub…", "запрашиваю GitHub…"));
+		set_refresh_status(t("asking GitHub…", "запрашиваю GitHub…"));
 	}
 }
 
@@ -751,8 +1125,24 @@ static void poll_cb(lv_timer_t *timer) {
 		return;
 	}
 
-	char line[96];
-	if (progress.total > 0) {
+	char line[128];
+	if (job_kind == JOB_UPDATE_ALL) {
+		int step = job_step + 1;
+		if (step > job_steps) {
+			step = job_steps;
+		}
+		if (progress.total > 0) {
+			long percent = progress.done * 100 / progress.total;
+			if (percent > 100) {
+				percent = 100;
+			}
+			lv_snprintf(line, sizeof(line), t("%d/%d %s %ld%%", "%d/%d %s %ld%%"), step, job_steps, job_step_id,
+						percent);
+		} else {
+			lv_snprintf(line, sizeof(line), t("%d/%d %s", "%d/%d %s"), step, job_steps, job_step_id);
+		}
+		set_status(list_status, line);
+	} else if (progress.total > 0) {
 		long percent = progress.done * 100 / progress.total;
 		if (percent > 100) {
 			percent = 100;
@@ -761,14 +1151,13 @@ static void poll_cb(lv_timer_t *timer) {
 					job_kind == JOB_REFRESH ? t("asking GitHub…", "запрашиваю GitHub…")
 											: t("downloading", "скачиваю"),
 					percent);
+		set_status(job_kind == JOB_REFRESH ? list_status : detail_status, line);
 	} else if (job_kind == JOB_REFRESH) {
-		lv_snprintf(line, sizeof(line), "%s",
-					job_reading ? t("reading the releases…", "читаю релизы…")
-								: t("asking GitHub…", "запрашиваю GitHub…"));
+		set_refresh_status(job_reading ? t("reading the releases…", "читаю релизы…")
+									   : t("asking GitHub…", "запрашиваю GitHub…"));
 	} else {
-		lv_snprintf(line, sizeof(line), "%s", t("working…", "работаю…"));
+		set_status(detail_status, t("working…", "работаю…"));
 	}
-	set_status(job_kind == JOB_REFRESH ? list_status : detail_status, line);
 
 	bool done;
 	pthread_mutex_lock(&job_lock);
@@ -787,6 +1176,8 @@ static void poll_cb(lv_timer_t *timer) {
 	lv_snprintf(version, sizeof(version), "%s", job_version);
 	refresh_result_t *fresh = job_refresh;
 	job_refresh = NULL;
+	update_result_set_t *updates = job_updates;
+	job_updates = NULL;
 	as_release_t release = job_release;
 	job_kind = JOB_NONE;
 	pthread_mutex_unlock(&job_lock);
@@ -811,9 +1202,59 @@ static void poll_cb(lv_timer_t *timer) {
 		fresh = NULL;
 		refreshed_this_session = true;
 		build_list();
-		set_status(list_status, ok ? "" : error);
+		set_refresh_status(ok ? "" : error);
 		if (!ok && error[0]) {
 			toast_error(error);
+		}
+		return;
+	}
+
+	if (kind == JOB_UPDATE_ALL) {
+		int updated = 0;
+		int failed = 0;
+		char first_error[AS_ERROR_MAX] = "";
+		if (updates) {
+			for (int i = 0; i < updates->count; i++) {
+				update_result_t *r = &updates->item[i];
+				if (!r->ok) {
+					failed++;
+					if (!first_error[0]) {
+						lv_snprintf(first_error, sizeof(first_error), "%s", r->error);
+					}
+					continue;
+				}
+				const as_release_t *rel = as_release_find(&model, r->id);
+				if (rel) {
+					as_record_t rec;
+					memset(&rec, 0, sizeof(rec));
+					lv_snprintf(rec.id, sizeof(rec.id), "%s", rel->id);
+					lv_snprintf(rec.repo, sizeof(rec.repo), "%s", rel->repo);
+					lv_snprintf(rec.tag, sizeof(rec.tag), "%s", rel->tag);
+					lv_snprintf(rec.asset, sizeof(rec.asset), "%s", rel->asset);
+					rec.size = rel->size;
+					lv_snprintf(rec.digest, sizeof(rec.digest), "%s", rel->digest);
+					lv_snprintf(rec.version, sizeof(rec.version), "%s", r->version);
+					as_record_put(&model, &rec);
+				}
+				updated++;
+			}
+			free(updates);
+			updates = NULL;
+		}
+		as_scan_installed(&model);
+		build_list();
+		char summary[160];
+		if (failed > 0) {
+			lv_snprintf(summary, sizeof(summary), t("%d updated, %d failed: %s", "%d обновлено, %d с ошибкой: %s"),
+						updated, failed, first_error);
+			set_status(list_status, summary);
+			toast_error(first_error[0] ? first_error : t("some updates failed", "часть обновлений не удалась"));
+		} else {
+			lv_snprintf(summary, sizeof(summary), t("%d updated", "%d обновлено"), updated);
+			set_status(list_status, summary);
+			if (updated > 0) {
+				toast_success(summary);
+			}
 		}
 		return;
 	}
@@ -871,6 +1312,10 @@ static lv_obj_t *store_init(const sonix_addon_host_t *h) {
 	job_done = false;
 	job_ok = false;
 	job_refresh = NULL;
+	job_updates = NULL;
+	job_step = 0;
+	job_steps = 0;
+	job_step_id[0] = '\0';
 	busy = false;
 	refreshed_this_session = false;
 	memset(&progress, 0, sizeof(progress));
@@ -879,6 +1324,9 @@ static lv_obj_t *store_init(const sonix_addon_host_t *h) {
 	host = h;
 	cfg = h->cfg;
 	addon_id = h->id;
+	query[0] = '\0';
+	update_plan_count = 0;
+	entry_mode = ENTRY_SEARCH;
 
 	char cache[512];
 	addon_cache_dir(h, cache, sizeof(cache));
@@ -886,9 +1334,10 @@ static lv_obj_t *store_init(const sonix_addon_host_t *h) {
 	as_repos_load(&model);
 	as_cache_load(&model);
 	as_records_load(&model);
+	as_local_load(&model);
 	as_scan_installed(&model);
-	printf("addonstore: %d repo(s), %d installed, %d release entries, cache %s\n", model.repo_count,
-		   model.installed_count, model.release_count, cache);
+	printf("addonstore: %d repo(s), %d installed, %d release entries, %d fingerprint(s), cache %s\n",
+		   model.repo_count, model.installed_count, model.release_count, model.local_count, cache);
 
 	list_screen = lv_obj_create(NULL);
 	sonix_addon_own_screen(addon_id, list_screen);
@@ -917,6 +1366,36 @@ static lv_obj_t *store_init(const sonix_addon_host_t *h) {
 	readme_screen = lv_obj_create(NULL);
 	sonix_addon_own_screen(addon_id, readme_screen);
 	readme_container = scrolling_page(readme_screen, "README", &readme_title);
+
+	repos_screen = lv_obj_create(NULL);
+	sonix_addon_own_screen(addon_id, repos_screen);
+	repos_container = scrolling_page(repos_screen, t("Repositories", "Репозитории"), NULL);
+	build_repos();
+
+	// One field, one keyboard: "Search" and "Add repository" share them. The
+	// keyboard is the largest object in this addon, and a second one would cost
+	// more RAM than this device has spare.
+	entry_screen = lv_obj_create(NULL);
+	sonix_addon_own_screen(addon_id, entry_screen);
+	lv_obj_add_style(entry_screen, &theme_style_screen, 0);
+	entry_title = settingsrow_title(entry_screen, cfg, t("Search", "Поиск"));
+	int entry_top = settingsrow_content_top(cfg);
+	entry_field = lv_textarea_create(entry_screen);
+	lv_textarea_set_one_line(entry_field, true);
+	lv_textarea_set_placeholder_text(entry_field, t("name or id", "имя или id"));
+	lv_obj_set_size(entry_field, cfg->screen_width - 2 * cfg->padding, SC(64));
+	lv_obj_align(entry_field, LV_ALIGN_TOP_LEFT, cfg->padding, entry_top);
+	lv_obj_set_scrollbar_mode(entry_field, LV_SCROLLBAR_MODE_OFF);
+	lv_obj_add_style(entry_field, &theme_style_card, 0);
+	lv_obj_set_style_radius(entry_field, SC(12), 0);
+	lv_obj_set_style_border_width(entry_field, 0, 0);
+	lv_obj_set_style_shadow_width(entry_field, 0, 0);
+	lv_obj_set_style_pad_all(entry_field, SC(14), 0);
+	lv_obj_set_style_text_font(entry_field, &font_ui_24, 0);
+	keyboard_style_caret(entry_field);
+	entry_kb = keyboard_create(entry_screen, cfg->screen_width, SC(316), entry_field, NULL, "ok", entry_accept_cb,
+							   NULL);
+	switcher_attach_back_gesture(entry_screen);
 
 	build_list();
 	poll_timer = lv_timer_create(poll_cb, POLL_MS, NULL);
@@ -948,8 +1427,11 @@ static bool store_stop(void) {
 	bool quiet = workers_live == 0;
 	refresh_result_t *fresh = job_refresh;
 	job_refresh = NULL;
+	update_result_set_t *updates = job_updates;
+	job_updates = NULL;
 	pthread_mutex_unlock(&job_lock);
 	free(fresh);
+	free(updates);
 
 	if (poll_timer) {
 		power_forget_timer(poll_timer);
@@ -965,6 +1447,12 @@ static bool store_stop(void) {
 	if (readme_screen) {
 		switcher_forget_screen(readme_screen);
 	}
+	if (repos_screen) {
+		switcher_forget_screen(repos_screen);
+	}
+	if (entry_screen) {
+		switcher_forget_screen(entry_screen);
+	}
 	list_screen = NULL;
 	list_container = NULL;
 	list_status = NULL;
@@ -975,9 +1463,21 @@ static bool store_stop(void) {
 	readme_screen = NULL;
 	readme_container = NULL;
 	readme_title = NULL;
+	repos_screen = NULL;
+	repos_container = NULL;
+	repos_status = NULL;
+	entry_screen = NULL;
+	entry_field = NULL;
+	entry_title = NULL;
+	entry_kb = NULL;
 	host = NULL;
 	cfg = NULL;
 	addon_id = NULL;
+	detail_id[0] = '\0';
+	query[0] = '\0';
+	update_plan_count = 0;
+	repo_row_count = 0;
+	row_count = 0;
 	detail_id[0] = '\0';
 	busy = false;
 	return quiet;

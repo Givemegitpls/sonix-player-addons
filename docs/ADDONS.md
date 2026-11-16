@@ -761,18 +761,20 @@ without an interpreter and a process boundary the device does not have.
 That is a property of the design, not an oversight: a card that carries an
 addon is a card you trust, exactly as a card that carries a firmware image is.
 
-## What is built, and what is not
+## What is built, and what is released
 
-The CI builds a whitelist, not everything that has an `addon.json`, and there is
-one reason for it: an addon that has never run on a device can be broken in ways
-no ABI check sees. The list is `ADDON_IDS` in `.github/workflows/addons.yml`, and
-this is the state behind it:
+Every addon with an `addon.json` compiles in CI when something it depends on
+changes — compiling it is how the tree is kept honest. What may be **packed or
+published** is a shorter, explicit list, `RELEASE_ADDONS` in
+`.github/workflows/addons.yml`: an addon that has never run on a device can be
+broken in ways no ABI check sees, and the artifact the CI hands out is not the
+place to find out. This is the state behind the list:
 
-| addon | built in CI | why |
+| addon | released | why |
 |---|---|---|
 | `subsonic`, `yandex`, `qobuz` | yes | used on a device; the pages, the sign-in and the caches were checked there |
 | `gearboy`, `flappybird`, `dino` | yes | games, checked on a device |
-| `hello` | yes | the example: it is the cheap compile that proves the SDK still compiles |
+| `hello` | no | the example: it compiles as the cheap check that proves the SDK still builds, and `PACK_EXCLUDE` keeps it out of every folder and archive |
 | `zvuk` | no | ported, never checked on a device — a state screen stands in for its page |
 | `tidal` | no | the device-code sign-in and playback were never checked on a device; `tidal/README.md` says what is unverified |
 | `spotify` | no | the C half builds, but the addon means nothing without its Rust engine, and the engine's session was never checked on a device |
@@ -780,9 +782,77 @@ this is the state behind it:
 | `cassette` | yes | a decorative page: it has run on a device, and what it adds to a build is a small `.so` and its sprites |
 | `addonstore` | yes | installed, updated and removed addons on a device (owner, 2026-11-16); its self-update is the same rename path |
 
-A plain `make` still builds all of them, and that is deliberate: a developer's
-machine is where the unverified ones are supposed to be tried. What the whitelist
-keeps out is the artifact — the folder `make pack` produces for somebody's card.
+A plain `make` builds all of them, and that is deliberate: a developer's machine
+is where the unverified ones are supposed to be tried. A tag cannot smuggle one
+into a release either — `zvuk-v0.1.0` fails the `changes` job with that sentence,
+because the id is not on the list.
+
+Only what a commit touches is built. `tools/changed_addons.py` turns the range
+(or the tag, or a dispatch input) into two lists: everything that changed is
+compiled, and the part of it that is in `RELEASE_ADDONS` is what gets packed. A
+change in `common/`, in the player submodule or in the `Makefile` means every
+addon, because those are compiled into all of them or decide how. A PR that
+touches one addon compiles one addon and nothing else; a docs-only push compiles
+nothing, and neither the artifact nor the release step runs.
+
+### Releasing an addon
+
+Each addon is released on its own tag, `<id>-v<major>.<minor>.<patch>`
+(`dino-v0.2.0`), so a change to one addon does not have to wait for a repository
+tag that names them all. On that tag the CI builds that addon, packs it, and
+publishes a release with two files:
+
+- `<id>.zip` — the addon folder's contents at the archive root, as always;
+- `<id>.json` — its metadata: title, section, version, the zip's size and
+  `sha256`, and the `sha256` of the `addon.so` inside it. Written by
+  `tools/release_zip.py`, which is also `make release` on a developer's machine.
+
+The version in the tag and the one in the addon's `addon.json` are the same
+number, and the CI checks it: `release_zip.py --expect-version` fails the job
+before anything is written if the file says something else. So a release is one
+commit — bump `"version"` in `<id>/addon.json`, then tag `<id>-v<that version>` —
+and a tag that does not match cannot produce a release. Locally the same check
+is `make release ADDON_IDS=<id> VERSION=<that version>`.
+
+After every release one more job rebuilds the store's catalogue: `index.json`,
+published in a release tagged **`store`** (`tools/publish_index.py`). It takes
+the newest version of each addon out of the releases, and the store fetches it
+straight from
+
+```
+https://github.com/<owner>/<name>/releases/download/store/index.json
+```
+
+which is why opening the store needs no API call and no zip download. A
+repository that never publishes a catalogue is read the old way — the API's
+hundred newest releases, newest per addon — so the file is an optimisation for
+its own repository and not a requirement of the format.
+
+**The copy for old clients.** Store builds released before per-addon tags read
+`releases?per_page=1` and treat that one release's `.zip` assets as the
+catalogue, so a per-addon tag leaves them with one addon and the `store` release
+leaves them with none. A job after the catalogue therefore copies the current
+archive of every addon into one release tagged **`latest`**, recreated last so it
+is the newest. Nothing is rebuilt or repacked: each file is downloaded from the
+release that publishes it and uploaded byte for byte, so its size and `sha256`
+are unchanged and a client that is already current is offered nothing — which is
+the point of copying rather than zipping again. The cost is the transfer (a few
+megabytes per release), not the build. The catalogue and the new store's API
+fallback both skip `store` and `latest`; the repository variable
+`ROLLING_RELEASE=off` stops the job.
+
+The old all-in-one tags (`0.0.7`) still work: they build every releasable addon
+and publish every zip beside its fragment, and the catalogue picks them up. What
+is new is only the granularity. Tags are made and pushed by hand (the agent-side
+policy forbids `git push`); the CI does no tagging of its own, so a version is
+never bumped by accident:
+
+```
+git tag dino-v0.2.0 && git push origin dino-v0.2.0
+```
+
+`workflow_dispatch` takes `addons` (space separated; empty means every addon)
+and `index` (rebuild the catalogue without releasing anything, for a repair).
 
 ## The addons in this tree
 
@@ -1494,44 +1564,74 @@ invalidated rectangle per frame, which is the hub's 60x60 when it is turning.
 ### addonstore
 
 `addonstore/` – the **Store**: what this card has, what a repository publishes,
-and one tap between them. Install, update, delete and read the README, from the device.
+and one tap between them. Install, update, update everything, delete, search and
+read the README, from the device.
+
+**The catalogue first.** A repository in this shape publishes `index.json` in a
+release tagged `store`, and that one file names every addon with its title,
+section, version, size, `sha256` of the zip and `sha256` of the `addon.so`
+inside it. The store requests it directly
+(`https://github.com/<repo>/releases/download/store/index.json`): no API call,
+no rate limit, and **no zip downloads** — which is what used to make the page
+slow, since it used to fetch every release archive just to read its manifest.
+A repository without a catalogue (or one whose file does not parse) falls back
+to the GitHub API: its hundred newest releases are read and the newest release
+that carries an addon is that addon's, so one tag per addon still lists them all
+— only the manifests then come out of the archives, the old slow way. A
+third-party repository with a single release works exactly as before. Both
+paths skip the `store` and `latest` tags: one is this catalogue, the other a
+copy of the real releases for older clients.
+
+How the catalogue is produced is under "Releasing an addon" below.
 
 The list is grouped the way the player is: **Music**, **Streaming**, **Wireless**,
 **More**, in that order, from each addon's own manifest `section`. A section the
 card and the releases have nothing for is not drawn at all, so a card with no
 wireless addon has no Wireless heading. A release whose manifest has not been
 read yet, or which names a section this player does not have, goes under
-**Other**. The section and the tile's name are read out of the release zip once
-per published file (digest) and cached in `cache/releases.tsv` with the rest of
-the list: that is a one-off download of the asset, and the download does not
-count against GitHub's API limit. Installed addons take their section from
-`Addons/<id>/addon.json`, so moving an addon between pages on the card moves it
-in the store too.
+**Other**. Installed addons take their section from `Addons/<id>/addon.json`, so
+moving an addon between pages on the card moves it in the store too.
 
-It reads the latest GitHub release of every repository named in
-`<card>/Addons/addonstore/repos.txt` (one `owner/name` per line; the file is
-written with `Givemegitpls/sonix-player-addons` on the first start) and offers
-each `.zip` asset in it as an addon. It is not a catalogue: the asset names are
-the addon ids, and a folder copied onto the card by hand shows up in the same
-list without a record.
+Above the rows: **Search** (a field and the shell's keyboard, filtering by title
+or id, ASCII and Russian case folded — `as_matches()`), **Update all (n)**
+(every addon with a newer release, in one confirmed batch, the store itself
+last), **Repositories** (the same `repos.txt`, edited from the device: add
+`owner/name`, remove one, both written back), and **Check for updates**.
+
+It reads every repository named in `<card>/Addons/addonstore/repos.txt` (one
+`owner/name` per line; the file is written with
+`Givemegitpls/sonix-player-addons` on the first start) and offers each addon the
+repository publishes. It is not a closed catalogue: a folder copied onto the
+card by hand shows up in the same list without a record.
 
 **What "update" means**, and it is two answers because the card can tell two
 things about itself:
 
 - **installed by the store** — the record in `installed.tsv` holds the asset's
-  size and `sha256:` from the API, and those cover **every file in the zip**.
-  The addon is out of date exactly when the latest release's asset is not the
-  recorded one. No card read, no download, and an assets-only release is caught.
-- **copied by hand** — there is no record, so the evidence is the code: the store
-  reads `addon.so` out of the release zip when it reads the manifest (once per
-  published digest, cached in `releases.tsv`) and compares its `sha256` with
+  size and `sha256:`, and those cover **every file in the zip**. The addon is out
+  of date exactly when the catalogue's file is not the recorded one. No card
+  read, no download, and an assets-only release is caught.
+- **copied by hand** — there is no record, so the evidence is the code: the
+  catalogue carries the `sha256` of the release's `addon.so` (`so_sha256`, or it
+  is read out of the zip the old way), and the store compares it with
   `Addons/<id>/addon.so`. Equal means `up to date`. The limit is honest: a
   release that changes only artwork and no code is not detected for a
-  hand-installed folder — the store has never seen that folder's contents, and
-  hashing every asset on every page build is not worth the card reads.
+  hand-installed folder — the store has never seen that folder's contents.
+
+Hashing the card is the other thing that made the page feel stuck: it asked
+"is this the release?" for every row on every rebuild, and a `.so` is a few
+hundred kilobytes off a slow card. `cache/local.tsv` keeps the `sha256` beside
+the size and mtime it was read with, so a stat that matches answers without
+touching the file (`as_local_sha()`).
 
 `version` strings are deliberately not compared: those are hand-written `0.1`s
 in every manifest and say nothing about a release.
+
+The version the page shows for an installed addon comes from `installed.tsv`,
+not from the folder's `addon.json`: an update never rewrites the manifest (it is
+the card's, and it may have been edited), so the file would keep saying whatever
+it said when the folder was first copied there. An addon installed by hand has
+no record and shows its manifest.
 
 **Installing** (`asinst.c`): the asset is downloaded into the store's own
 `cache/`, paced by `common/cardpace.h` at 1 MB/s like every other write to this
@@ -1581,9 +1681,9 @@ restart. Deleting itself stays refused: there would be nothing to open.
 update; a release that changes the manifest (a new section, order or title)
 therefore needs a fresh folder, because the manifest on the card is the user's.
 
-The store is released like every other addon: it is in the CI whitelist
-(`.github/workflows/addons.yml`), so a tag publishes `addonstore.zip` beside the
-rest. The first copy arrives the usual way — a zip unzipped into
+The store is released like every other addon, but on its own tag:
+`addonstore-v<version>` publishes `addonstore.zip` on its own, without waiting
+for the rest. The first copy arrives the usual way — a zip unzipped into
 `Addons/addonstore/` — and a store whose folder was copied by hand has no record
 for itself, so its own row reads **Update** like any other; once the card's library is the
 release's, the row says `up to date` instead.
@@ -1602,7 +1702,8 @@ exporting them would mean a firmware update to install an addon. So an install
 says "reinsert the card" and a delete says the tile goes at the next read.
 That is the one thing this addon cannot do for the user.
 
-**Network.** `https://api.github.com/repos/<repo>/releases?per_page=1`, with
+**Network.** The catalogue URL first (above), which is one GET and no API call.
+Without one: `https://api.github.com/repos/<repo>/releases?per_page=1`, with
 `Accept: application/vnd.github+json`; anonymous calls allow sixty an hour per
 address, so the parsed list is cached in `cache/releases.tsv` and refreshed at
 most once per open, or on "Check for updates". A 403 shows the API's own sentence
@@ -1617,10 +1718,13 @@ executing.
 
 `addonstore/tools/` holds the host checks, not part of the build: `test_zip.c`
 lists and extracts a zip (`7z` is the reference), `test_store.c` with
-`stub_net.c` runs the release parsing, install, README and removal against a
-fake card, and `run_store_test.sh` builds them. It verified `dino.zip` from
-release 0.0.6 byte for byte against `7z x`, a nested source archive, stored and
-deflated entries, a `../` entry being refused, and the real release JSON.
+`stub_net.c` runs the release parsing, the catalogue, search, repositories,
+install, update-all's parts, README and removal against a fake card, and
+`run_store_test.sh` builds them. It verified `dino.zip` from release 0.0.6 byte
+for byte against `7z x`, a nested source archive, stored and deflated entries, a
+`../` entry being refused, and the real release JSON. The catalogue is checked
+twice: parsed out of a literal, and fetched through the stubbed network to prove
+`as_fetch_releases()` takes it without asking the API.
 
 ## Covers on the rows of a list
 

@@ -99,7 +99,7 @@ subsonic/           the user's own library on their own server
 tidal/              Tidal, as a service
 yandex/             Yandex Music, as a service
 zvuk/               Zvuk, as a service
-tools/              addon_port.py (porting a page), make_icon.py (tile icons)
+tools/              addon_port.py, make_icon.py, changed_addons.py and the release scripts
 docs/ADDONS.md      the documentation
 docs/SETUP.md       installing an addon, and signing a service in (en/ru)
 ```
@@ -113,6 +113,7 @@ git submodule update --init      # the player: headers, ABI, toolchain, image
 make                             # build/target/<id>.so, all of them
 make host                        # build/host/<id>.so, for the SDL simulator
 make pack                        # build/Addons/<id>/ -- copy to <card>/Addons
+make release                     # build/release/<id>.zip and <id>.json, what a release carries
 make checks                      # ABI and export checks: needs a built player
                                  # (sonix-player/sonix-player/sonix_player) for the second one
 ```
@@ -124,15 +125,47 @@ the player's image. `docker/build.sh ADDON_IDS="dino qobuz"` narrows the build.
 `make host` needs the machine's own SDL2, FreeType, opusfile, wavpack and ALSA:
 it is the simulator's build, not the device's.
 
-## What is built, and what is not
+## What is built, and what is released
 
-The CI builds a whitelist and packs all of it but `hello`: `dino flappybird
-gearboy qobuz subsonic yandex` are the release zips, and `hello` is the compile
-check that proves the SDK still builds. `zvuk`, `tidal` and `spotify` are in the
-tree, compile, and are not built by the pipeline — none of the three has been
-verified on a device, and `spotify` additionally means nothing without the engine
-its Rust half builds. `docs/ADDONS.md`, "What is built, and what is not", has the
-per-addon reason. A plain `make` builds all of them.
+Every addon compiles in CI when something it depends on changes; only what a
+commit touches is built, and a change in `common/`, the player submodule or the
+`Makefile` means everything. A docs-only push builds nothing.
+
+What may be packed or released is the shorter, explicit `RELEASE_ADDONS` list in
+`.github/workflows/addons.yml`: `dino flappybird gearboy qobuz subsonic yandex`
+and the rest of the released ones. `hello` compiles as the SDK check and is
+never packed. `zvuk`, `tidal`, `piped` and `spotify` are in the tree and compile,
+but are not on the list — none of them has been verified on a device, and
+`spotify` additionally means nothing without the engine its Rust half builds. A
+tag naming one of them fails instead of publishing it. `docs/ADDONS.md`, "What is
+built, and what is released", has the per-addon reason.
+
+## Releasing
+
+Every addon has its own tag, `<id>-v<version>` — `dino-v0.2.0`, `qobuz-v0.4.1` —
+and publishing one builds and releases that addon alone. The version in the tag
+must be the one in the addon's `addon.json`, and the CI checks that before it
+writes anything:
+
+```sh
+# addon.json: "version": "0.2.0"
+git add dino
+git commit -m "dino: 0.2.0"
+git tag dino-v0.2.0
+git push origin main dino-v0.2.0
+```
+
+The release carries `<id>.zip` and `<id>.json` (its metadata). A job after it
+rebuilds `index.json`, the store's catalogue, in the release tagged `store`, so
+the store learns about the new version without an API call. Old all-in-one tags
+still build and publish every releasable addon. `docs/ADDONS.md`, "Releasing an
+addon", has the details.
+
+A `latest` release is recreated after every tag with **byte copies** of all
+current zips, because store builds released before per-addon tags read only the
+newest release. Nothing is rebuilt for it and the copies keep their size and
+`sha256`, so a client that is already current is not asked to update. Set the
+repository variable `ROLLING_RELEASE=off` to stop it.
 
 ## Licence
 

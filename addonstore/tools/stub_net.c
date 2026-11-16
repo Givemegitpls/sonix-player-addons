@@ -23,34 +23,53 @@ static long zip_size(void) {
 	return stat(zip_path(), &st) == 0 ? (long)st.st_size : 0;
 }
 
+// A whole file into memory: the canned release list, and the catalogue the
+// index URL is answered with.
+static bool read_all(const char *path, char **out, size_t *out_len) {
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		return false;
+	}
+	fseek(f, 0, SEEK_END);
+	long len = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	char *raw = len >= 0 ? malloc((size_t)len + 1) : NULL;
+	if (!raw || fread(raw, 1, (size_t)len, f) != (size_t)len) {
+		free(raw);
+		fclose(f);
+		return false;
+	}
+	fclose(f);
+	raw[len] = '\0';
+	*out = raw;
+	if (out_len) {
+		*out_len = (size_t)len;
+	}
+	return true;
+}
+
 bool http_get_ex(const char *url, const char *extra_headers, bool want_error_body, char **out, size_t *out_len,
 				 size_t limit, int timeout_secs, int *status_out) {
-	(void)url;
 	(void)extra_headers;
 	(void)want_error_body;
 	(void)limit;
 	(void)timeout_secs;
 
+	const char *index_file = getenv("AS_TEST_INDEX");
+	if (index_file && index_file[0] && url && strstr(url, "/releases/download/store/index.json")) {
+		if (!read_all(index_file, out, out_len)) {
+			return false;
+		}
+		if (status_out) {
+			*status_out = 200;
+		}
+		return true;
+	}
+
 	const char *json_file = getenv("AS_TEST_JSON");
 	if (json_file && json_file[0]) {
-		FILE *jf = fopen(json_file, "rb");
-		if (!jf) {
+		if (!read_all(json_file, out, out_len)) {
 			return false;
-		}
-		fseek(jf, 0, SEEK_END);
-		long jl = ftell(jf);
-		fseek(jf, 0, SEEK_SET);
-		char *raw = malloc((size_t)jl + 1);
-		if (!raw || fread(raw, 1, (size_t)jl, jf) != (size_t)jl) {
-			free(raw);
-			fclose(jf);
-			return false;
-		}
-		fclose(jf);
-		raw[jl] = '\0';
-		*out = raw;
-		if (out_len) {
-			*out_len = (size_t)jl;
 		}
 		if (status_out) {
 			*status_out = 200;

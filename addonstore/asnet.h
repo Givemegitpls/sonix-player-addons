@@ -8,13 +8,22 @@
 
 // The two network calls the store makes, both on the worker.
 //
+// The first thing asked of a repository is its catalogue -- index.json in a
+// release tagged `store`, at
+// https://github.com/<repo>/releases/download/store/index.json -- which names
+// every addon with its title, section, version, size and sha256 already in it.
+// A repository that does not publish one (or has no release yet) falls back to
+// the GitHub API: its latest hundred releases, newest first, one entry per addon
+// (the newest release that carries it). The manifests of those entries then have
+// to be read from the archives themselves.
+//
 // GitHub answers the release list as JSON at api.github.com and the asset
 // itself with a 302 to objects.githubusercontent.com; the player's http client
 // follows both and speaks https, so nothing here knows about TLS.
 //
 // The API is anonymous, and anonymous GitHub allows sixty requests an hour per
 // address. That is why the page shows the cached list first and refreshes at
-// most once per open, not per row.
+// most once per open, not per row -- and why the catalogue is worth having.
 
 // What the UI polls while a job runs. `stop` is set by the addon's stop() and
 // by a cancel on the page; the worker checks it between chunks (a few hundred

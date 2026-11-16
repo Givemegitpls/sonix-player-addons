@@ -11,6 +11,8 @@ The documentation lives in
 - `make` builds every addon; `make ADDON_IDS="dino qobuz"` builds some. The
   toolchain is `sonix-player/rockbox-toolchain`, `ROCKBOX_TOOLCHAIN_DIR` reuses
   one from outside the tree.
+- `make release` writes `build/release/<id>.zip` and `<id>.json`: exactly what a
+  release carries, made the same way the CI makes it.
 - `docker/build.sh` is the same build with nothing installed but docker; it
   builds the toolchain on the first run.
 - `make host` needs SDL2, FreeType, opusfile, wavpack and ALSA on the machine.
@@ -21,15 +23,43 @@ The documentation lives in
   `sonix-player/sonix-player/src/addon/exports.list`. A new symbol is a change in the player's
   repository (`sonix-player/sonix-player/tools/addon_exports.sh`), never a change here.
 
-## What the CI builds
+## What the CI builds, and what it releases
 
-`ADDON_IDS` in `.github/workflows/addons.yml` is the whitelist: `2048
-addonstore cassette daily dino flappybird gearboy gravity hello qobuz
-subsonic tictactoe yandex`. `zvuk`, `tidal` and `spotify` are excluded
-because none has been verified on a device; `spotify` also because its Rust
-engine must be built with its C half, and that pair has not been checked. Do not
-add an addon to the whitelist without a device run to point at — `docs/ADDONS.md`,
-"What is built, and what is not".
+Every addon compiles in CI when something it depends on changes
+(`tools/changed_addons.py`): a change in `common/`, the player submodule or the
+`Makefile` means every addon, anything else is the addon folders the diff names.
+A docs-only push builds nothing.
+
+`RELEASE_ADDONS` in `.github/workflows/addons.yml` is the gate for packing and
+releasing: `2048 addonstore cassette daily dino flappybird gearboy gravity
+qobuz subsonic tictactoe yandex`. Everything else — `piped`, `zvuk`, `tidal`,
+`spotify` — still compiles, but is never packed into the CI artifact and cannot
+be released: a tag `<id>-v<version>` naming an addon outside the list fails the
+`changes` job with that reason. Do not add an addon to the list without a device
+run to point at — `docs/ADDONS.md`, "What is built, and what is released".
+
+Within the list, only what a commit touches is compiled.
+
+## Releasing
+
+One tag per addon, `<id>-v<version>` (`dino-v0.2.0`). The version in the tag must
+be the one in `<id>/addon.json` — `release_zip.py --expect-version` fails the job
+before anything is written — so a release is "bump the manifest, tag the same
+number". It builds and publishes that addon alone: the release carries `<id>.zip`
+and `<id>.json` (title, section, version, zip size/`sha256`, `addon.so`
+`sha256`), both written by `tools/release_zip.py` — the same thing `make release`
+writes locally (`make release ADDON_IDS=<id> VERSION=<ver>` checks the match too).
+After the release, `tools/publish_index.py` rebuilds `index.json` in the release
+tagged `store`, which is the catalogue the store fetches directly:
+`https://github.com/<owner>/<name>/releases/download/store/index.json`. The old
+all-in-one tags still build and publish every releasable addon. `docs/ADDONS.md`,
+"Releasing an addon".
+
+A `latest` release is recreated last with byte copies of every current zip: store
+builds released before per-addon tags read only the newest release, and the
+copies keep their size and `sha256`, so no client is offered an update for an
+addon that did not change. `ROLLING_RELEASE=off` in the repository variables
+turns that job off (the catalogue and the new store do not need it).
 
 ## Rules that keep biting
 

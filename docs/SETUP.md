@@ -570,7 +570,8 @@ copy of the instructions.)
 | `Addons/dino/settings.ini` | Dino | best score |
 | `Addons/addonstore/installed.tsv` | Addons | which release each addon on the card came from |
 | `Addons/addonstore/repos.txt` | Addons | the GitHub repositories the store reads |
-| `Addons/addonstore/cache/` | Addons | the release list, downloaded zips and READMEs |
+| `Addons/addonstore/cache/` | Addons | the catalogue, downloaded zips and READMEs |
+| `Addons/addonstore/cache/local.tsv` | Addons | the `sha256` of each installed library, so a list does not re-read the card |
 
 `Games/GB`, `Games/GBC`, `Games/Saves`, `Games/Bios` are the user's, not an
 addon's: Gearboy reads them and writes only the saves.
@@ -636,17 +637,31 @@ heading. A tap on a row opens the addon's page:
   store installed, that is the published file's size and `sha256` against what
   was recorded at install (it covers the whole zip, artwork included); for one
   copied by hand it is the release's `addon.so` against the file on the card.
-  When they match the row says `up to date` and there is nothing to press;
+  When they match the row says `up to date` and there is nothing to press.
+  The version shown for an installed addon is the one the release it came from
+  carried: an update never rewrites `addon.json` on the card, so the file's own
+  string may be older than what is actually installed;
 - **Delete** — removes the folder, settings and cache included, after asking.
   The addon cannot remove itself;
 - **README** — the addon's own `README.txt`, from the card when it is there and
   from the release zip otherwise.
 
-The repositories are listed in `<card>/Addons/addonstore/repos.txt`, one
-`owner/name` per line; the file is created on the first start with
-`Givemegitpls/sonix-player-addons`. Edit it on a computer and open the addon
-again — every `.zip` asset in a repository's latest release becomes a row, so a
-repository that publishes one zip per addon works without any other setup.
+Above the rows are four actions: **Search** opens a field and a keyboard and
+narrows the list to what matches a name or an id (Russian included, in either
+case); **Update all (n)** appears when n addons have a newer release and does
+the whole batch with one tap (settings, tokens and saves stay, as with a single
+update); **Repositories** lists the GitHub repositories the store reads and adds
+or removes them from the device; **Check for updates** asks again instead of
+waiting for the next open.
+
+The repositories are `owner/name` lines in `<card>/Addons/addonstore/repos.txt`,
+created on the first start with `Givemegitpls/sonix-player-addons`. The
+**Repositories** page edits the same file: type `owner/name` (a pasted
+`https://github.com/owner/name` is understood too) and the store starts reading
+it at once. Where the repository publishes a catalogue (`index.json`, below),
+the store needs one request for everything it knows; otherwise it reads the
+repository's newest hundred releases and takes the newest one that carries each
+addon, so one zip per addon still works without any other setup.
 
 The store updates itself like any addon: once the repository publishes
 `addonstore.zip`, it appears in its own list. **Update** replaces only the code
@@ -654,20 +669,26 @@ The store updates itself like any addon: once the repository publishes
 starts when the tile is opened again — no restart. A store built from the
 published release says `up to date` instead. The store cannot delete itself.
 
-Магазин обновляет себя как обычный аддон: когда в репозитории появится
-`addonstore.zip`, он будет и в своём списке. **Обновить** заменит только код
-(`addon.json`, `repos.txt` и записи о релизах останутся), а новая версия начнёт
-работать при следующем открытии плитки — перезапуск не нужен. Магазин,
-собранный из опубликованного релиза, показывает «актуально». Удалить себя
-магазин не может.
+**A store older than this version** reads only the newest release of each
+repository. That is why a `latest` release carrying byte copies of every current
+zip is kept as the newest one: an older store sees the whole list there and can
+update itself in place, like any other addon. If that copy job is off
+(`ROLLING_RELEASE=off`) or the card already holds a stale list, unzip
+`addonstore.zip` from the releases page into `<card>/Addons/addonstore/` once.
+Its own row may then offer the same version again — the release and the folder
+are different files, and one reinstall makes them agree.
 
-Два момента:
+Two things:
 
 - **A new or removed tile shows up after the player reads the card again.** Take
   the card out and put it back, or restart. The player scans `Addons/` when the
   card is attached, and an addon cannot ask for that scan;
-- GitHub allows sixty anonymous API requests an hour per address. The list is
-  cached and refreshed once per open, or when you tap **Check for updates**.
+- The store asks a repository for its catalogue first — one file that already
+  names every addon, its size and its `sha256` — so opening it costs one request
+  per repository and no zip downloads at all. A repository that publishes no
+  catalogue falls back to the GitHub API, which allows sixty anonymous requests
+  an hour per address; that list is cached and refreshed once per open, or on
+  **Check for updates**.
 
 **Русский.** `addonstore` — аддон, который ставит аддоны: на странице More
 появляется плитка `Store` («Магазин»), а в ней — список того, что есть
@@ -688,17 +709,31 @@ published release says `up to date` instead. The store cannot delete itself.
   поставленного магазином, это размер и `sha256` опубликованного файла против
   записи об установке (покрывает весь zip, включая картинки); для
   скопированного вручную — `addon.so` из релиза против файла на карте. Если они
-  совпадают, строка говорит «актуально» и нажимать нечего;
+  совпадают, строка говорит «актуально» и нажимать нечего. Версия, которую
+  показывает магазин, — из релиза, откуда аддон поставлен: обновление не
+  переписывает `addon.json` на карте, поэтому строка в самом файле может быть
+  старше установленного;
 - **Удалить** — удаляет папку вместе с настройками и кэшем, спросив
   подтверждение. Себя аддон удалить не может;
 - **README** — собственный `README.txt` аддона: с карты, если он там есть, иначе
   из zip релиза.
 
-Репозитории перечислены в `<card>/Addons/addonstore/repos.txt`, по одному
-`owner/name` в строке; при первом запуске файл создаётся с
-`Givemegitpls/sonix-player-addons`. Правится на компьютере, после чего аддон
-открывается заново — каждый `.zip` в последнем релизе репозитория становится
-строкой списка, поэтому репозиторий с одним zip на аддон работает без
+Над строками — четыре действия: **Поиск** открывает поле с клавиатурой и
+сужает список до совпадающего по имени или id (по-русски тоже, в любом
+регистре); **Обновить всё (n)** появляется, когда у n аддонов есть релиз
+новее, и делает всю пачку одним касанием (настройки, токены и сохранения
+остаются, как при одиночном обновлении); **Репозитории** показывает
+репозитории GitHub, которые читает магазин, и позволяет добавлять и удалять их
+с устройства; **Проверить обновления** спрашивает заново, не дожидаясь
+следующего открытия.
+
+Репозитории — строки `owner/name` в `<card>/Addons/addonstore/repos.txt`, при
+первом запуске файл создаётся с `Givemegitpls/sonix-player-addons`. Страница
+**Репозитории** правит тот же файл: наберите `owner/name` (вставленный
+`https://github.com/owner/name` тоже понимается), и магазин сразу начнёт его
+читать. Если репозиторий публикует каталог (`index.json`, ниже), магазину
+хватает одного запроса на всё; иначе он читает последние сто релизов и берёт
+для каждого аддона самый новый, так что один zip на аддон работает без
 дополнительной настройки.
 
 Магазин обновляет себя как обычный аддон: когда в репозитории появится
@@ -708,10 +743,22 @@ published release says `up to date` instead. The store cannot delete itself.
 собранный из опубликованного релиза, показывает «актуально». Удалить себя
 магазин не может.
 
+**Магазин старше этой версии** читает только самый новый релиз репозитория.
+Поэтому самым новым держится релиз `latest` с побайтовыми копиями всех текущих
+zip: старый магазин видит там весь список и обновляется на месте, как любой
+другой аддон. Если эта копия отключена (`ROLLING_RELEASE=off`) или на карте уже
+устаревший список, один раз распакуйте `addonstore.zip` со страницы релизов в
+`<card>/Addons/addonstore/`. Своя строка после этого может снова предложить ту
+же версию: релиз и папка — разные файлы, и одна переустановка их согласует.
+
 Два момента:
 
 - **Новая или удалённая плитка появится, когда плеер снова прочитает карту.**
   Выньте карту и вставьте обратно или перезапустите плеер. Плеер сканирует
   `Addons/` при подключении карты, а попросить его об этом из аддона нельзя;
-- GitHub разрешает шестьдесят анонимных запросов к API в час на адрес. Список
-  кэшируется и обновляется раз за открытие или по кнопке «Проверить обновления».
+- Магазин сначала спрашивает у репозитория каталог — один файл, где уже есть
+  каждый аддон, его размер и `sha256`, — поэтому открытие стоит одного запроса
+  на репозиторий и не скачивает ни одного zip. Репозиторий без каталога
+  отвечает через API GitHub, а он разрешает шестьдесят анонимных запросов в час
+  на адрес; этот список кэшируется и обновляется раз за открытие или по кнопке
+  «Проверить обновления».

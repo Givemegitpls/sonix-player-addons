@@ -12,6 +12,7 @@
 #include "src/system/net/http.h"
 
 #define LIST_LIMIT (512 * 1024)
+#define INDEX_LIMIT (256 * 1024)
 #define LIST_TIMEOUT_SECS 20
 #define DOWNLOAD_TIMEOUT_SECS 30
 #define CHUNK 32768
@@ -53,6 +54,29 @@ static void api_error(const char *body, int status, char *error, size_t size) {
 	}
 }
 
+// The repository's own catalogue, if it publishes one: one file with every
+// addon's row already in it, so nothing has to be downloaded and no API call is
+// made. It lives in a release tagged `store`, at a URL that never changes.
+static bool fetch_index(const char *repo, as_release_t *out, int max, int *count) {
+	char url[320];
+	snprintf(url, sizeof(url), "https://github.com/%s/releases/download/store/index.json", repo);
+	char *body = NULL;
+	size_t body_len = 0;
+	int status = 0;
+	if (!http_get_ex(url, "Accept: application/json\r\n", false, &body, &body_len, INDEX_LIMIT, LIST_TIMEOUT_SECS,
+					 &status)) {
+		free(body);
+		return false;
+	}
+	int n = body ? as_index_parse(body, out, max, repo) : -1;
+	free(body);
+	if (n <= 0) {
+		return false;
+	}
+	*count = n;
+	return true;
+}
+
 bool as_fetch_releases(const char *repo, as_release_t *out, int max, int *count, char *error, size_t errsz,
 					   as_progress_t *pg) {
 	*count = 0;
@@ -60,12 +84,19 @@ bool as_fetch_releases(const char *repo, as_release_t *out, int max, int *count,
 		set_error(error, errsz, "the repository name is not owner/name");
 		return false;
 	}
-	char url[256];
-	snprintf(url, sizeof(url), "https://api.github.com/repos/%s/releases?per_page=1", repo);
 	if (pg) {
 		pg->total = 0;
 		pg->done = 0;
 	}
+	// The catalogue first: a repository that publishes one is answered with a
+	// single GET, where the API path below costs a call per repository and then
+	// a download per addon just to learn its title.
+	if (fetch_index(repo, out, max, count)) {
+		return true;
+	}
+
+	char url[256];
+	snprintf(url, sizeof(url), "https://api.github.com/repos/%s/releases?per_page=100", repo);
 
 	char *body = NULL;
 	size_t body_len = 0;
@@ -90,43 +121,71 @@ bool as_fetch_releases(const char *repo, as_release_t *out, int max, int *count,
 		return false;
 	}
 	int root = json_root(&doc);
-	int release = json_at(&doc, root, 0);
-	if (release < 0) {
+	int releases = json_len(&doc, root);
+	if (releases <= 0) {
 		json_free(&doc);
 		free(body);
 		set_error(error, errsz, "the repository has no published release");
 		return false;
 	}
 
-	char tag[AS_TAG_MAX];
-	if (!json_obj_str(&doc, release, "tag_name", tag, sizeof(tag))) {
-		tag[0] = '\0';
-	}
-	int assets = json_get(&doc, release, "assets");
-	int n = assets >= 0 ? json_len(&doc, assets) : 0;
-	for (int i = 0; i < n && *count < max; i++) {
-		int asset = json_at(&doc, assets, i);
-		if (asset < 0) {
+	// The API lists releases newest first, and one tag per addon means the
+	// newest release names a single addon: reading only the first one would
+	// show one addon and forget the rest. So every release is read and the
+	// first (newest) occurrence of an id wins -- which is also what the
+	// catalogue says, just slower and with a download per addon later.
+	for (int r = 0; r < releases && *count < max; r++) {
+		int release = json_at(&doc, root, r);
+		if (release < 0) {
 			continue;
 		}
-		as_release_t item;
-		memset(&item, 0, sizeof(item));
-		if (!json_obj_str(&doc, asset, "name", item.asset, sizeof(item.asset))) {
+		if (json_obj_bool(&doc, release, "draft", false) || json_obj_bool(&doc, release, "prerelease", false)) {
 			continue;
 		}
-		as_id_from_asset(item.asset, item.id, sizeof(item.id));
-		if (!item.id[0]) {
+		char tag[AS_TAG_MAX];
+		if (!json_obj_str(&doc, release, "tag_name", tag, sizeof(tag))) {
+			tag[0] = '\0';
+		}
+		// `store` is the catalogue and `latest` is a copy of the real releases
+		// for older store builds: neither is a release of its own.
+		if (strcmp(tag, "store") == 0 || strcmp(tag, "latest") == 0) {
 			continue;
 		}
-		snprintf(item.repo, sizeof(item.repo), "%s", repo);
-		snprintf(item.tag, sizeof(item.tag), "%s", tag);
-		item.size = json_obj_long(&doc, asset, "size", 0);
-		json_obj_str(&doc, asset, "digest", item.digest, sizeof(item.digest));
-		json_obj_str(&doc, asset, "browser_download_url", item.url, sizeof(item.url));
-		if (!item.url[0] || strncmp(item.url, "https://", 8) != 0 || item.size <= 0) {
-			continue;
+		int assets = json_get(&doc, release, "assets");
+		int n = assets >= 0 ? json_len(&doc, assets) : 0;
+		for (int i = 0; i < n && *count < max; i++) {
+			int asset = json_at(&doc, assets, i);
+			if (asset < 0) {
+				continue;
+			}
+			as_release_t item;
+			memset(&item, 0, sizeof(item));
+			if (!json_obj_str(&doc, asset, "name", item.asset, sizeof(item.asset))) {
+				continue;
+			}
+			as_id_from_asset(item.asset, item.id, sizeof(item.id));
+			if (!item.id[0]) {
+				continue;
+			}
+			bool seen = false;
+			for (int k = 0; k < *count; k++) {
+				if (strcmp(out[k].id, item.id) == 0) {
+					seen = true;
+				}
+			}
+			if (seen) {
+				continue;
+			}
+			snprintf(item.repo, sizeof(item.repo), "%s", repo);
+			snprintf(item.tag, sizeof(item.tag), "%s", tag);
+			item.size = json_obj_long(&doc, asset, "size", 0);
+			json_obj_str(&doc, asset, "digest", item.digest, sizeof(item.digest));
+			json_obj_str(&doc, asset, "browser_download_url", item.url, sizeof(item.url));
+			if (!item.url[0] || strncmp(item.url, "https://", 8) != 0 || item.size <= 0) {
+				continue;
+			}
+			out[(*count)++] = item;
 		}
-		out[(*count)++] = item;
 	}
 	json_free(&doc);
 	free(body);

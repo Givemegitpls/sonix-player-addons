@@ -727,3 +727,60 @@ the merged calculator were demonstrated rather than argued from the code.
   сессии, `*.tsv`, `cache/`, `saves/` переживают апдейт; сохранения gravity —
   `Addons/gravity/saves/` (platform/canvas.cpp), в архив не входят; gearboy — `Games/Saves`
   вне аддона. Удаление по-прежнему сносит папку целиком.
+
+## CI and releases: only what changed, one tag per addon (2026-11-16)
+
+- `tools/changed_addons.py` maps a commit range (push/PR), the tag, or the
+  `workflow_dispatch` inputs to addon ids; `common/`, `sonix-player` and
+  `Makefile` in the diff mean the whole `ADDON_IDS` whitelist. `any=false` skips
+  the build job entirely, so a docs-only push compiles nothing.
+- Tags are per addon: `<id>-v<semver>` (`dino-v0.2.0`) builds and releases that
+  one addon. Version-only tags (`0.0.7`) still release the whole whitelist; any
+  other tag (including `store`) releases nothing. Tags are created by hand — the
+  agent cannot push.
+- A release carries `<id>.zip` plus `<id>.json` (`tools/release_zip.py`, same as
+  `make release`: title, section, version, zip size/`sha256`, `addon.so`
+  `sha256`). `tools/publish_index.py` merges the newest fragment per addon into
+  `index.json` in the release tagged `store`; the store fetches it directly at
+  `https://github.com/<owner>/<name>/releases/download/store/index.json`.
+- `gh` is not installed on this machine, so `publish_index.py` was checked only
+  for syntax and arguments here; the CI has `gh`.
+- Store slowness had two causes, both fixed: the page downloaded every release
+  zip (1 MB/s card pacing) just to read `addon.json`, and it re-hashed each
+  hand-installed `addon.so` from the card on every list rebuild. The catalogue
+  removes the downloads; `cache/local.tsv` memoises `sha256` by size+mtime.
+- Store additions all live in `addonstore.c`: Search and "Add repository" share
+  one screen and one keyboard (`entry_mode`), "Update all" builds an id plan on
+  the UI thread (the store's own release last) and the worker walks it, records
+  are written on the UI thread in `poll_cb`.
+- `AS_MAX` stays 32 and the cache/record text buffers are `static`, not stack:
+  the model is ~30 KB of BSS already and the interface thread's stack is not the
+  place for 30 KB of text.
+- `addonstore/tools/run_store_test.sh` now also covers `as_matches`, repository
+  add/remove/normalisation, `as_index_parse`, a catalogue fetched through
+  `stub_net.c` (`AS_TEST_INDEX`), and the local fingerprint cache.
+- Old store builds (0.0.x) cannot follow per-addon tags: they read
+  `releases?per_page=1`, so they show only the newest release's addon, and once
+  the `store` catalogue release exists (it has no `.zip`) they show no published
+  addons at all. Installed rows, delete and README-from-card keep working. The
+  migration order that lets them self-update: tag `addonstore-vX` while the
+  index job is held back, then run it with `workflow_dispatch -f index=true`.
+- The API fallback (`as_fetch_releases`) reads `releases?per_page=100` and takes
+  the newest release that carries each id, so a missing or deleted catalogue
+  degrades to the old slow path instead of a one-addon list.
+- A compatibility release tagged `latest` is recreated last (`tools/rolling_release.py`,
+  job `latest`): every current zip is downloaded from its own release and
+  re-uploaded **byte for byte**, so size and sha256 do not change and old store
+  builds (which read only the newest release) are not offered phantom updates.
+  It costs transfer, not build time; `vars.ROLLING_RELEASE=off` disables it.
+- The catalogue (`publish_index.py`) and the new store's API fallback both skip
+  the `store` and `latest` tags, so the copy never becomes an addon's release.
+- Build and release are separate lists: every addon compiles when it changes,
+  `RELEASE_ADDONS` gates pack/release. `piped`, `zvuk`, `tidal`, `spotify`
+  compile but are never packed, and a tag for one fails the `changes` job.
+- A per-addon tag must carry the same number as `"version"` in that addon's
+  `addon.json`: `release_zip.py --expect-version` fails before writing anything.
+  Locally the same check is `make release ADDON_IDS=<id> VERSION=<ver>`.
+- The store now shows an installed addon's version from `installed.tsv`, not from
+  the card's `addon.json`: updates never rewrite the manifest, so the file's
+  string goes stale.

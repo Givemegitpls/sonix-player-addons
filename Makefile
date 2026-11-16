@@ -13,6 +13,7 @@
 #   make ADDON_IDS="dino qobuz"   # only these (CI's whitelist does this)
 #   make host              # the same addons for the SDL simulator, build/host/
 #   make pack              # build/Addons/, the folder to copy to a card
+#   make release           # build/release/, one zip and one metadata fragment per addon
 #   make checks            # ABI and export checks
 #
 # The host build is what makes an addon testable without the device: the same
@@ -362,6 +363,24 @@ pack: target
 		if [ -d "$(CURDIR)/$$id/assets" ]; then cp -r "$(CURDIR)/$$id/assets" "$(BUILD_DIR)/Addons/$$id/"; fi; \
 	done
 	@echo "pack: $(BUILD_DIR)/Addons -- copy it to <card>/Addons"
+
+# ---------------------------------------------------------------------------
+# release: what a GitHub release carries
+#
+#   build/release/<id>.zip    the addon folder's contents at the archive root
+#   build/release/<id>.json   the sizes and sha256 the store compares against,
+#                             and the manifest fields its list needs -- so a
+#                             catalogue is built without downloading the zips
+#
+# CI runs this for the addons a tag names; locally it is the same command with
+# the same result. Publishing the catalogue itself is tools/publish_index.py.
+# ---------------------------------------------------------------------------
+.PHONY: release
+release: pack
+	@python3 "$(CURDIR)/tools/release_zip.py" --build "$(BUILD_DIR)/Addons" --out "$(BUILD_DIR)/release" \
+		$(if $(strip $(ADDON_IDS)),--ids "$(ADDON_IDS)",) \
+		$(if $(strip $(VERSION)),--expect-version "$(VERSION)",)
+	@echo "release: $(BUILD_DIR)/release"
 
 .PHONY: clean
 clean:
