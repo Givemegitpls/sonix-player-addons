@@ -17,6 +17,7 @@
 #include "src/gui/shell/spinner.h"
 #include "src/gui/shell/switcher.h"
 #include "src/gui/shell/theme.h"
+#include "src/gui/shell/topbar.h"
 #include "src/system/core/lang.h"
 #include "src/system/core/utils.h"
 #include "src/system/device/power.h"
@@ -32,9 +33,12 @@
 
 #define PATH_MAX_QUIZ 512
 #define CHOICES 4
-#define POOL_MAX 128
+#define POOL_MAX 512
+#define ARTIST_POOL_MAX 256
+#define PICK_TRIES 5
 #define SNIPPET_MS 12000
-#define SEEK_SETTLE_MS 500
+#define SEEK_POLL_MS 30
+#define SEEK_WAIT_MS 4500
 #define ANSWER_TICK_MS 200
 #define CHOICE_H SC(80)
 #define CHOICE_GAP SC(8)
@@ -65,7 +69,8 @@ typedef struct {
 	quiz_mode_t mode;
 	bool ok;
 	bool no_library;
-	bool no_tracks;
+	bool no_tracks;	  // library genuinely too small (< CHOICES rows)
+	bool no_choices;  // enough rows, but could not form CHOICES distinct labels
 	unsigned gen;
 } quiz_job_t;
 
@@ -99,6 +104,8 @@ static quiz_cfg_t cfg;
 static quiz_cfg_t cfg_before_settings; // snapshot when the gear opens
 
 static lv_obj_t *quiz_screen;
+static lv_obj_t *quiz_back_btn;
+static lv_obj_t *quiz_back_icon;
 static lv_obj_t *settings_screen;
 static lv_obj_t *records_screen;
 static lv_obj_t *records_surv_val;
@@ -189,8 +196,14 @@ static quiz_track_t pool[POOL_MAX];
 static int pool_n;
 static bool pool_ready;
 static bool pool_used[POOL_MAX]; // correct-answer tracks already played this game
+static char artist_pool[ARTIST_POOL_MAX][256];
+static int artist_pool_n;
+static bool artist_pool_ready;
+static bool artist_pool_used[ARTIST_POOL_MAX];
 static bool pool_failed_library;
 static bool pool_failed_tracks;
+static bool pool_failed_choices;
+static uint32_t seek_wait_started_ms;
 
 static quiz_track_t round_tracks[CHOICES];
 static int round_correct = -1;
@@ -660,7 +673,8 @@ static void stop_snippet(void) {
 	if (seek_timer) {
 		lv_timer_pause(seek_timer);
 	}
-	if (we_started_playback) {
+	// Also stop a paused restore_file that never reached play_file_at.
+	if (we_started_playback || snippet_path[0]) {
 		device_state_stop();
 		we_started_playback = false;
 	}
@@ -745,23 +759,41 @@ static double snippet_offset(double total) {
 	return mid > 0.0 ? mid : 0.0;
 }
 
-static void seek_settle_cb(lv_timer_t *t) {
-	(void)t;
+// Load paused, wait until duration is known, then start at the snippet offset
+// so the first second of the file is never audible.
+static void seek_ready_play(double total) {
 	if (seek_timer) {
 		lv_timer_pause(seek_timer);
 	}
-	if (!we_started_playback || !snippet_path[0]) {
+	if (!snippet_path[0]) {
+		return;
+	}
+	double off = snippet_offset(total);
+	device_state_play_file_at(snippet_path, off > 0.0 ? off : 0.0);
+	we_started_playback = true;
+	if (snippet_timer) {
+		lv_timer_reset(snippet_timer);
+		lv_timer_resume(snippet_timer);
+	}
+}
+
+static void seek_poll_cb(lv_timer_t *t) {
+	(void)t;
+	if (!snippet_path[0]) {
+		if (seek_timer) {
+			lv_timer_pause(seek_timer);
+		}
 		return;
 	}
 	device_state_t st;
 	device_state_get(&st);
-	double off = snippet_offset(st.progress_total_secs);
-	if (off > 0.5) {
-		device_state_seek(off);
+	if (st.progress_total_secs > 0.5) {
+		seek_ready_play(st.progress_total_secs);
+		return;
 	}
-	if (snippet_timer) {
-		lv_timer_reset(snippet_timer);
-		lv_timer_resume(snippet_timer);
+	if (lv_tick_elaps(seek_wait_started_ms) >= SEEK_WAIT_MS) {
+		// Duration never arrived — play from the start rather than hang silent.
+		seek_ready_play(0.0);
 	}
 }
 
@@ -771,9 +803,12 @@ static void start_snippet(const char *path) {
 		return;
 	}
 	snprintf(snippet_path, sizeof(snippet_path), "%s", path);
-	device_state_play_file(path);
-	we_started_playback = true;
+	// Paused open: decoder warms up and total length becomes readable without sound.
+	device_state_restore_file(path, 0.0);
+	we_started_playback = false;
+	seek_wait_started_ms = lv_tick_get();
 	if (seek_timer) {
+		lv_timer_set_period(seek_timer, SEEK_POLL_MS);
 		lv_timer_reset(seek_timer);
 		lv_timer_resume(seek_timer);
 	}
@@ -1177,6 +1212,11 @@ static void invalidate_pool(void) {
 	pool_ready = false;
 	memset(pool_used, 0, sizeof(pool_used));
 	memset(pool, 0, sizeof(pool));
+	artist_pool_n = 0;
+	artist_pool_ready = false;
+	memset(artist_pool_used, 0, sizeof(artist_pool_used));
+	memset(artist_pool, 0, sizeof(artist_pool));
+	pool_failed_choices = false;
 }
 
 static bool cfg_same(const quiz_cfg_t *a, const quiz_cfg_t *b) {
@@ -1221,8 +1261,29 @@ static int pool_unused_count(void) {
 	return n;
 }
 
+static int artist_unused_count(void) {
+	int n = 0;
+	for (int i = 0; i < artist_pool_n; i++) {
+		if (!artist_pool_used[i]) {
+			n++;
+		}
+	}
+	return n;
+}
+
+static bool catch_artist_row(const char *name, const char *path, const char *artist, void *user) {
+	(void)path;
+	(void)artist;
+	row_catch_t *c = user;
+	snprintf(c->name, sizeof(c->name), "%s", name ? name : "");
+	c->path[0] = '\0';
+	c->artist[0] = '\0';
+	c->filled = c->name[0] != '\0';
+	return false;
+}
+
 // force: rebuild even if a pool is already warm (new game / exhausted sample).
-static bool ensure_pool(quiz_job_t *job, bool force) {
+static bool ensure_track_pool(quiz_job_t *job, bool force) {
 	if (!force && pool_ready && pool_n >= CHOICES) {
 		return true;
 	}
@@ -1238,8 +1299,8 @@ static bool ensure_pool(quiz_job_t *job, bool force) {
 		return false;
 	}
 
-	library_index_t *ix = library_index_open(LIBRARY_LIST_TRACKS, LIBRARY_FILTER_NONE, NULL, LIBRARY_ORDER_DEFAULT,
-											 false);
+	library_index_t *ix =
+		library_index_open(LIBRARY_LIST_TRACKS, LIBRARY_FILTER_NONE, NULL, LIBRARY_ORDER_DEFAULT, false);
 	int count = library_index_count(ix);
 	if (count < CHOICES) {
 		library_index_close(ix);
@@ -1248,8 +1309,9 @@ static bool ensure_pool(quiz_job_t *job, bool force) {
 		return false;
 	}
 
+	// Sample up to the real library size (capped): more variety for near-dupe filter.
 	int want = count < POOL_MAX ? count : POOL_MAX;
-	for (int i = 0; i < want * 2 && pool_n < want; i++) {
+	for (int i = 0; i < want * 3 && pool_n < want; i++) {
 		int idx = (int)(((uint32_t)rand() + (uint32_t)i * 2654435761u) % (uint32_t)count);
 		row_catch_t c = {0};
 		library_index_window(ix, idx, 1, catch_row, &c);
@@ -1284,22 +1346,97 @@ static bool ensure_pool(quiz_job_t *job, bool force) {
 	return true;
 }
 
-static bool pick_round_from_pool(quiz_job_t *job) {
-	if (!ensure_pool(job, false)) {
+static bool ensure_artist_pool(quiz_job_t *job, bool force) {
+	if (!force && artist_pool_ready && artist_pool_n >= CHOICES) {
+		return true;
+	}
+	artist_pool_n = 0;
+	artist_pool_ready = false;
+	memset(artist_pool_used, 0, sizeof(artist_pool_used));
+	pool_failed_library = false;
+	pool_failed_tracks = false;
+
+	if (!library_is_open()) {
+		job->no_library = true;
+		pool_failed_library = true;
 		return false;
 	}
-	// Every correct answer in this game must be a fresh pool track; when the
-	// sample is spent, draw a new one rather than repeating.
-	if (pool_unused_count() < 1) {
-		if (!ensure_pool(job, true)) {
-			return false;
-		}
+
+	// ARTIST_TABLE already respects split_artists / separators / exceptions.
+	library_index_t *ix =
+		library_index_open(LIBRARY_LIST_ARTISTS, LIBRARY_FILTER_NONE, NULL, LIBRARY_ORDER_DEFAULT, false);
+	int count = library_index_count(ix);
+	if (count < CHOICES) {
+		library_index_close(ix);
+		job->no_tracks = true;
+		pool_failed_tracks = true;
+		return false;
 	}
 
-	quiz_mode_t mode = job->mode;
-	quiz_track_t picked[CHOICES];
-	memset(picked, 0, sizeof(picked));
+	int want = count < ARTIST_POOL_MAX ? count : ARTIST_POOL_MAX;
+	for (int i = 0; i < want * 3 && artist_pool_n < want; i++) {
+		int idx = (int)(((uint32_t)rand() + (uint32_t)i * 2654435761u) % (uint32_t)count);
+		row_catch_t c = {0};
+		library_index_window(ix, idx, 1, catch_artist_row, &c);
+		if (!c.filled) {
+			continue;
+		}
+		bool dup = false;
+		for (int j = 0; j < artist_pool_n; j++) {
+			if (strcmp(artist_pool[j], c.name) == 0) {
+				dup = true;
+				break;
+			}
+		}
+		if (dup) {
+			continue;
+		}
+		snprintf(artist_pool[artist_pool_n], sizeof(artist_pool[0]), "%s", c.name);
+		artist_pool_n++;
+	}
+	library_index_close(ix);
 
+	if (artist_pool_n < CHOICES) {
+		job->no_tracks = true;
+		pool_failed_tracks = true;
+		return false;
+	}
+	artist_pool_ready = true;
+	return true;
+}
+
+static bool pick_track_for_artist(const char *artist_name, quiz_track_t *out) {
+	if (!artist_name || !artist_name[0] || !out) {
+		return false;
+	}
+	library_index_t *ix =
+		library_index_open(LIBRARY_LIST_TRACKS, LIBRARY_FILTER_ARTIST, artist_name, LIBRARY_ORDER_DEFAULT, false);
+	int count = library_index_count(ix);
+	if (count < 1) {
+		library_index_close(ix);
+		return false;
+	}
+	int idx = rand() % count;
+	row_catch_t c = {0};
+	library_index_window(ix, idx, 1, catch_row, &c);
+	library_index_close(ix);
+	if (!c.filled) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	snprintf(out->path, sizeof(out->path), "%s", c.path);
+	snprintf(out->name, sizeof(out->name), "%s", c.name);
+	// Answer label = split artist name from ARTIST_TABLE, not the raw tag.
+	snprintf(out->artist, sizeof(out->artist), "%s", artist_name);
+	fill_album(out);
+	return true;
+}
+
+static bool try_pick_track_round(quiz_job_t *job, quiz_track_t picked[CHOICES], int *correct_i_out) {
+	quiz_mode_t mode = job->mode;
+	if (pool_unused_count() < 1) {
+		return false;
+	}
 	int unused = pool_unused_count();
 	int pick = rand() % unused;
 	int correct_i = -1;
@@ -1313,15 +1450,15 @@ static bool pick_round_from_pool(quiz_job_t *job) {
 		}
 	}
 	if (correct_i < 0) {
-		job->no_tracks = true;
 		return false;
 	}
 
+	memset(picked, 0, sizeof(quiz_track_t) * CHOICES);
 	picked[0] = pool[correct_i];
 	int have = 1;
 
 	for (int pass = 0; pass < 2 && have < CHOICES; pass++) {
-		for (int t = 0; t < pool_n * 2 && have < CHOICES; t++) {
+		for (int t = 0; t < pool_n * 3 && have < CHOICES; t++) {
 			int idx = rand() % pool_n;
 			if (idx == correct_i) {
 				continue;
@@ -1336,30 +1473,150 @@ static bool pick_round_from_pool(quiz_job_t *job) {
 			if (dup_path) {
 				continue;
 			}
-			// pass 0: strict near-dupes; pass 1: still block shared units / containment
 			if (label_used(picked, have, mode, &pool[idx], pass == 0)) {
 				continue;
 			}
 			picked[have++] = pool[idx];
 		}
 	}
-
 	if (have < CHOICES) {
-		job->no_tracks = true;
+		return false;
+	}
+	*correct_i_out = correct_i;
+	return true;
+}
+
+static bool artist_name_used(const char *const *names, int n, const char *cand, bool strict) {
+	if (!cand || !cand[0]) {
+		return true;
+	}
+	for (int i = 0; i < n; i++) {
+		if (labels_conflict(names[i], cand, strict)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool try_pick_artist_round(quiz_job_t *job, quiz_track_t picked[CHOICES], int picked_artist_i[CHOICES]) {
+	(void)job;
+	if (artist_unused_count() < 1) {
+		return false;
+	}
+	const char *names[CHOICES];
+	int artist_i[CHOICES];
+	int have = 0;
+
+	int unused = artist_unused_count();
+	int pick = rand() % unused;
+	for (int i = 0; i < artist_pool_n; i++) {
+		if (artist_pool_used[i]) {
+			continue;
+		}
+		if (pick-- == 0) {
+			names[0] = artist_pool[i];
+			artist_i[0] = i;
+			have = 1;
+			break;
+		}
+	}
+	if (have < 1) {
 		return false;
 	}
 
-	pool_used[correct_i] = true;
-
-	int order[CHOICES] = {0, 1, 2, 3};
-	shuffle_ints(order, CHOICES);
-	for (int i = 0; i < CHOICES; i++) {
-		job->tracks[i] = picked[order[i]];
-		if (order[i] == 0) {
-			job->correct = i;
+	for (int pass = 0; pass < 2 && have < CHOICES; pass++) {
+		for (int t = 0; t < artist_pool_n * 3 && have < CHOICES; t++) {
+			int idx = rand() % artist_pool_n;
+			bool already = false;
+			for (int j = 0; j < have; j++) {
+				if (artist_i[j] == idx) {
+					already = true;
+					break;
+				}
+			}
+			if (already) {
+				continue;
+			}
+			if (artist_name_used(names, have, artist_pool[idx], pass == 0)) {
+				continue;
+			}
+			names[have] = artist_pool[idx];
+			artist_i[have] = idx;
+			have++;
 		}
 	}
+	if (have < CHOICES) {
+		return false;
+	}
+
+	memset(picked, 0, sizeof(quiz_track_t) * CHOICES);
+	for (int i = 0; i < CHOICES; i++) {
+		if (!pick_track_for_artist(names[i], &picked[i])) {
+			return false;
+		}
+		picked_artist_i[i] = artist_i[i];
+	}
 	return true;
+}
+
+static bool pick_round_from_pool(quiz_job_t *job) {
+	pool_failed_choices = false;
+	job->no_choices = false;
+
+	if (job->mode == MODE_ARTIST) {
+		for (int try = 0; try < PICK_TRIES; try++) {
+			bool force = (try > 0) || !artist_pool_ready || artist_unused_count() < 1;
+			if (!ensure_artist_pool(job, force)) {
+				return false;
+			}
+			quiz_track_t picked[CHOICES];
+			int artist_i[CHOICES];
+			if (!try_pick_artist_round(job, picked, artist_i)) {
+				// Resample artists and try again.
+				artist_pool_ready = false;
+				continue;
+			}
+			artist_pool_used[artist_i[0]] = true;
+			int order[CHOICES] = {0, 1, 2, 3};
+			shuffle_ints(order, CHOICES);
+			for (int i = 0; i < CHOICES; i++) {
+				job->tracks[i] = picked[order[i]];
+				if (order[i] == 0) {
+					job->correct = i;
+				}
+			}
+			return true;
+		}
+		job->no_choices = true;
+		pool_failed_choices = true;
+		return false;
+	}
+
+	for (int try = 0; try < PICK_TRIES; try++) {
+		bool force = (try > 0) || !pool_ready || pool_unused_count() < 1;
+		if (!ensure_track_pool(job, force)) {
+			return false;
+		}
+		quiz_track_t picked[CHOICES];
+		int correct_i = -1;
+		if (!try_pick_track_round(job, picked, &correct_i)) {
+			pool_ready = false;
+			continue;
+		}
+		pool_used[correct_i] = true;
+		int order[CHOICES] = {0, 1, 2, 3};
+		shuffle_ints(order, CHOICES);
+		for (int i = 0; i < CHOICES; i++) {
+			job->tracks[i] = picked[order[i]];
+			if (order[i] == 0) {
+				job->correct = i;
+			}
+		}
+		return true;
+	}
+	job->no_choices = true;
+	pool_failed_choices = true;
+	return false;
 }
 
 static void finish_answer(bool ok, int which);
@@ -1628,11 +1885,22 @@ static void apply_round(void *user) {
 		const char *msg;
 		if (job->no_library || pool_failed_library) {
 			msg = ru() ? "Сначала просканируйте\nбиблиотеку в Music." : "Scan the library\nunder Music first.";
+		} else if (job->no_choices || pool_failed_choices) {
+			msg = ru() ? "Не удалось набрать 4 разных\nварианта. Попробуйте ещё раз."
+					   : "Could not pick 4 distinct\nchoices. Try again.";
+		} else if (job->mode == MODE_ARTIST) {
+			msg = ru() ? "Нужно хотя бы 4 исполнителя\nв библиотеке." : "Need at least 4 artists\nin the library.";
 		} else {
 			msg = ru() ? "Нужно хотя бы 4 трека\nв библиотеке." : "Need at least 4 tracks\nin the library.";
 		}
-		game_started = false;
-		show_idle();
+		bool mid_run = game_started && score > 0;
+		if (!mid_run) {
+			game_started = false;
+			show_idle();
+		} else {
+			// Keep the session; leave the last round visible and show the error.
+			set_loading(false);
+		}
 		lv_label_set_text(status_label, msg);
 		lv_obj_set_hidden(status_label, false);
 		free(job);
@@ -2206,6 +2474,15 @@ static void build_records(void) {
 	switcher_attach_back_gesture(records_screen);
 }
 
+// Fullscreen quiz chrome: no status bar, header sits at the top padding.
+static int quiz_header_y(const gui_config_t *cfg) {
+	return cfg ? cfg->padding + SC(4) : SC(8);
+}
+
+static int quiz_content_top(const gui_config_t *cfg) {
+	return quiz_header_y(cfg) + SC(56) + (cfg ? cfg->padding : SC(12));
+}
+
 static lv_obj_t *corner_button(lv_obj_t *screen, gui_config_t *cfg, int slot, const lv_image_dsc_t *glyph,
 							   lv_event_cb_t cb, lv_obj_t **icon_out) {
 	lv_obj_t *button = lv_btn_create(screen);
@@ -2214,8 +2491,7 @@ static lv_obj_t *corner_button(lv_obj_t *screen, gui_config_t *cfg, int slot, co
 	lv_obj_set_style_border_width(button, 0, 0);
 	lv_obj_set_style_shadow_width(button, 0, 0);
 	lv_obj_set_style_pad_all(button, 0, 0);
-	lv_obj_align(button, LV_ALIGN_TOP_RIGHT, -cfg->padding - slot * (SC(56) + SC(6)),
-				 cfg->padding + cfg->top_bar_height);
+	lv_obj_align(button, LV_ALIGN_TOP_RIGHT, -cfg->padding - slot * (SC(56) + SC(6)), quiz_header_y(cfg));
 	lv_obj_add_event_cb(button, cb, LV_EVENT_CLICKED, NULL);
 
 	lv_obj_t *icon = lv_image_create(button);
@@ -2399,8 +2675,16 @@ static void poll_cb(lv_timer_t *t) {
 
 static lv_timer_t *poll_timer;
 
+static void quiz_chrome_game(bool on) {
+	// Hide the status bar (no quickpanel spoiler) and the system chevron,
+	// which still parks below the bar height. Our own back sits with gear/trophy.
+	topbar_set_hidden(on);
+	back_btn_force_hidden(on);
+}
+
 static void loaded_cb(lv_event_t *e) {
 	(void)e;
+	quiz_chrome_game(true);
 	if (poll_timer) {
 		lv_timer_resume(poll_timer);
 	}
@@ -2411,13 +2695,20 @@ static void loaded_cb(lv_event_t *e) {
 		show_idle();
 		return;
 	}
-	// Resume only a live unanswered round. Otherwise Start (also covers a fresh
-	// entry after leaving the addon for More).
-	if (!game_started || answered || revealing || busy || round_correct < 0 ||
-		!round_tracks[round_correct].path[0]) {
-		if (game_started && (answered || revealing || busy)) {
-			abandon_session();
-		}
+	if (!game_started) {
+		show_idle();
+		return;
+	}
+	// Returning mid-feedback / reveal / load: advance or wait — do not abort
+	// the whole session (that felt like a random kick to Start).
+	if (busy) {
+		return;
+	}
+	if (answered || revealing) {
+		continue_after_answer();
+		return;
+	}
+	if (round_correct < 0 || !round_tracks[round_correct].path[0]) {
 		show_idle();
 		return;
 	}
@@ -2433,6 +2724,7 @@ static void unloaded_cb(lv_event_t *e) {
 	if (poll_timer) {
 		lv_timer_pause(poll_timer);
 	}
+	quiz_chrome_game(false);
 	// Leaving the addon (More, etc.) — not a detour into Settings/Records.
 	// Next entry must open on Start, not resume a half-finished run.
 	if (lv_screen_active() != settings_screen && lv_screen_active() != records_screen) {
@@ -2491,6 +2783,24 @@ static lv_obj_t *quiz_addon_init(const sonix_addon_host_t *host) {
 
 	lv_obj_t *title = settingsrow_title(quiz_screen, gui_cfg, ru() ? "Викторина" : "Quiz");
 	settingsrow_title_corner_slots(title, gui_cfg, 2);
+	// settingsrow_title parks below the status bar; pull it up for fullscreen.
+	{
+		int left = gui_cfg->padding + SC(56) + 14;
+		lv_obj_align(title, LV_ALIGN_TOP_LEFT, left, quiz_header_y(gui_cfg) + SC(10));
+	}
+
+	quiz_back_btn = lv_btn_create(quiz_screen);
+	lv_obj_set_size(quiz_back_btn, SC(56), SC(56));
+	lv_obj_set_style_bg_opa(quiz_back_btn, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_border_width(quiz_back_btn, 0, 0);
+	lv_obj_set_style_shadow_width(quiz_back_btn, 0, 0);
+	lv_obj_set_style_pad_all(quiz_back_btn, 0, 0);
+	lv_obj_align(quiz_back_btn, LV_ALIGN_TOP_LEFT, gui_cfg->padding, quiz_header_y(gui_cfg));
+	lv_obj_add_event_cb(quiz_back_btn, back_btn_cb, LV_EVENT_CLICKED, NULL);
+	quiz_back_icon = lv_image_create(quiz_back_btn);
+	lv_image_set_src(quiz_back_icon, &icon_chevron_left);
+	lv_obj_add_style(quiz_back_icon, &theme_style_icon, 0);
+	lv_obj_center(quiz_back_icon);
 
 	corner_button(quiz_screen, gui_cfg, 0, &icon_music_settings, open_settings_cb, NULL);
 	trophy_ready = heart_sprite_load("trophy.png", &trophy_dsc, &trophy_px);
@@ -2500,14 +2810,15 @@ static lv_obj_t *quiz_addon_init(const sonix_addon_host_t *host) {
 		corner_button(quiz_screen, gui_cfg, 1, &icon_star_corner, open_records_cb, &trophy_icon);
 	}
 
-	int top = settingsrow_content_top(gui_cfg);
+	int top = quiz_content_top(gui_cfg);
 	int pad = host->cfg->padding;
 	int sw = (int)host->cfg->screen_width;
+	int sh = (int)host->cfg->screen_height;
 
 	lv_obj_t *page = lv_obj_create(quiz_screen);
 	lv_obj_remove_style_all(page);
 	lv_obj_set_pos(page, pad, top);
-	lv_obj_set_size(page, sw - 2 * pad, (int)host->cfg->screen_height - top - pad);
+	lv_obj_set_size(page, sw - 2 * pad, sh - top - pad);
 	lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_flex_align(page, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 	lv_obj_set_style_pad_row(page, CHOICE_GAP, 0);
@@ -2836,7 +3147,7 @@ static lv_obj_t *quiz_addon_init(const sonix_addon_host_t *host) {
 	lv_timer_pause(snippet_timer);
 	power_pause_in_standby(snippet_timer);
 
-	seek_timer = lv_timer_create(seek_settle_cb, SEEK_SETTLE_MS, NULL);
+	seek_timer = lv_timer_create(seek_poll_cb, SEEK_POLL_MS, NULL);
 	lv_timer_pause(seek_timer);
 	power_pause_in_standby(seek_timer);
 
@@ -2924,6 +3235,8 @@ static bool quiz_addon_stop(void) {
 	}
 
 	quiz_screen = NULL;
+	quiz_back_btn = NULL;
+	quiz_back_icon = NULL;
 	settings_screen = NULL;
 	records_screen = NULL;
 	records_surv_val = NULL;
