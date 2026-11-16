@@ -1,9 +1,14 @@
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/input.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "common/store.h"
 #include "src/addon/addon.h"
@@ -12,6 +17,7 @@
 #include "src/gui/nowplaying/coverloader.h"
 #include "src/gui/shell/gui.h"
 #include "src/gui/shell/icons_select.h"
+#include "src/gui/shell/powermenu.h"
 #include "src/gui/shell/scale.h"
 #include "src/gui/shell/settingsrow.h"
 #include "src/gui/shell/spinner.h"
@@ -38,9 +44,12 @@
 // How many correct-deck skips to attempt before declaring the library done.
 #define CORRECT_SKIP_MAX 96
 #define SNIPPET_MS 12000
-#define SEEK_POLL_MS 30
-#define SEEK_WAIT_MS 4500
+// Paused load: poll length until known, then seek before audible playback.
+#define SNIPPET_LOAD_TICK_MS 30
+#define SNIPPET_LOAD_TRIES 150
 #define ANSWER_TICK_MS 200
+#define QUIZ_KEYS_NODE "/dev/input/event1"
+#define POWER_LONG_MS 1200
 #define CHOICE_H SC(80)
 #define CHOICE_GAP SC(8)
 #define TOOL_H SC(64)
@@ -208,13 +217,15 @@ static bool pool_failed_library;
 static bool pool_failed_tracks;
 static bool pool_failed_choices;
 static bool run_library_done; // results: finished the library, not lives/time
-static uint32_t seek_wait_started_ms;
+static int snippet_load_ticks;
+static bool force_relaxed; // one retry without near-dupe strictness
 
 static quiz_track_t round_tracks[CHOICES];
 static int round_correct = -1;
 static bool answered;
 static bool busy;
 static bool revealing;
+static bool paused;
 static unsigned job_gen;
 static int score;
 static int streak;		  // Endless: correct answers in a row
@@ -237,6 +248,26 @@ static bool feedback_holding;	  // solid colour, waiting to advance
 static int feedback_ok_idx = -1;
 static bool we_started_playback;
 static char snippet_path[PATH_MAX_QUIZ];
+
+static lv_obj_t *quiz_back_btn;
+static lv_obj_t *pause_btn;
+static lv_obj_t *pause_icon;
+static lv_obj_t *pause_box;
+static int pause_answer_left_ms;
+static int pause_run_left_ms;
+
+static int keys_fd = -1;
+static lv_timer_t *keys_timer;
+static bool power_down;
+static bool power_long;
+static int64_t power_since;
+static bool screen_was_on = true;
+
+static void pause_reset(void);
+static void pause_button_update(void);
+static void pause_apply(bool on);
+static void keys_open(void);
+static void keys_close(void);
 static uint32_t answer_deadline_ms;
 static int answer_left_ms;
 
@@ -466,6 +497,12 @@ static bool label_sep_char(unsigned char c) {
 	return c == ';' || c == '/' || c == '|' || c == '&' || c == ',' || c == '+';
 }
 
+// ASCII alphanumerics and every UTF-8 byte (≥0x80). Dropping high bytes folded
+// Cyrillic labels to empty strings, which then conflicted with everything.
+static bool label_char(unsigned char c) {
+	return isalnum(c) != 0 || c >= 0x80;
+}
+
 // Lowercase, map artist separators to spaces, keep letters/digits/spaces, collapse runs.
 static void label_fold(const char *in, char *out, size_t out_sz) {
 	if (!out || out_sz == 0) {
@@ -477,10 +514,10 @@ static void label_fold(const char *in, char *out, size_t out_sz) {
 		unsigned char c = *p;
 		if (label_sep_char(c)) {
 			c = ' ';
-		} else {
+		} else if (c < 0x80) {
 			c = (unsigned char)tolower(c);
 		}
-		if (!(isalnum(c) || c == ' ' || c == '\'')) {
+		if (!(label_char(c) || c == ' ' || c == '\'')) {
 			continue;
 		}
 		if (c == ' ') {
@@ -678,11 +715,12 @@ static void stop_snippet(void) {
 	if (seek_timer) {
 		lv_timer_pause(seek_timer);
 	}
-	// Also stop a paused restore_file that never reached play_file_at.
+	// Also stop a paused audio_play_paused that never reached play_file_at.
 	if (we_started_playback || snippet_path[0]) {
 		device_state_stop();
 		we_started_playback = false;
 	}
+	snippet_path[0] = '\0';
 }
 
 static void free_reveal_cover(void) {
@@ -764,56 +802,55 @@ static double snippet_offset(double total) {
 	return mid > 0.0 ? mid : 0.0;
 }
 
-// Load paused, wait until duration is known, then start at the snippet offset
-// so the first second of the file is never audible.
-static void seek_ready_play(double total) {
-	if (seek_timer) {
-		lv_timer_pause(seek_timer);
-	}
-	if (!snippet_path[0]) {
-		return;
-	}
-	double off = snippet_offset(total);
-	device_state_play_file_at(snippet_path, off > 0.0 ? off : 0.0);
-	we_started_playback = true;
+static void play_snippet_from(double offset) {
+	device_state_play_file_at(snippet_path, offset);
 	if (snippet_timer) {
 		lv_timer_reset(snippet_timer);
 		lv_timer_resume(snippet_timer);
 	}
 }
 
-static void seek_poll_cb(lv_timer_t *t) {
+// Load paused at 0 so nothing is heard until length is known; then seek and play.
+static void snippet_load_cb(lv_timer_t *t) {
 	(void)t;
-	if (!snippet_path[0]) {
+	if (!we_started_playback || !snippet_path[0]) {
 		if (seek_timer) {
 			lv_timer_pause(seek_timer);
 		}
 		return;
 	}
-	device_state_t st;
-	device_state_get(&st);
-	if (st.progress_total_secs > 0.5) {
-		seek_ready_play(st.progress_total_secs);
+	double total = 0.0;
+	audio_get_progress(NULL, &total);
+	if (total > 0.5) {
+		if (seek_timer) {
+			lv_timer_pause(seek_timer);
+		}
+		play_snippet_from(snippet_offset(total));
 		return;
 	}
-	if (lv_tick_elaps(seek_wait_started_ms) >= SEEK_WAIT_MS) {
-		// Duration never arrived — play from the start rather than hang silent.
-		seek_ready_play(0.0);
+	if (++snippet_load_ticks >= SNIPPET_LOAD_TRIES) {
+		if (seek_timer) {
+			lv_timer_pause(seek_timer);
+		}
+		play_snippet_from(0.0);
 	}
 }
 
 static void start_snippet(const char *path) {
+	if (paused) {
+		return;
+	}
 	stop_snippet();
 	if (!path || !path[0]) {
 		return;
 	}
 	snprintf(snippet_path, sizeof(snippet_path), "%s", path);
-	// Paused open: decoder warms up and total length becomes readable without sound.
-	device_state_restore_file(path, 0.0);
-	we_started_playback = false;
-	seek_wait_started_ms = lv_tick_get();
+	// Snippet, not the user's queue position: audio_play_paused keeps history clean.
+	we_started_playback = true;
+	snippet_load_ticks = 0;
+	audio_play_paused(path, 0.0);
 	if (seek_timer) {
-		lv_timer_set_period(seek_timer, SEEK_POLL_MS);
+		lv_timer_set_period(seek_timer, SNIPPET_LOAD_TICK_MS);
 		lv_timer_reset(seek_timer);
 		lv_timer_resume(seek_timer);
 	}
@@ -1231,6 +1268,7 @@ static void invalidate_pool(void) {
 	pool_failed_tracks = false;
 	run_library_done = false;
 	session_rounds = 0;
+	force_relaxed = false;
 }
 
 static bool cfg_same(const quiz_cfg_t *a, const quiz_cfg_t *b) {
@@ -1261,6 +1299,7 @@ static void abandon_session(void) {
 	memset(choice_missed, 0, sizeof(choice_missed));
 	last_result_line[0] = '\0';
 	invalidate_pool();
+	pause_reset();
 	hide_reveal();
 	hide_results();
 }
@@ -1424,7 +1463,8 @@ static bool fill_distractors_tracks(library_index_t *ix, int count, quiz_mode_t 
 			if (dup_path) {
 				continue;
 			}
-			if (label_used(picked, have, mode, &cand, pass == 0)) {
+			// pass 0: strict near-dupes; pass 1 / force_relaxed: exact + units only
+			if (label_used(picked, have, mode, &cand, !force_relaxed && pass == 0)) {
 				continue;
 			}
 			picked[have++] = cand;
@@ -1542,7 +1582,7 @@ static bool try_pick_artist_round(quiz_job_t *job, quiz_track_t picked[CHOICES])
 				if (already) {
 					continue;
 				}
-				if (artist_name_used(names, have, cand, pass == 0)) {
+				if (artist_name_used(names, have, cand, !force_relaxed && pass == 0)) {
 					continue;
 				}
 				snprintf(name_buf[have], sizeof(name_buf[0]), "%s", cand);
@@ -1585,12 +1625,13 @@ static bool pick_round_from_pool(quiz_job_t *job) {
 	quiz_track_t picked[CHOICES];
 	bool ok = (job->mode == MODE_ARTIST) ? try_pick_artist_round(job, picked) : try_pick_track_round(job, picked);
 	if (!ok) {
-		// Deck finished or remaining rows cannot form 4 distinct labels.
-		job->library_done = true;
-		if (session_rounds == 0) {
-			job->no_choices = true;
-			pool_failed_choices = true;
-			job->library_done = false;
+		job->no_choices = true;
+		pool_failed_choices = true;
+		// Truly finished the shuffled deck → library complete (if any rounds played).
+		if (deck_pos >= deck_n && session_rounds > 0) {
+			job->library_done = true;
+			job->no_choices = false;
+			pool_failed_choices = false;
 		}
 		return false;
 	}
@@ -1687,6 +1728,202 @@ static void start_timers_for_round(void) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Physical keys (EVIOCGRAB) — next/prev swallowed, play/pause = quiz pause,
+// volume forwarded, power short blanks+pauses, long opens the power menu.
+// ---------------------------------------------------------------------------
+
+static int64_t keys_now_ms(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void keys_close(void) {
+	if (keys_fd >= 0) {
+		ioctl(keys_fd, EVIOCGRAB, 0);
+		close(keys_fd);
+		keys_fd = -1;
+	}
+	power_down = false;
+	power_long = false;
+}
+
+static void keys_open(void) {
+	if (keys_fd >= 0) {
+		return;
+	}
+	int fd = open(QUIZ_KEYS_NODE, O_RDONLY | O_NONBLOCK);
+	if (fd < 0) {
+		return;
+	}
+	if (ioctl(fd, EVIOCGRAB, 1) != 0) {
+		close(fd);
+		return;
+	}
+	keys_fd = fd;
+	screen_was_on = true;
+}
+
+static void keys_tick(lv_timer_t *t) {
+	(void)t;
+	if (keys_fd < 0) {
+		return;
+	}
+	struct input_event ev[32];
+	ssize_t got;
+	while ((got = read(keys_fd, ev, sizeof(ev))) >= (ssize_t)sizeof(ev[0])) {
+		int count = (int)(got / (ssize_t)sizeof(ev[0]));
+		for (int i = 0; i < count; i++) {
+			const struct input_event *e = &ev[i];
+			if (e->type != EV_KEY) {
+				continue;
+			}
+			bool down = e->value != 0;
+			if (down) {
+				power_notify_activity();
+			}
+			switch (e->code) {
+			case KEY_PLAYPAUSE:
+				if (down && power_screen_is_on()) {
+					pause_apply(!paused);
+				}
+				break;
+			case KEY_NEXTSONG:
+			case KEY_PREVIOUSSONG:
+				break;
+			case KEY_VOLUMEUP:
+			case KEY_VOLUMEDOWN:
+				if (down) {
+					device_state_change_volume_percent(e->code == KEY_VOLUMEUP ? 1 : -1);
+					gui_notify_volume(device_state_get_volume_percent());
+				}
+				break;
+			case KEY_POWER:
+				if (down) {
+					if (!power_down) {
+						power_down = true;
+						power_long = false;
+						power_since = keys_now_ms();
+					}
+				} else if (power_down) {
+					if (!power_long) {
+						if (power_screen_is_on() && game_started && !paused && !run_needs_again) {
+							pause_apply(true);
+						}
+						power_notify_power_button();
+					}
+					power_down = false;
+				}
+				break;
+			default:
+				break;
+			}
+		}
+	}
+	if (power_down && !power_long && keys_now_ms() - power_since >= POWER_LONG_MS) {
+		power_long = true;
+		powermenu_request_show();
+	}
+	bool screen_on = power_screen_is_on();
+	if (!screen_on && screen_was_on && game_started && !paused && !run_needs_again && !busy && !revealing) {
+		pause_apply(true);
+	}
+	screen_was_on = screen_on;
+}
+
+static void pause_button_update(void) {
+	if (pause_icon) {
+		lv_image_set_src(pause_icon, paused ? &icon_play : &icon_pause);
+	}
+	if (pause_btn) {
+		bool available = game_started && round_correct >= 0 && !revealing && !busy && !run_needs_again;
+		lv_obj_set_hidden(pause_btn, !available && !paused);
+	}
+}
+
+static void pause_apply(bool on) {
+	if (on == paused) {
+		return;
+	}
+	if (on) {
+		if (!game_started || round_correct < 0 || revealing || busy || run_needs_again) {
+			return;
+		}
+		paused = true;
+		pause_answer_left_ms = 0;
+		if (per_answer_timer_active()) {
+			int left = (int)answer_deadline_ms - (int)lv_tick_get();
+			pause_answer_left_ms = left > 0 ? left : 0;
+		}
+		pause_run_left_ms = 0;
+		if (play_has_session_clock() && run_active) {
+			int left = (int)run_deadline_ms - (int)lv_tick_get();
+			pause_run_left_ms = left > 0 ? left : 0;
+		}
+		stop_snippet();
+		stop_answer_timer();
+		if (pause_box) {
+			lv_obj_set_hidden(pause_box, false);
+			lv_obj_move_foreground(pause_box);
+		}
+		if (quiz_back_btn) {
+			lv_obj_move_foreground(quiz_back_btn);
+		}
+	} else {
+		paused = false;
+		uint32_t now = lv_tick_get();
+		if (play_has_session_clock() && run_active) {
+			run_deadline_ms = now + (uint32_t)pause_run_left_ms;
+			run_left_ms = pause_run_left_ms;
+		}
+		if (per_answer_timer_active()) {
+			answer_deadline_ms = now + (uint32_t)pause_answer_left_ms;
+			answer_left_ms = pause_answer_left_ms;
+			if (answer_timer) {
+				lv_timer_reset(answer_timer);
+				lv_timer_resume(answer_timer);
+			}
+		}
+		if (pause_box) {
+			lv_obj_set_hidden(pause_box, true);
+		}
+		if (round_correct >= 0 && round_tracks[round_correct].path[0]) {
+			start_snippet(round_tracks[round_correct].path);
+		}
+		paint_timer();
+	}
+	pause_button_update();
+}
+
+static void pause_cb(lv_event_t *e) {
+	(void)e;
+	if (switcher_back_drag_active()) {
+		return;
+	}
+	pause_apply(!paused);
+}
+
+static void pause_resume_cb(lv_event_t *e) {
+	(void)e;
+	pause_apply(false);
+}
+
+static void pause_reset(void) {
+	paused = false;
+	pause_answer_left_ms = 0;
+	pause_run_left_ms = 0;
+	if (pause_box) {
+		lv_obj_set_hidden(pause_box, true);
+	}
+	if (pause_btn) {
+		lv_obj_set_hidden(pause_btn, true);
+	}
+	if (pause_icon) {
+		lv_image_set_src(pause_icon, &icon_pause);
+	}
+}
+
 static void poll_reveal_cover(void) {
 	if (!reveal_cover_pending || !reveal_cover_img) {
 		return;
@@ -1728,6 +1965,7 @@ static void reveal_tap_cb(lv_event_t *e) {
 
 static void show_results(void) {
 	hide_reveal();
+	pause_reset();
 	if (!results_box) {
 		return;
 	}
@@ -1885,8 +2123,9 @@ static void apply_round(void *user) {
 
 	if (!job->ok) {
 		if (job->library_done && session_rounds > 0) {
-			// Shuffled library finished mid-session — celebrate, don't error.
+			force_relaxed = false;
 			run_library_done = true;
+			pause_reset();
 			stop_snippet();
 			stop_answer_timer();
 			replay_set_available(false);
@@ -1906,12 +2145,38 @@ static void apply_round(void *user) {
 			free(job);
 			return;
 		}
+		// Strict near-dupe filter blocked a fill — one relaxed redraw, keep the run.
+		if (game_started && !force_relaxed && (job->no_choices || pool_failed_choices) && !job->no_library &&
+			!pool_failed_library && !job->no_tracks && !pool_failed_tracks) {
+			force_relaxed = true;
+			free(job);
+			start_round();
+			return;
+		}
+		force_relaxed = false;
+		// Mid-session and still cannot form a round → treat as library complete.
+		if (session_rounds > 0 && (job->no_choices || pool_failed_choices)) {
+			run_library_done = true;
+			pause_reset();
+			stop_snippet();
+			stop_answer_timer();
+			replay_set_available(false);
+			for (int i = 0; i < CHOICES; i++) {
+				if (choice_btn[i]) {
+					lv_obj_set_hidden(choice_btn[i], true);
+				}
+			}
+			end_run(false);
+			show_results();
+			free(job);
+			return;
+		}
 		const char *msg;
 		if (job->no_library || pool_failed_library) {
 			msg = ru() ? "Сначала просканируйте\nбиблиотеку в Music." : "Scan the library\nunder Music first.";
 		} else if (job->no_choices || pool_failed_choices) {
-			msg = ru() ? "Не удалось набрать 4 разных\nварианта. Попробуйте ещё раз."
-					   : "Could not pick 4 distinct\nchoices. Try again.";
+			msg = ru() ? "Не удалось собрать четыре варианта:\nмало разных треков/исполнителей."
+					   : "Could not build four choices:\ntoo few distinct tracks/artists.";
 		} else if (job->mode == MODE_ARTIST) {
 			msg = ru() ? "Нужно хотя бы 4 исполнителя\nв библиотеке." : "Need at least 4 artists\nin the library.";
 		} else {
@@ -1925,6 +2190,7 @@ static void apply_round(void *user) {
 		return;
 	}
 
+	force_relaxed = false;
 	answered = false;
 	revealing = false;
 	stop_answer_feedback();
@@ -1947,6 +2213,7 @@ static void apply_round(void *user) {
 	lv_obj_set_hidden(feedback_label, true);
 	lv_obj_set_hidden(status_label, true);
 	replay_set_available(true);
+	pause_button_update();
 
 	start_snippet(round_tracks[round_correct].path);
 	start_timers_for_round();
@@ -2102,7 +2369,7 @@ static bool try_spend_life(int which) {
 }
 
 static void choice_cb(lv_event_t *e) {
-	if (answered || busy || revealing || !game_started || switcher_back_drag_active()) {
+	if (answered || busy || revealing || paused || !game_started || switcher_back_drag_active()) {
 		return;
 	}
 	int which = (int)(intptr_t)lv_event_get_user_data(e);
@@ -2144,6 +2411,7 @@ static void show_idle(void) {
 	run_needs_again = false;
 	lives_left = 0;
 	memset(choice_missed, 0, sizeof(choice_missed));
+	pause_reset();
 	stop_snippet();
 	stop_answer_timer();
 	hide_reveal();
@@ -2258,7 +2526,7 @@ static void start_cb(lv_event_t *e) {
 
 static void replay_cb(lv_event_t *e) {
 	(void)e;
-	if (answered || busy || revealing || round_correct < 0 || switcher_back_drag_active()) {
+	if (answered || busy || revealing || paused || round_correct < 0 || switcher_back_drag_active()) {
 		return;
 	}
 	start_snippet(round_tracks[round_correct].path);
@@ -2759,6 +3027,10 @@ static lv_timer_t *poll_timer;
 static void loaded_cb(lv_event_t *e) {
 	(void)e;
 	quiz_chrome(true);
+	keys_open();
+	if (keys_timer) {
+		lv_timer_resume(keys_timer);
+	}
 	if (poll_timer) {
 		lv_timer_resume(poll_timer);
 	}
@@ -2769,21 +3041,28 @@ static void loaded_cb(lv_event_t *e) {
 		show_idle();
 		return;
 	}
-	if (!game_started) {
+	if (!game_started || round_correct < 0 || !round_tracks[round_correct].path[0]) {
 		show_idle();
+		return;
+	}
+	if (paused) {
+		if (pause_box) {
+			lv_obj_set_hidden(pause_box, false);
+			lv_obj_move_foreground(pause_box);
+		}
+		if (quiz_back_btn) {
+			lv_obj_move_foreground(quiz_back_btn);
+		}
 		return;
 	}
 	// Returning mid-feedback / reveal / load: advance or wait — do not abort
 	// the whole session (that felt like a random kick to Start).
 	if (busy) {
+		set_loading(true);
 		return;
 	}
 	if (answered || revealing) {
 		continue_after_answer();
-		return;
-	}
-	if (round_correct < 0 || !round_tracks[round_correct].path[0]) {
-		show_idle();
 		return;
 	}
 	start_snippet(round_tracks[round_correct].path);
@@ -2792,6 +3071,11 @@ static void loaded_cb(lv_event_t *e) {
 
 static void unloaded_cb(lv_event_t *e) {
 	(void)e;
+	keys_close();
+	if (keys_timer) {
+		lv_timer_pause(keys_timer);
+	}
+	pause_reset();
 	stop_snippet();
 	stop_answer_timer();
 	stop_answer_feedback();
@@ -2856,14 +3140,14 @@ static lv_obj_t *quiz_addon_init(const sonix_addon_host_t *host) {
 	sonix_addon_own_screen(addon_id, quiz_screen);
 
 	lv_obj_t *title = settingsrow_title(quiz_screen, gui_cfg, ru() ? "Викторина" : "Quiz");
-	settingsrow_title_corner_slots(title, gui_cfg, 2);
+	settingsrow_title_corner_slots(title, gui_cfg, 3);
 	// settingsrow_title parks below the status bar; pull it up for fullscreen.
 	{
 		int left = gui_cfg->padding + SC(56) + 14;
 		lv_obj_align(title, LV_ALIGN_TOP_LEFT, left, quiz_header_y(gui_cfg) + SC(10));
 	}
 
-	quiz_header_back(quiz_screen);
+	quiz_back_btn = quiz_header_back(quiz_screen);
 
 	corner_button(quiz_screen, gui_cfg, 0, &icon_music_settings, open_settings_cb, NULL);
 	trophy_ready = heart_sprite_load("trophy.png", &trophy_dsc, &trophy_px);
@@ -2872,6 +3156,8 @@ static lv_obj_t *quiz_addon_init(const sonix_addon_host_t *host) {
 	} else {
 		corner_button(quiz_screen, gui_cfg, 1, &icon_star_corner, open_records_cb, &trophy_icon);
 	}
+	pause_btn = corner_button(quiz_screen, gui_cfg, 2, &icon_pause, pause_cb, &pause_icon);
+	lv_obj_set_hidden(pause_btn, true);
 
 	int top = quiz_content_top(gui_cfg);
 	int pad = host->cfg->padding;
@@ -3206,11 +3492,58 @@ static lv_obj_t *quiz_addon_init(const sonix_addon_host_t *host) {
 	lv_label_set_text(results_btn_lbl, ru() ? "Ещё раз" : "Play again");
 	lv_obj_center(results_btn_lbl);
 
+	// Pause cover above choices / reveal / results; back stays above it.
+	pause_box = lv_obj_create(quiz_screen);
+	lv_obj_remove_style_all(pause_box);
+	lv_obj_set_size(pause_box, lv_pct(100), lv_pct(100));
+	lv_obj_align(pause_box, LV_ALIGN_TOP_LEFT, 0, 0);
+	lv_obj_set_style_bg_color(pause_box, lv_color_black(), 0);
+	lv_obj_set_style_bg_opa(pause_box, LV_OPA_50, 0);
+	lv_obj_set_style_pad_all(pause_box, pad, 0);
+	lv_obj_set_flex_flow(pause_box, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_flex_align(pause_box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_scrollable(pause_box, false);
+	lv_obj_set_clickable(pause_box, true);
+	lv_obj_add_event_cb(pause_box, pause_resume_cb, LV_EVENT_CLICKED, NULL);
+	lv_obj_set_hidden(pause_box, true);
+
+	lv_obj_t *pause_card = lv_obj_create(pause_box);
+	lv_obj_remove_style_all(pause_card);
+	lv_obj_set_width(pause_card, lv_pct(100));
+	lv_obj_set_height(pause_card, LV_SIZE_CONTENT);
+	lv_obj_set_style_bg_color(pause_card, theme()->surface, 0);
+	lv_obj_set_style_bg_opa(pause_card, LV_OPA_COVER, 0);
+	lv_obj_set_style_radius(pause_card, SC(20), 0);
+	lv_obj_set_style_pad_all(pause_card, SC(28), 0);
+	lv_obj_set_style_pad_row(pause_card, SC(8), 0);
+	lv_obj_set_flex_flow(pause_card, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_flex_align(pause_card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_scrollable(pause_card, false);
+	lv_obj_add_event_cb(pause_card, pause_resume_cb, LV_EVENT_CLICKED, NULL);
+
+	lv_obj_t *pause_title = lv_label_create(pause_card);
+	lv_obj_set_width(pause_title, lv_pct(100));
+	lv_obj_set_style_text_align(pause_title, LV_TEXT_ALIGN_CENTER, 0);
+	lv_obj_set_style_text_font(pause_title, &font_ui_26, 0);
+	lv_obj_set_style_text_color(pause_title, theme()->text_primary, 0);
+	lv_label_set_text(pause_title, ru() ? "Пауза" : "Paused");
+
+	lv_obj_t *pause_hint = lv_label_create(pause_card);
+	lv_obj_set_width(pause_hint, lv_pct(100));
+	lv_obj_set_style_text_align(pause_hint, LV_TEXT_ALIGN_CENTER, 0);
+	lv_obj_set_style_text_font(pause_hint, &font_ui_18, 0);
+	lv_obj_set_style_text_color(pause_hint, theme()->text_secondary, 0);
+	lv_label_set_text(pause_hint, ru() ? "Нажмите, чтобы продолжить" : "Tap to continue");
+
+	if (quiz_back_btn) {
+		lv_obj_move_foreground(quiz_back_btn);
+	}
+
 	snippet_timer = lv_timer_create(snippet_done_cb, SNIPPET_MS, NULL);
 	lv_timer_pause(snippet_timer);
 	power_pause_in_standby(snippet_timer);
 
-	seek_timer = lv_timer_create(seek_poll_cb, SEEK_POLL_MS, NULL);
+	seek_timer = lv_timer_create(snippet_load_cb, SNIPPET_LOAD_TICK_MS, NULL);
 	lv_timer_pause(seek_timer);
 	power_pause_in_standby(seek_timer);
 
@@ -3225,6 +3558,9 @@ static lv_obj_t *quiz_addon_init(const sonix_addon_host_t *host) {
 	feedback_timer = lv_timer_create(feedback_tick_cb, FEEDBACK_HALF_MS, NULL);
 	lv_timer_pause(feedback_timer);
 	power_pause_in_standby(feedback_timer);
+
+	keys_timer = lv_timer_create(keys_tick, 50, NULL);
+	lv_timer_pause(keys_timer);
 
 	poll_timer = lv_timer_create(poll_cb, 200, NULL);
 	lv_timer_pause(poll_timer);
@@ -3247,6 +3583,12 @@ static lv_obj_t *quiz_addon_init(const sonix_addon_host_t *host) {
 
 static bool quiz_addon_stop(void) {
 	job_gen++;
+	keys_close();
+	if (keys_timer) {
+		lv_timer_delete(keys_timer);
+		keys_timer = NULL;
+	}
+	pause_reset();
 	quiz_chrome(false);
 	stop_snippet();
 	stop_answer_timer();
@@ -3299,6 +3641,10 @@ static bool quiz_addon_stop(void) {
 	}
 
 	quiz_screen = NULL;
+	quiz_back_btn = NULL;
+	pause_btn = NULL;
+	pause_icon = NULL;
+	pause_box = NULL;
 	settings_screen = NULL;
 	records_screen = NULL;
 	records_surv_val = NULL;
