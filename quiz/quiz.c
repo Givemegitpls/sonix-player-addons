@@ -1421,7 +1421,68 @@ static bool ensure_deck(quiz_job_t *job) {
 	return build_deck(job, want_artists);
 }
 
-static bool pick_track_for_artist(const char *artist_name, quiz_track_t *out) {
+// First name in a raw artist tag: sole artist, or the lead before ; / | & , +
+// / "feat." / "ft." / "featuring". Matches how people read "Gorillaz;Jamie…".
+static void artist_tag_title(const char *raw, char *out, size_t out_sz) {
+	if (!out || out_sz == 0) {
+		return;
+	}
+	out[0] = '\0';
+	if (!raw || !raw[0]) {
+		return;
+	}
+	const char *start = raw;
+	while (*start == ' ' || *start == '\t') {
+		start++;
+	}
+	const char *end = start;
+	while (*end) {
+		unsigned char c = (unsigned char)*end;
+		if (label_sep_char(c) || c == '/') {
+			break;
+		}
+		// Word separators as in the library: "feat.", "ft.", "featuring".
+		if ((end == start || end[-1] == ' ' || end[-1] == '(' || end[-1] == '[') &&
+			(strncasecmp(end, "featuring", 9) == 0 || strncasecmp(end, "feat.", 5) == 0 ||
+			 strncasecmp(end, "feat ", 5) == 0 || strncasecmp(end, "ft.", 3) == 0 || strncasecmp(end, "ft ", 3) == 0)) {
+			break;
+		}
+		end++;
+	}
+	while (end > start && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '(' || end[-1] == '[')) {
+		end--;
+	}
+	size_t n = (size_t)(end - start);
+	if (n >= out_sz) {
+		n = out_sz - 1;
+	}
+	memcpy(out, start, n);
+	out[n] = '\0';
+}
+
+// True when `artist_name` is the title artist on this track (sole or first in tag).
+static bool artist_is_title_on_track(const char *artist_name, const char *path) {
+	if (!artist_name || !artist_name[0] || !path || !path[0]) {
+		return false;
+	}
+	char raw[256];
+	if (!library_track_artist(path, raw, sizeof(raw)) || !raw[0]) {
+		return false;
+	}
+	char title[256];
+	artist_tag_title(raw, title, sizeof(title));
+	if (!title[0]) {
+		return false;
+	}
+	char fa[LABEL_FOLD_MAX], fb[LABEL_FOLD_MAX];
+	label_fold(artist_name, fa, sizeof(fa));
+	label_fold(title, fb, sizeof(fb));
+	return fa[0] && fb[0] && strcmp(fa, fb) == 0;
+}
+
+// title_only: only accept a track where artist_name is the lead/sole tag artist
+// (correct-answer snippets). Distractors keep any linked track.
+static bool pick_track_for_artist(const char *artist_name, quiz_track_t *out, bool title_only) {
 	if (!artist_name || !artist_name[0] || !out) {
 		return false;
 	}
@@ -1432,8 +1493,26 @@ static bool pick_track_for_artist(const char *artist_name, quiz_track_t *out) {
 		library_index_close(ix);
 		return false;
 	}
-	int idx = rand() % count;
-	bool ok = load_track_at(ix, idx, out);
+
+	int start = rand() % count;
+	bool ok = false;
+	if (!title_only) {
+		ok = load_track_at(ix, start, out);
+	} else {
+		for (int i = 0; i < count; i++) {
+			int idx = (start + i) % count;
+			quiz_track_t cand;
+			if (!load_track_at(ix, idx, &cand)) {
+				continue;
+			}
+			if (!artist_is_title_on_track(artist_name, cand.path)) {
+				continue;
+			}
+			*out = cand;
+			ok = true;
+			break;
+		}
+	}
 	library_index_close(ix);
 	if (!ok) {
 		return false;
@@ -1597,7 +1676,9 @@ static bool try_pick_artist_round(quiz_job_t *job, quiz_track_t picked[CHOICES])
 		memset(picked, 0, sizeof(quiz_track_t) * CHOICES);
 		bool tracks_ok = true;
 		for (int i = 0; i < CHOICES; i++) {
-			if (!pick_track_for_artist(names[i], &picked[i])) {
+			// Correct snippet must feature this artist as the title/lead name;
+			// guests-only collabs are skipped so the heard act is on a button.
+			if (!pick_track_for_artist(names[i], &picked[i], i == 0)) {
 				tracks_ok = false;
 				break;
 			}
