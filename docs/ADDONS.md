@@ -780,7 +780,7 @@ place to find out. This is the state behind the list:
 | `spotify` | no | the C half builds, but the addon means nothing without its Rust engine, and the engine's session was never checked on a device |
 | `piped` | no | checked in the simulator and on a device against a live Piped instance; what it depends on is a third party (see `### piped`) |
 | `cassette` | yes | a decorative page: it has run on a device, and what it adds to a build is a small `.so` and its sprites |
-| `quiz` | yes | played on a device (owner, 2026-11-16/17): the artist difficulty, the library's own separator settings, the points scoring and the back guard were all checked there |
+| `quiz` | yes | played on a device (owner, 2026-11-16/17): the artist difficulty, the library's own separator settings and the back guard were checked there; the merged Survival (hearts and points in one mode, Skip, healing every ten rounds) has only been built, not played (2026-11-17) |
 | `addonstore` | yes | installed, updated and removed addons on a device (owner, 2026-11-16); its self-update is the same rename path |
 
 A plain `make` builds all of them, and that is deliberate: a developer's machine

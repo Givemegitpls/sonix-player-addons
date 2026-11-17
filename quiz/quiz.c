@@ -66,33 +66,40 @@
 
 typedef enum { MODE_ARTIST = 0, MODE_TRACK = 1, MODE_ALBUM = 2, MODE_COUNT } quiz_mode_t;
 typedef enum { PLAY_SURVIVAL = 0, PLAY_ENDLESS = 1, PLAY_TIMED = 2, PLAY_COUNT } play_mode_t;
-// Survival has two ways of keeping score: lives (a miss costs one) and points
-// (every answer is worth something, and a balance below zero ends the run).
-typedef enum { SCORING_LIVES = 0, SCORING_POINTS = 1, SCORING_COUNT } survival_scoring_t;
 
-// One record per (mode and scoring) x (difficulty the run was played on), where
-// the bucket is the artist level for an artist run and "track or album" for the
-// others -- those have no difficulty to speak of.
-typedef enum { REC_SURV_LIVES = 0, REC_SURV_POINTS, REC_ENDLESS, REC_TIMED, REC_COUNT } rec_profile_t;
+// One record per mode x (difficulty the run was played on), where the bucket is
+// the artist level for an artist run and "track or album" for the others --
+// those have no difficulty to speak of.
+typedef enum { REC_SURVIVAL = 0, REC_ENDLESS, REC_TIMED, REC_COUNT } rec_profile_t;
 typedef enum { REC_NONE = 0, REC_EASY, REC_MEDIUM, REC_HARD } rec_bucket_t;
 #define REC_BUCKETS 4
 
-// Short keys: settings.ini is hand-editable and 26 of them have to fit.
+// Short keys: settings.ini is hand-editable and the entries have to fit.
 static const char *const REC_KEYS[REC_COUNT][REC_BUCKETS] = {
 	{"b_sv_n", "b_sv_e", "b_sv_m", "b_sv_h"},
-	{"b_sp_n", "b_sp_e", "b_sp_m", "b_sp_h"},
 	{"b_en_n", "b_en_e", "b_en_m", "b_en_h"},
 	{"b_td_n", "b_td_e", "b_td_m", "b_td_h"},
 };
+// The two runs Survival used to be: the keys are folded into b_sv_* at load and
+// cleared, so a player's bests survive the merge.
+static const char *const LEGACY_SURV_POINTS_KEYS[REC_BUCKETS] = {"b_sp_n", "b_sp_e", "b_sp_m", "b_sp_h"};
 
-// The points variant, as asked for: an answer is worth 10 at the first second
-// and one less for every second spent listening, a miss is -10, silence -5, and
-// a balance under zero ends the run. The snippet is the clock, so the window is
-// SNIPPET_MS and nothing else runs out.
+// Survival keeps both a book of points and a row of hearts. An answer is worth
+// 10 at the first second and one less for every second spent listening; a wrong
+// answer costs 10 points and nothing else; silence and Skip cost a heart.
+// Running out of hearts ends the run, and the points are the score.
 #define POINTS_START 10
 #define POINTS_ANSWER_MAX 10
 #define POINTS_WRONG (-10)
 #define POINTS_TIMEOUT (-5)
+// The answer that was not given ends the round with two different signs: -1 is
+// the clock running out, -2 is the Skip button.
+#define ANSWER_TIMEOUT (-1)
+#define ANSWER_SKIPPED (-2)
+// Every HEAL_EVERY rounds the hearts are topped up; a run of that many answers
+// that were both right and worth more than HEAL_MIN_POINTS fills the row.
+#define HEAL_EVERY 10
+#define HEAL_MIN_POINTS 5
 // Who the artist round asks about: the one a listener names when the track
 // plays (first in the tag), any credit, or only the guests. A collaboration
 // tag is "A; B" and the library files the track under both, so without this
@@ -114,6 +121,10 @@ typedef struct {
 	char name[256];
 	char artist[256];
 	char album[256];
+	// The raw credit tag the library kept for the track ("A; B", "A feat. B").
+	// artist above may be replaced by the split name the round asks about, so the
+	// whole list of authors lives here and the preview reads it.
+	char credits[256];
 } quiz_track_t;
 
 typedef struct {
@@ -134,7 +145,6 @@ typedef struct {
 	quiz_mode_t ask;
 	artist_level_t artist_level;
 	play_mode_t play;
-	survival_scoring_t survival_scoring;
 	bool reveal_on;
 	int reveal_sec;
 	int survival_lives; // 1..5
@@ -172,7 +182,6 @@ static lv_obj_t *records_val[REC_COUNT][REC_BUCKETS];
 static lv_obj_t *prompt_label;
 static lv_obj_t *meta_row;
 static lv_obj_t *score_label;
-static lv_obj_t *balance_label;
 static lv_obj_t *lives_row;
 static lv_obj_t *lives_img[LIVES_MAX];
 static lv_obj_t *timer_label;
@@ -181,6 +190,9 @@ static lv_obj_t *choice_btn[CHOICES];
 static lv_obj_t *choice_lbl[CHOICES];
 static lv_obj_t *replay_btn;
 static lv_obj_t *replay_lbl;
+static lv_obj_t *skip_btn;
+static lv_obj_t *skip_lbl;
+static lv_obj_t *skip_heart;
 static lv_obj_t *idle_box;
 static lv_obj_t *idle_title;
 static lv_obj_t *idle_ask_cap;
@@ -223,6 +235,11 @@ static lv_image_dsc_t heart_empty_dsc;
 static void *heart_full_px;
 static void *heart_empty_px;
 static bool hearts_ready;
+// The broken heart on the Skip button: its own sprite, so the lives row keeps
+// whole hearts.
+static lv_image_dsc_t skip_sprite_dsc;
+static void *skip_sprite_px;
+static bool skip_sprite_ready;
 static lv_image_dsc_t trophy_dsc;
 static void *trophy_px;
 static bool trophy_ready;
@@ -232,12 +249,6 @@ static int best_score[REC_COUNT][REC_BUCKETS];
 
 static lv_obj_t *set_ask_pills[MODE_COUNT];
 static lv_obj_t *set_play_pills[PLAY_COUNT];
-// Difficulty of the artist round, on the start card: it is a choice for the
-// game, not a preference. Hidden while something else is what to guess.
-static lv_obj_t *idle_scoring_sec; // "Scoring" row: lives or points, Survival only
-static lv_obj_t *idle_scoring_cap;
-static lv_obj_t *idle_scoring_row;
-static lv_obj_t *idle_scoring_pills[SCORING_COUNT];
 static lv_obj_t *idle_level_sec;
 static lv_obj_t *idle_level_cap;
 static lv_obj_t *idle_level_row;
@@ -296,12 +307,15 @@ static bool revealing;
 static bool paused;
 static unsigned job_gen;
 static int score;
-static int points_balance; // only the points variant: opens at POINTS_START, under zero ends the run
 static int streak;		  // Endless: correct answers in a row
 static int best_streak;	  // Endless: best this session (for results if ever shown)
 static int run_correct;	  // correct answers in the current/last ended session
 static bool run_end_failed; // lives out vs time simply ran out
 static int lives_left;
+// Survival's healing: rounds played this run, and the answers in a row that were
+// right and worth more than HEAL_MIN_POINTS.
+static int heal_rounds;
+static int heal_perfect;
 static bool choice_missed[CHOICES];
 static bool game_started;
 static bool theme_hook;
@@ -372,7 +386,6 @@ static void cfg_defaults(void) {
 	cfg.ask = MODE_ARTIST;
 	cfg.artist_level = ARTIST_LEVEL_PRIMARY;
 	cfg.play = PLAY_SURVIVAL;
-	cfg.survival_scoring = SCORING_LIVES;
 	cfg.reveal_on = true;
 	cfg.reveal_sec = 3;
 	cfg.survival_lives = 3;
@@ -405,12 +418,6 @@ static void cfg_load(void) {
 	}
 	cfg.play = (play_mode_t)play;
 
-	int scoring = store_get_int(&store, "survival_scoring", (int)SCORING_LIVES);
-	if (scoring < 0 || scoring >= SCORING_COUNT) {
-		scoring = SCORING_LIVES;
-	}
-	cfg.survival_scoring = (survival_scoring_t)scoring;
-
 	cfg.reveal_on = store_get_int(&store, "reveal_on", 1) != 0;
 	cfg.reveal_sec = REVEAL_SECS[nearest_index(REVEAL_SECS, REVEAL_N, store_get_int(&store, "reveal_sec", 3))];
 
@@ -430,13 +437,23 @@ static void cfg_load(void) {
 			best_score[p][b] = v > 0 ? v : 0;
 		}
 	}
+	// Survival used to keep lives and points as two separate runs: the higher of
+	// the two is the record now, and the points keys go away.
+	for (int b = 0; b < REC_BUCKETS; b++) {
+		int v = store_get_int(&store, LEGACY_SURV_POINTS_KEYS[b], 0);
+		if (v > best_score[REC_SURVIVAL][b]) {
+			best_score[REC_SURVIVAL][b] = v;
+			store_set_int(&store, REC_KEYS[REC_SURVIVAL][b], v);
+		}
+		store_set(&store, LEGACY_SURV_POINTS_KEYS[b], "");
+	}
 	// Records kept before the table existed had no difficulty: they move to the
 	// "no difficulty" bucket rather than being lost.
 	static const struct {
 		const char *key;
 		rec_profile_t profile;
 	} LEGACY[] = {
-		{"best_survival_score", REC_SURV_LIVES},
+		{"best_survival_score", REC_SURVIVAL},
 		{"best_endless_streak", REC_ENDLESS},
 		{"best_timed_score", REC_TIMED},
 	};
@@ -455,6 +472,7 @@ static void cfg_load(void) {
 	store_set(&store, "lives", "");
 	store_set(&store, "run_sec", "");
 	store_set(&store, "limit_sec", "");
+	store_set(&store, "survival_scoring", "");
 	// The migration above only lives in memory until something writes the file;
 	// a launch that changed nothing would lose the records it just moved.
 	store_save(&store);
@@ -467,7 +485,6 @@ static void cfg_save(void) {
 	store_set_int(&store, "ask", (int)cfg.ask);
 	store_set_int(&store, "artist_level", (int)cfg.artist_level);
 	store_set_int(&store, "play", (int)cfg.play);
-	store_set_int(&store, "survival_scoring", (int)cfg.survival_scoring);
 	store_set_int(&store, "reveal_on", cfg.reveal_on ? 1 : 0);
 	store_set_int(&store, "reveal_sec", cfg.reveal_sec);
 	store_set_int(&store, "survival_lives", cfg.survival_lives);
@@ -476,8 +493,6 @@ static void cfg_save(void) {
 	store_set_int(&store, "timed_limit_sec", cfg.timed_limit_sec);
 	store_save(&store);
 }
-
-static bool play_points_mode(void);
 
 static void records_save(void) {
 	if (!store_ready) {
@@ -495,8 +510,8 @@ static void records_save(void) {
 	store_save(&store);
 }
 
-// The mode and scoring the run is being played with, and the difficulty it is
-// asked at: the two halves of the record's address.
+// The mode the run is being played with, and the difficulty it is asked at: the
+// two halves of the record's address.
 static rec_profile_t record_profile(void) {
 	if (cfg.play == PLAY_ENDLESS) {
 		return REC_ENDLESS;
@@ -504,7 +519,7 @@ static rec_profile_t record_profile(void) {
 	if (cfg.play == PLAY_TIMED) {
 		return REC_TIMED;
 	}
-	return cfg.survival_scoring == SCORING_POINTS ? REC_SURV_POINTS : REC_SURV_LIVES;
+	return REC_SURVIVAL;
 }
 
 static rec_bucket_t record_bucket(void) {
@@ -530,22 +545,18 @@ static void records_clear(void) {
 	records_save();
 }
 
-// Survival with points instead of lives: no hearts, no run clock, the snippet is
-// the answer window.
-static bool play_points_mode(void) {
-	return cfg.play == PLAY_SURVIVAL && cfg.survival_scoring == SCORING_POINTS;
-}
-
+// Hearts belong to Survival and Timed; Endless keeps only a streak.
 static bool play_has_lives(void) {
-	return cfg.play == PLAY_TIMED || (cfg.play == PLAY_SURVIVAL && !play_points_mode());
+	return cfg.play != PLAY_ENDLESS;
 }
 
 static bool play_has_session_clock(void) {
 	return cfg.play == PLAY_TIMED;
 }
 
+// Survival's answer window is the snippet itself; Timed has its own limit.
 static bool play_has_answer_clock(void) {
-	return cfg.play == PLAY_TIMED || play_points_mode();
+	return cfg.play != PLAY_ENDLESS;
 }
 
 static int cfg_lives(void) {
@@ -890,7 +901,7 @@ static int answer_points(int left_ms) {
 }
 
 static int per_answer_ms(void) {
-	return play_points_mode() ? SNIPPET_MS : cfg.timed_limit_sec * 1000;
+	return cfg.play == PLAY_TIMED ? cfg.timed_limit_sec * 1000 : SNIPPET_MS;
 }
 
 // White heart PNGs from assets/, tinted to the theme accent (same path as
@@ -961,8 +972,8 @@ static void paint_lives(void) {
 	if (total > LIVES_MAX) {
 		total = LIVES_MAX;
 	}
-	// Hearts only in Survival/Timed with 2+ lives.
-	if (!game_started || !hearts_ready || !play_has_lives() || total <= 1) {
+	// Hearts only in Survival/Timed, and never for Endless.
+	if (!game_started || !hearts_ready || !play_has_lives() || total < 1) {
 		lv_obj_set_hidden(lives_row, true);
 		return;
 	}
@@ -989,30 +1000,18 @@ static void paint_score(void) {
 	}
 	if (!game_started) {
 		lv_label_set_text(score_label, "");
-		if (balance_label) {
-			lv_obj_set_hidden(balance_label, true);
-		}
 		paint_lives();
 		return;
 	}
 	char line[64];
 	if (cfg.play == PLAY_ENDLESS) {
 		snprintf(line, sizeof(line), ru() ? "Серия %d" : "Streak %d", streak);
-	} else if (play_points_mode()) {
-		snprintf(line, sizeof(line), ru() ? "Угадано %d" : "Guessed %d", score);
 	} else {
+		// Survival and Timed both score points; Survival opens at POINTS_START
+		// so a Skip or a silent round has something to take.
 		snprintf(line, sizeof(line), ru() ? "Счёт %d" : "Score %d", score);
 	}
 	lv_label_set_text(score_label, line);
-	if (balance_label) {
-		if (game_started && play_points_mode()) {
-			snprintf(line, sizeof(line), "%d", points_balance);
-			lv_label_set_text(balance_label, line);
-			lv_obj_set_hidden(balance_label, false);
-		} else {
-			lv_obj_set_hidden(balance_label, true);
-		}
-	}
 	paint_lives();
 }
 
@@ -1120,6 +1119,24 @@ static void replay_set_available(bool on) {
 		lv_obj_add_state(replay_btn, LV_STATE_DISABLED);
 		lv_obj_set_clickable(replay_btn, false);
 		lv_obj_set_style_opa(replay_btn, LV_OPA_TRANSP, 0);
+	}
+}
+
+// Skip belongs to Survival: it spends a heart and says nothing about points.
+// Hidden elsewhere, and faded like Replay while the round is not open.
+static void skip_set_available(bool on) {
+	if (!skip_btn) {
+		return;
+	}
+	lv_obj_set_hidden(skip_btn, cfg.play != PLAY_SURVIVAL);
+	if (on) {
+		lv_obj_remove_state(skip_btn, LV_STATE_DISABLED);
+		lv_obj_set_clickable(skip_btn, true);
+		lv_obj_set_style_opa(skip_btn, LV_OPA_COVER, 0);
+	} else {
+		lv_obj_add_state(skip_btn, LV_STATE_DISABLED);
+		lv_obj_set_clickable(skip_btn, false);
+		lv_obj_set_style_opa(skip_btn, LV_OPA_40, 0);
 	}
 }
 
@@ -1237,8 +1254,10 @@ static void set_loading(bool on) {
 	}
 	if (on || answered || round_correct < 0) {
 		replay_set_available(false);
+		skip_set_available(false);
 	} else {
 		replay_set_available(true);
+		skip_set_available(true);
 	}
 	if (start_btn || idle_box) {
 		hide_idle();
@@ -1396,7 +1415,6 @@ static void invalidate_pool(void) {
 
 static bool cfg_same(const quiz_cfg_t *a, const quiz_cfg_t *b) {
 	return a->ask == b->ask && a->artist_level == b->artist_level && a->play == b->play &&
-		   a->survival_scoring == b->survival_scoring &&
 		   a->reveal_on == b->reveal_on && a->reveal_sec == b->reveal_sec &&
 		   a->survival_lives == b->survival_lives && a->timed_run_sec == b->timed_run_sec &&
 		   a->timed_limit_sec == b->timed_limit_sec && a->timed_lives == b->timed_lives;
@@ -1425,11 +1443,11 @@ static void abandon_session(void) {
 	run_end_failed = false;
 	lives_left = 0;
 	score = 0;
-	points_balance = 0;
 	streak = 0;
 	best_streak = 0;
 	run_correct = 0;
-	run_active = false;
+	heal_rounds = 0;
+	heal_perfect = 0;
 	memset(choice_missed, 0, sizeof(choice_missed));
 	last_result_line[0] = '\0';
 	invalidate_pool();
@@ -1489,6 +1507,7 @@ static bool load_track_at(library_index_t *ix, int idx, quiz_track_t *out) {
 	snprintf(out->path, sizeof(out->path), "%s", c.path);
 	snprintf(out->name, sizeof(out->name), "%s", c.name);
 	snprintf(out->artist, sizeof(out->artist), "%s", c.artist);
+	snprintf(out->credits, sizeof(out->credits), "%s", c.artist);
 	fill_album(out);
 	return true;
 }
@@ -1726,6 +1745,13 @@ static bool try_pick_artist_round(quiz_job_t *job, quiz_track_t picked[CHOICES])
 		names[0] = name_buf[0];
 		int have = 1;
 
+		// The track comes first: its credit tag is what keeps another artist of
+		// the same snippet out of the wrong options.
+		memset(picked, 0, sizeof(quiz_track_t) * CHOICES);
+		if (!pick_track_for_artist(names[0], job->artist_level, &picked[0])) {
+			continue;
+		}
+
 		for (int pass = 0; pass < 2 && have < CHOICES; pass++) {
 			for (int t = 0; t < DISTRACTOR_TRIES && have < CHOICES; t++) {
 				int idx = rand() % count;
@@ -1743,6 +1769,14 @@ static bool try_pick_artist_round(quiz_job_t *job, quiz_track_t picked[CHOICES])
 				if (already) {
 					continue;
 				}
+				// A name the snippet itself credits is another right answer, not
+				// a wrong one -- on Easy that is what made guests look common.
+				// Only the first pass is this strict: a small library that cannot
+				// fill four options would otherwise lose the round.
+				if (!force_relaxed && pass == 0 &&
+					artisttag_credit(&round_rules, picked[0].credits, cand) != ARTISTTAG_NONE) {
+					continue;
+				}
 				if (artist_name_used(names, have, cand, !force_relaxed && pass == 0)) {
 					continue;
 				}
@@ -1755,14 +1789,8 @@ static bool try_pick_artist_round(quiz_job_t *job, quiz_track_t picked[CHOICES])
 			continue;
 		}
 
-		memset(picked, 0, sizeof(quiz_track_t) * CHOICES);
-		// The correct answer needs a track at this level; the distractors are
-		// names only -- a wrong option has nothing to sound, and a guest-only
-		// artist is a perfectly good distractor. One index open per round
-		// instead of four.
-		if (!pick_track_for_artist(names[0], job->artist_level, &picked[0])) {
-			continue;
-		}
+		// The distractors are names only -- a wrong option has nothing to sound,
+		// and a guest-only artist is a perfectly good distractor.
 		for (int i = 1; i < CHOICES; i++) {
 			snprintf(picked[i].artist, sizeof(picked[i].artist), "%s", names[i]);
 		}
@@ -1826,7 +1854,7 @@ static void answer_tick_cb(lv_timer_t *t) {
 		}
 		run_left_ms = left;
 		if (left == 0) {
-			finish_answer(false, -1);
+			finish_answer(false, ANSWER_TIMEOUT);
 			return;
 		}
 	}
@@ -1837,7 +1865,7 @@ static void answer_tick_cb(lv_timer_t *t) {
 		}
 		answer_left_ms = left;
 		if (left == 0) {
-			finish_answer(false, -1);
+			finish_answer(false, ANSWER_TIMEOUT);
 			return;
 		}
 	}
@@ -1847,14 +1875,17 @@ static void answer_tick_cb(lv_timer_t *t) {
 static void start_timers_for_round(void) {
 	uint32_t now = lv_tick_get();
 
-	// Open a scored session once at Start for Survival (either scoring) / Timed.
-	if ((play_has_lives() || play_points_mode()) && !run_active) {
+	// Open a scored session once at Start: Survival and Timed run on hearts, and
+	// both keep points. Survival opens with something to spend, because a Skip
+	// or a silent round takes it away.
+	if (play_has_lives() && !run_active) {
 		run_active = true;
-		score = 0;
+		score = cfg.play == PLAY_SURVIVAL ? POINTS_START : 0;
 		run_correct = 0;
 		run_end_failed = false;
-		lives_left = play_has_lives() ? cfg_lives() : 0;
-		points_balance = POINTS_START;
+		lives_left = cfg_lives();
+		heal_rounds = 0;
+		heal_perfect = 0;
 		if (play_has_session_clock()) {
 			run_deadline_ms = now + (uint32_t)cfg.timed_run_sec * 1000u;
 			run_left_ms = cfg.timed_run_sec * 1000;
@@ -1862,8 +1893,6 @@ static void start_timers_for_round(void) {
 			run_left_ms = 0;
 		}
 		paint_score();
-	} else if (cfg.play == PLAY_ENDLESS && !game_started) {
-		// game_started is already true in start_cb; streak reset happens there.
 	}
 
 	if (play_has_session_clock() && run_active) {
@@ -2147,8 +2176,7 @@ static void show_results(void) {
 		if (run_library_done) {
 			lv_label_set_text(results_title, ru() ? "Медиатека пройдена" : "Library complete");
 		} else if (run_end_failed) {
-			lv_label_set_text(results_title, play_points_mode() ? (ru() ? "Очки в минусе" : "Out of points")
-															   : (ru() ? "Жизни закончились" : "Out of lives"));
+			lv_label_set_text(results_title, ru() ? "Жизни закончились" : "Out of lives");
 		} else {
 			lv_label_set_text(results_title, ru() ? "Время вышло" : "Time's up");
 		}
@@ -2176,16 +2204,13 @@ static void show_results(void) {
 		lv_label_set_text(results_stat_correct_lbl, ru() ? "угадано" : "correct");
 	}
 	if (results_stat_lives) {
-		// The second stat is what ended the run: hearts spent, or the balance.
+		// The second stat: the hearts a run ended with, where the mode has them.
 		int lives_total = cfg_lives();
-		bool show_points = play_points_mode();
-		bool show_lives = !show_points && play_has_lives() && lives_total > 1;
-		lv_obj_set_hidden(results_stat_lives, !show_points && !show_lives);
+		bool show_lives = play_has_lives() && lives_total > 0;
+		lv_obj_set_hidden(results_stat_lives, !show_lives);
 		if (results_stat_lives_val) {
 			char line[24];
-			if (show_points) {
-				snprintf(line, sizeof(line), "%d", points_balance);
-			} else if (show_lives) {
+			if (show_lives) {
 				snprintf(line, sizeof(line), "%d/%d", lives_left > 0 ? lives_left : 0, lives_total);
 			} else {
 				line[0] = '\0';
@@ -2193,8 +2218,7 @@ static void show_results(void) {
 			lv_label_set_text(results_stat_lives_val, line);
 		}
 		if (results_stat_lives_lbl) {
-			lv_label_set_text(results_stat_lives_lbl,
-							  show_points ? (ru() ? "баланс" : "balance") : (ru() ? "жизни" : "lives"));
+			lv_label_set_text(results_stat_lives_lbl, ru() ? "жизни" : "lives");
 		}
 	}
 	if (results_btn_lbl) {
@@ -2231,7 +2255,10 @@ static void show_preview(void) {
 	}
 	lv_label_set_text(reveal_title, t->name[0] ? t->name : t->path);
 	char meta[512];
-	snprintf(meta, sizeof(meta), "%s%s%s", t->artist, (t->artist[0] && t->album[0]) ? " · " : "", t->album);
+	// The whole credit list, not just the name the round asked about: credits is
+	// the tag as the library kept it, artist may be one split name of it.
+	const char *authors = t->credits[0] ? t->credits : t->artist;
+	snprintf(meta, sizeof(meta), "%s%s%s", authors, (authors[0] && t->album[0]) ? " · " : "", t->album);
 	lv_label_set_text(reveal_meta, meta);
 
 	if (reveal_cover_img) {
@@ -2280,6 +2307,7 @@ static void end_run(bool failed) {
 	}
 	stop_answer_timer();
 	replay_set_available(false);
+	skip_set_available(false);
 	paint_score();
 }
 
@@ -2294,6 +2322,7 @@ static void finish_library(void) {
 	stop_snippet();
 	stop_answer_timer();
 	replay_set_available(false);
+	skip_set_available(false);
 	for (int i = 0; i < CHOICES; i++) {
 		if (choice_btn[i]) {
 			lv_obj_set_hidden(choice_btn[i], true);
@@ -2385,6 +2414,7 @@ static void apply_round(void *user) {
 	lv_obj_set_hidden(feedback_label, true);
 	lv_obj_set_hidden(status_label, true);
 	replay_set_available(true);
+	skip_set_available(true);
 	pause_button_update();
 
 	start_snippet(round_tracks[round_correct].path);
@@ -2478,41 +2508,55 @@ static void finish_answer(bool ok, int which) {
 
 	int bonus = 0;
 	if (ok) {
-		if (play_points_mode()) {
-			// The visible score is the tracks guessed; the points are the balance,
-			// which is what can run out.
-			bonus = answer_points(answer_left_snap);
-			points_balance += bonus;
-			score++;
+		if (cfg.play == PLAY_ENDLESS) {
+			bonus = 1;
+			streak++;
+			if (streak > best_streak) {
+				best_streak = streak;
+			}
+			records_note(streak);
+		} else if (cfg.play == PLAY_TIMED) {
+			// Timed keeps its own scale: a point plus the seconds left on the
+			// answer clock, in thirds.
+			bonus = 1;
+			if (answer_left_snap > 0) {
+				bonus += answer_left_snap / 3000;
+			}
+			score += bonus;
 			if (run_active) {
 				run_correct++;
 			}
 		} else {
-			bonus = 1;
-			if (per_answer_timer_active() && answer_left_snap > 0) {
-				bonus += answer_left_snap / 3000;
-			}
-			if (cfg.play == PLAY_ENDLESS) {
-				streak++;
-				if (streak > best_streak) {
-					best_streak = streak;
-				}
-				records_note(streak);
-			} else {
-				score += bonus;
-				if (run_active) {
-					run_correct++;
-				}
+			bonus = answer_points(answer_left_snap);
+			score += bonus;
+			if (run_active) {
+				run_correct++;
 			}
 		}
-	} else {
-		if (play_points_mode()) {
-			points_balance += (which < 0) ? POINTS_TIMEOUT : POINTS_WRONG;
-		} else if (cfg.play == PLAY_ENDLESS) {
-			streak = 0;
-		} else if (run_active && play_has_lives() && lives_left > 0 && which >= 0) {
-			// Last life spent on this miss (timeout path uses which < 0).
-			lives_left = 0;
+	} else if (cfg.play == PLAY_ENDLESS) {
+		streak = 0;
+	} else if (run_active) {
+		if (cfg.play == PLAY_SURVIVAL) {
+			// Every miss costs a heart in Survival: a wrong answer, silence and
+			// Skip alike. Points come off for the first two.
+			if (which == ANSWER_TIMEOUT) {
+				score += POINTS_TIMEOUT;
+			} else if (which != ANSWER_SKIPPED) {
+				score += POINTS_WRONG;
+			}
+			if (lives_left > 0) {
+				lives_left--;
+			}
+		}
+	}
+	// Healing counts rounds of either kind, and a perfect run only counts
+	// answers that were both right and worth more than HEAL_MIN_POINTS.
+	if (cfg.play == PLAY_SURVIVAL && run_active) {
+		heal_rounds++;
+		if (ok && bonus > HEAL_MIN_POINTS) {
+			heal_perfect++;
+		} else {
+			heal_perfect = 0;
 		}
 	}
 	paint_score();
@@ -2525,6 +2569,8 @@ static void finish_answer(bool ok, int which) {
 		} else {
 			snprintf(line, sizeof(line), ru() ? "Верно! +%d" : "Correct! +%d", bonus);
 		}
+	} else if (which == ANSWER_SKIPPED) {
+		snprintf(line, sizeof(line), ru() ? "Пропуск — %s" : "Skipped — %s", right);
 	} else if (which < 0) {
 		snprintf(line, sizeof(line), ru() ? "Время! — %s" : "Time! — %s", right);
 	} else if (cfg.play == PLAY_ENDLESS) {
@@ -2532,23 +2578,38 @@ static void finish_answer(bool ok, int which) {
 	} else {
 		snprintf(line, sizeof(line), ru() ? "Нет — %s" : "No — %s", right);
 	}
+	if (cfg.play == PLAY_SURVIVAL && run_active && heal_rounds >= HEAL_EVERY) {
+		// Every tenth round: a perfect ten fills the row, anything else gives one
+		// heart back. A run that dies on the same round is not healed.
+		if (lives_left > 0) {
+			if (heal_perfect >= HEAL_EVERY) {
+				lives_left = cfg_lives();
+			} else if (lives_left < cfg_lives()) {
+				lives_left++;
+			}
+			heal_rounds = 0;
+			heal_perfect = 0;
+			paint_lives();
+		}
+	}
 	snprintf(last_result_line, sizeof(last_result_line), "%s", line);
 	lv_label_set_text(feedback_label, line);
 	lv_obj_set_hidden(feedback_label, cfg.reveal_on);
 	replay_set_available(false);
+	skip_set_available(false);
 
-	// Survival/Timed: end when lives are gone, or Timed session clock hits zero.
-	// Endless never ends a session here.
+	// Survival ends when the hearts are gone; Timed also ends when its clock
+	// runs out or when the last heart goes on a miss. Endless never ends here.
 	bool end_session = false;
-	if (play_points_mode()) {
-		if (points_balance < 0) {
-			end_session = true;
-			run_end_failed = true;
-		}
-	} else if (cfg.play != PLAY_ENDLESS && run_active) {
+	if (cfg.play != PLAY_ENDLESS && run_active) {
 		if (session_expired) {
 			end_session = true;
 			run_end_failed = false;
+		} else if (cfg.play == PLAY_SURVIVAL) {
+			end_session = lives_left <= 0;
+			if (end_session) {
+				run_end_failed = true;
+			}
 		} else if (!ok) {
 			end_session = true;
 			run_end_failed = true;
@@ -2561,9 +2622,10 @@ static void finish_answer(bool ok, int which) {
 	start_answer_feedback(ok, which);
 }
 
-// Wrong pick with lives left: spend one and keep the round open.
+// Wrong pick with lives left, Timed only: spend one and keep the round open.
+// Survival hands a wrong answer a points bill and moves on.
 static bool try_spend_life(int which) {
-	if (!play_has_lives() || !run_active || lives_left <= 1 || which < 0 || which >= CHOICES) {
+	if (cfg.play != PLAY_TIMED || !run_active || lives_left <= 1 || which < 0 || which >= CHOICES) {
 		return false;
 	}
 	if (choice_missed[which]) {
@@ -2598,6 +2660,18 @@ static void choice_cb(lv_event_t *e) {
 		return;
 	}
 	finish_answer(false, which);
+}
+
+// Skip: the round is given up for a heart, without a bill in points.
+static void skip_cb(lv_event_t *e) {
+	(void)e;
+	if (answered || busy || revealing || paused || !game_started || switcher_back_drag_active()) {
+		return;
+	}
+	if (cfg.play != PLAY_SURVIVAL || round_correct < 0 || lives_left <= 0) {
+		return;
+	}
+	finish_answer(false, ANSWER_SKIPPED);
 }
 
 // Out of the run, back to the start card (the same place the chevron goes).
@@ -2648,6 +2722,9 @@ static void show_idle(void) {
 	}
 	if (replay_btn) {
 		lv_obj_set_hidden(replay_btn, true);
+	}
+	if (skip_btn) {
+		lv_obj_set_hidden(skip_btn, true);
 	}
 	if (feedback_label) {
 		lv_obj_set_hidden(feedback_label, true);
@@ -2768,8 +2845,6 @@ static void refresh_ask_pills(void) {
 	refresh_level_pills();
 }
 
-static void refresh_scoring_pills(void);
-
 static void refresh_play_pills(void) {
 	for (int i = 0; i < PLAY_COUNT; i++) {
 		if (set_play_pills[i]) {
@@ -2785,7 +2860,6 @@ static void refresh_play_pills(void) {
 	if (set_timed_box) {
 		lv_obj_set_hidden(set_timed_box, cfg.play != PLAY_TIMED);
 	}
-	refresh_scoring_pills();
 }
 
 static void paint_idle_blurb(void) {
@@ -2793,14 +2867,12 @@ static void paint_idle_blurb(void) {
 		return;
 	}
 	char line[320];
-	if (cfg.play == PLAY_SURVIVAL && play_points_mode()) {
+	if (cfg.play == PLAY_SURVIVAL) {
 		snprintf(line, sizeof(line),
-				 ru() ? "Без жизней: +10, −1 за каждую секунду; −10 за ошибку, −5 за молчание. Ниже нуля — конец."
-					  : "No lives: +10, one less per second; -10 for a miss, -5 for silence. Under zero ends it.");
-	} else if (cfg.play == PLAY_SURVIVAL) {
-		snprintf(line, sizeof(line),
-				 ru() ? "Жизни: %d. Ошибка тратит жизнь.\nСчёт растёт за верные ответы."
-					  : "Lives: %d. A miss costs a life.\nScore grows with correct answers.",
+				 ru() ? "Жизни: %d. Верный ответ +10…+1, любая ошибка −10 или −5 и сердце, пропуск — сердце."
+						" Каждые 10 треков жизни пополняются."
+					  : "Lives: %d. A hit is +10…+1, any miss is -10 or -5 and a heart, Skip a heart."
+						" Heals every 10 tracks.",
 				 cfg.survival_lives);
 	} else if (cfg.play == PLAY_ENDLESS) {
 		snprintf(line, sizeof(line),
@@ -2846,28 +2918,6 @@ static void ask_pill_cb(lv_event_t *e) {
 	cfg.ask = (quiz_mode_t)v;
 	cfg_save();
 	sync_cfg_ui();
-}
-
-static void scoring_pill_cb(lv_event_t *e) {
-	int v = (int)(intptr_t)lv_event_get_user_data(e);
-	if (v < 0 || v >= SCORING_COUNT) {
-		return;
-	}
-	cfg.survival_scoring = (survival_scoring_t)v;
-	cfg_save();
-	sync_cfg_ui();
-}
-
-static void refresh_scoring_pills(void) {
-	for (int i = 0; i < SCORING_COUNT; i++) {
-		if (idle_scoring_pills[i]) {
-			settingsrow_pill_active(idle_scoring_pills[i], i == (int)cfg.survival_scoring);
-		}
-	}
-	// Lives or points is a Survival question: Endless has a streak, Timed a clock.
-	if (idle_scoring_sec) {
-		lv_obj_set_hidden(idle_scoring_sec, cfg.play != PLAY_SURVIVAL);
-	}
 }
 
 static void level_pill_cb(lv_event_t *e) {
@@ -3002,14 +3052,12 @@ static void open_settings_cb(lv_event_t *e) {
 
 static const char *record_profile_label(int p) {
 	switch (p) {
-	case REC_SURV_POINTS:
-		return ru() ? "очки" : "points";
 	case REC_ENDLESS:
 		return ru() ? "серия" : "streak";
 	case REC_TIMED:
 		return ru() ? "время" : "timed";
 	default:
-		return ru() ? "жизни" : "lives";
+		return ru() ? "выживание" : "survival";
 	}
 }
 
@@ -3285,9 +3333,6 @@ static void theme_cb(void) {
 	if (timer_label) {
 		lv_obj_set_style_text_color(timer_label, theme()->accent, 0);
 	}
-	if (balance_label) {
-		lv_obj_set_style_text_color(balance_label, theme()->accent, 0);
-	}
 	if (idle_box) {
 		lv_obj_set_style_bg_color(idle_box, theme()->surface, 0);
 	}
@@ -3314,6 +3359,12 @@ static void theme_cb(void) {
 	}
 	if (replay_btn) {
 		lv_obj_set_style_bg_color(replay_btn, theme()->surface, 0);
+	}
+	if (skip_btn) {
+		lv_obj_set_style_bg_color(skip_btn, theme()->surface, 0);
+	}
+	if (skip_heart) {
+		heart_tint(skip_heart, true);
 	}
 	if (reveal_box) {
 		lv_obj_set_style_bg_color(reveal_box, theme()->screen_bg, 0);
@@ -3468,7 +3519,13 @@ static lv_obj_t *make_choice(lv_obj_t *parent, int index) {
 
 	lv_obj_t *lbl = lv_label_create(btn);
 	lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
-	lv_obj_set_width(lbl, lv_pct(100));
+	// A pixel width, not lv_pct: a long track name has to be cut with the dots
+	// rather than pushed past the button's edge.
+	int label_w = gui_cfg ? (int)gui_cfg->screen_width - 2 * (int)gui_cfg->padding - 2 * SC(16) : SC(240);
+	if (label_w < SC(120)) {
+		label_w = SC(120);
+	}
+	lv_obj_set_width(lbl, label_w);
 	lv_obj_set_style_text_font(lbl, &font_ui_22, 0);
 	lv_obj_set_style_text_color(lbl, theme()->text_primary, 0);
 	lv_label_set_text(lbl, "");
@@ -3550,6 +3607,7 @@ static lv_obj_t *quiz_addon_init(const sonix_addon_host_t *host) {
 
 	hearts_ready = heart_sprite_load("heart.png", &heart_full_dsc, &heart_full_px) &&
 				   heart_sprite_load("heart_empty.png", &heart_empty_dsc, &heart_empty_px);
+	skip_sprite_ready = heart_sprite_load("skip_heart.png", &skip_sprite_dsc, &skip_sprite_px);
 
 	// Fixed slot for LIVES_MAX hearts so the row never changes width mid-run
 	// (and stays put while the timer digits tick).
@@ -3573,14 +3631,7 @@ static lv_obj_t *quiz_addon_init(const sonix_addon_host_t *host) {
 		lives_img[i] = img;
 	}
 
-	// The points variant's balance: the hearts' slot, because a run has one or
-	// the other and never both.
-	balance_label = lv_label_create(meta_row);
-	lv_obj_set_style_text_font(balance_label, &font_ui_22, 0);
-	lv_obj_set_style_text_color(balance_label, theme()->accent, 0);
-	lv_label_set_text(balance_label, "");
-	lv_obj_set_hidden(balance_label, true);
-
+	// The points are the score line; the hearts row is what a run spends.
 	timer_label = lv_label_create(meta_row);
 	lv_obj_set_width(timer_label, TIMER_SLOT_W);
 	lv_obj_set_style_text_align(timer_label, LV_TEXT_ALIGN_RIGHT, 0);
@@ -3635,14 +3686,6 @@ static lv_obj_t *quiz_addon_init(const sonix_addon_host_t *host) {
 	idle_play_pills[PLAY_ENDLESS] =
 		idle_pill(idle_play_row, ru() ? "Бескон." : "Endless", PLAY_ENDLESS, play_pill_cb);
 	idle_play_pills[PLAY_TIMED] = idle_pill(idle_play_row, ru() ? "Время" : "Timed", PLAY_TIMED, play_pill_cb);
-
-	// Survival's other way of keeping score, beside the mode it belongs to.
-	idle_scoring_sec =
-		idle_section(idle_box, ru() ? "Подсчёт" : "Scoring", &idle_scoring_cap, &idle_scoring_row);
-	idle_scoring_pills[SCORING_LIVES] =
-		idle_pill(idle_scoring_row, ru() ? "Жизни" : "Lives", SCORING_LIVES, scoring_pill_cb);
-	idle_scoring_pills[SCORING_POINTS] =
-		idle_pill(idle_scoring_row, ru() ? "Очки" : "Points", SCORING_POINTS, scoring_pill_cb);
 
 	idle_mode_blurb = lv_label_create(idle_box);
 	lv_label_set_long_mode(idle_mode_blurb, LV_LABEL_LONG_WRAP);
@@ -3703,6 +3746,30 @@ static lv_obj_t *quiz_addon_init(const sonix_addon_host_t *host) {
 	for (int i = 0; i < CHOICES; i++) {
 		choice_btn[i] = make_choice(page, i);
 		lv_obj_set_hidden(choice_btn[i], true);
+	}
+
+	// Skip sits under the answers, where the round is: the word and the broken
+	// heart the press spends.
+	skip_btn = make_tool_btn(page, skip_cb);
+	lv_obj_set_width(skip_btn, lv_pct(100));
+	lv_obj_set_flex_flow(skip_btn, LV_FLEX_FLOW_ROW);
+	lv_obj_set_flex_align(skip_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+	lv_obj_set_style_pad_column(skip_btn, SC(8), 0);
+	lv_obj_set_hidden(skip_btn, true);
+
+	skip_lbl = lv_label_create(skip_btn);
+	lv_obj_set_style_text_font(skip_lbl, &font_ui_18, 0);
+	lv_obj_set_style_text_color(skip_lbl, theme()->text_primary, 0);
+	lv_label_set_text(skip_lbl, ru() ? "Пропустить" : "Skip");
+
+	skip_heart = lv_image_create(skip_btn);
+	lv_obj_set_size(skip_heart, HEART_PX, HEART_PX);
+	if (skip_sprite_ready || hearts_ready) {
+		lv_image_set_src(skip_heart, skip_sprite_ready ? &skip_sprite_dsc : &heart_empty_dsc);
+		lv_image_set_inner_align(skip_heart, LV_IMAGE_ALIGN_STRETCH);
+		heart_tint(skip_heart, true);
+	} else {
+		lv_obj_set_hidden(skip_heart, true);
 	}
 
 	feedback_label = lv_label_create(page);
@@ -4053,7 +4120,6 @@ static bool quiz_addon_stop(void) {
 	}
 	prompt_label = NULL;
 	score_label = NULL;
-	balance_label = NULL;
 	for (int i = 0; i < LIVES_MAX; i++) {
 		if (lives_img[i]) {
 			lv_image_set_src(lives_img[i], NULL);
@@ -4072,6 +4138,12 @@ static bool quiz_addon_stop(void) {
 	memset(&heart_full_dsc, 0, sizeof(heart_full_dsc));
 	memset(&heart_empty_dsc, 0, sizeof(heart_empty_dsc));
 	hearts_ready = false;
+	if (skip_sprite_px) {
+		stbi_image_free(skip_sprite_px);
+		skip_sprite_px = NULL;
+	}
+	memset(&skip_sprite_dsc, 0, sizeof(skip_sprite_dsc));
+	skip_sprite_ready = false;
 	if (trophy_px) {
 		stbi_image_free(trophy_px);
 		trophy_px = NULL;
@@ -4083,6 +4155,9 @@ static bool quiz_addon_stop(void) {
 	feedback_label = NULL;
 	replay_btn = NULL;
 	replay_lbl = NULL;
+	skip_btn = NULL;
+	skip_lbl = NULL;
+	skip_heart = NULL;
 	meta_row = NULL;
 	idle_box = NULL;
 	idle_title = NULL;
@@ -4131,12 +4206,6 @@ static bool quiz_addon_stop(void) {
 	}
 	for (int i = 0; i < PLAY_COUNT; i++) {
 		set_play_pills[i] = NULL;
-	}
-	idle_scoring_sec = NULL;
-	idle_scoring_cap = NULL;
-	idle_scoring_row = NULL;
-	for (int i = 0; i < SCORING_COUNT; i++) {
-		idle_scoring_pills[i] = NULL;
 	}
 	idle_level_sec = NULL;
 	idle_level_cap = NULL;

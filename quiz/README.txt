@@ -8,8 +8,11 @@ INSTALL
 WHAT IT IS
   Guess the artist, the track or the album from a short snippet of a track in
   your library. The start card picks what to guess and how to play:
-    Survival — three lives by default, a wrong answer costs one, or Scoring
-               points: no lives, an answer is worth up to 10
+    Survival — hearts and points together: a hit is +10 down to +1 by the
+               seconds of the snippet, any miss costs a heart (a wrong answer
+               also -10, silence -5, Skip no points). Every tenth track tops the
+               hearts up (ten hits in a row worth more than 5 each fill the
+               row). Out of hearts ends the run, and the points are the score.
     Endless  — no lives, the streak is the score
     Timed    — a run clock and a per-answer clock, lives as in Survival
   Every game shuffles the library and asks each track (or each artist) once as
@@ -28,14 +31,14 @@ WHAT IT IS
   way the player's library splits them (its own separator settings), so the
   answer is always a name the Artists list would show.
 
-  Scoring points, beside the mode and Survival only: an answer is worth 10 at
-  the first second and one less for every second of the snippet, a wrong answer
-  is -10 and silence -5. There is no run clock and no hearts; the balance
-  opens at 10 and a run ends when it goes under zero. The line on the screen is
-  the number of tracks guessed.
-  Trophy — personal bests as a list, one row per mode and difficulty: lives
-  and points are separate records, and a run on Hard is its own row next to
-  Easy. Only combinations that were played are shown.
+  Skip, a row of its own under the choices, gives the round up for one heart and
+  no points; the broken heart it spends is drawn on it. It is Survival's own
+  button. The answer window there is the snippet: when the twelve seconds are
+  gone, the round is a silence. The reveal shows the cover, the album and every
+  name the tag credits.
+  Trophy — personal bests as a list, one row per mode and difficulty: a run on
+  Hard is its own row next to Easy. Only combinations that were played are
+  shown.
   Pause — the play/pause key, or the button in the corner. A round holds while
   the panel is dark and does not resume by itself.
   Back — the chevron or the swipe steps up one level: out of a round, the
@@ -58,8 +61,12 @@ KEYS
 ЧТО ЭТО
   Угадайте исполнителя, трек или альбом по короткому фрагменту трека из
   медиатеки. Стартовая карточка выбирает, что угадывать и как играть:
-    Выживание — три жизни по умолчанию, ошибка стоит одной, либо «Подсчёт:
-               очки»: жизней нет, верный ответ стоит до 10
+    Выживание — жизни и баллы вместе: верный ответ +10…+1 по секундам
+               фрагмента, любая ошибка стоит сердца (неверный ответ ещё −10,
+               молчание −5, «Пропустить» — без баллов). Каждые 10 треков жизни
+               пополняются (десять верных подряд дороже 5 баллов заполняют
+               полоску целиком). Жизни кончились — конец забега, баллы и есть
+               счёт.
     Бесконечный — жизней нет, счёт — серия
     На время  — общий таймер и таймер на ответ, жизни как в «Выживании»
   За игру медиатека перемешивается, и каждый трек (или исполнитель)
@@ -78,14 +85,13 @@ KEYS
   Тег разбирается теми же разделителями, что в настройках медиатеки плеера,
   поэтому ответ — всегда имя, которое показал бы список исполнителей.
 
-  «Подсчёт: очки» — рядом с режимом и только для «Выживания»: ответ стоит 10
-  на первой секунде и на балл меньше за каждую секунду фрагмента, ошибка −10,
-  молчание −5. Общего таймера и сердечек нет: баланс начинается с 10 и игра
-  кончается, когда он уходит ниже нуля. В строке на экране — число угаданных
-  треков.
-  Кубок — рекорды списком: по строке на режим и сложность. «Жизни» и «очки» —
-  разные рекорды, и прогон на «Сложном» лежит отдельно от «Лёгкого».
-  Показываются только те сочетания, которые играли.
+  «Пропустить» — отдельной строкой под вариантами: ход сдаётся за одно сердце и
+  ничего не стоит в баллах, на кнопке нарисовано разбитое сердце. Кнопка есть
+  только в «Выживании». Окно ответа там — сам фрагмент: когда двенадцать секунд
+  прошли, раунд считается молчанием. Превью ответа показывает обложку, альбом и
+  все имена, которые указаны в теге.
+  Кубок — рекорды списком: по строке на режим и сложность. Прогон на «Сложном»
+  лежит отдельно от «Лёгкого». Показываются только те сочетания, которые играли.
   Пауза — клавиша play/pause или кнопка в углу. Пока экран погашен, раунд
   стоит на паузе и сам не продолжается.
   Назад — шеврон или свайп поднимают на уровень: из раунда, превью ответа или

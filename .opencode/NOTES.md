@@ -826,11 +826,53 @@ deck back to a file-scope array freed by the UI thread — that was the crash.
 
 ## quiz: records are a table, and the addon's store grew for it (2026-11-17)
 
-`quiz` keeps one best per (mode and scoring) x (difficulty the run was played
-on): 16 keys named `b_sv_*`, `b_sp_*`, `b_en_*`, `b_td_*` with the last letter
-`n`/`e`/`m`/`h` (track-album, easy, medium, hard). That pushed
-`common/store.h` `STORE_KEYS` from 16 to 32 — every addon's `store_t` grew by
-about 5 KB, so do not shrink it back without moving the records somewhere else.
-Old `best_survival_score` / `best_endless_streak` / `best_timed_score` are
-migrated into the `_n` bucket at load and written back at once (a load that
-only migrated used to lose them).
+`quiz` keeps one best per mode x (difficulty the run was played on), 12 keys:
+`b_sv_*`, `b_en_*`, `b_td_*` with the last letter `n`/`e`/`m`/`h` (track-album,
+easy, medium, hard). That pushed `common/store.h` `STORE_KEYS` from 16 to 32 —
+every addon's `store_t` grew by about 5 KB, so do not shrink it back without
+moving the records somewhere else. The two Survival variants (lives and points)
+were merged into one mode on 2026-11-17; the old `b_sp_*` keys are folded into
+`b_sv_*` as the higher of the two per bucket and cleared at load (the legacy
+`best_survival_score` / `best_endless_streak` / `best_timed_score` still migrate
+into the `_n` bucket, written back at once — a load that only migrated used to
+lose them).
+
+## quiz: Survival is one mode now (2026-11-17)
+
+There is no "lives or points" choice any more. Survival keeps both: a hit is
+`answer_points()` (+10 down to +1 by the snippet second), any miss costs a heart
+— a wrong answer `POINTS_WRONG` and the round moves on, silence
+`POINTS_TIMEOUT`, Skip (`ANSWER_SKIPPED`) no points. The answer window is
+`SNIPPET_MS` (12 s); the run ends when `lives_left` reaches 0 and the points are
+the score. `finish_answer()` takes the two non-answer paths as `which == -1`
+(timeout) and `-2` (skip) — any positive `which` is a pick.
+Healing: `heal_rounds` counts Survival rounds, `heal_perfect` counts hits worth
+more than `HEAL_MIN_POINTS` in a row; on every tenth round the hearts are refilled
+(`lives_left = cfg_lives()` after ten perfect, otherwise +1), and never on the
+round that kills the run. The counter is updated for *both* outcomes, outside the
+miss branch of `finish_answer()` — it lived inside it once and no correct answer
+ever counted (fixed 2026-11-18, "сердечки не восстанавливаются").
+
+## quiz: credits, the artist round and the skip row (2026-11-17)
+
+- `quiz_track_t.credits` holds the raw MEDIA_TABLE artist tag. In the artist
+  round `artist` is overwritten with the split name that is the answer, so the
+  preview (`show_preview`) reads `credits` to show every author the tag names.
+- Artist-round distractors are rejected when `artisttag_credit()` says the name is
+  credited on the correct track (pass 0 only, relaxed pass and `force_relaxed`
+  may still use them). Without this, a guest of "A; B" sat next to A as a wrong
+  option and looked like a frequent guest question, especially on Easy.
+- Choice labels get an explicit pixel width: `lv_pct(100)` inside the button did
+  not cut long titles with `LV_LABEL_LONG_DOT` on the device.
+- Skip is a full-width row created *after* the four choices (child order is the
+  layout order in the page's flex column), with the word and a broken-heart
+  sprite (`quiz/assets/skip_heart.png`, same `HEART_PX` as a life, its own `dsc`
+  so the lives row keeps whole hearts; falls back to `heart_empty.png`). The
+  sprite is the owner's own drawing (`~/drawing.png`, 2026-11-18), 64x64
+  white-on-transparent with the heart's bbox -- used byte for byte, never
+  regenerated. The heart is tinted in `theme_cb` at full opacity, not the 40% of
+  a spent life.
+- The player notices a changed addon by `addon.so` and `addon.json` only
+  (`slot_files_current()`): replacing a file under `assets/` changes nothing
+  until the `.so` is pushed again or the player restarts, because the sprite is
+  decoded once in `init()`.
