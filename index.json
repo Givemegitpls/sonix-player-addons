@@ -1,0 +1,225 @@
+{
+  "schema": 1,
+  "repo": "Givemegitpls/sonix-player-addons",
+  "addons": [
+    {
+      "id": "2048",
+      "version": "0.2.0",
+      "title": "2048",
+      "titles": {
+        "Russian": "2048"
+      },
+      "section": "more",
+      "tag": "2048-v0.2.0",
+      "asset": "2048.zip",
+      "size": 44289,
+      "sha256": "d6865757f19784e67269e76dab9389db63d210e1e6d6654dc69f671bd582656e",
+      "so_size": 74876,
+      "so_sha256": "bc4d7767e261c19b095380491e8732c345443fd84b65e59d488f823399ff7b28",
+      "url": "https://github.com/Givemegitpls/sonix-player-addons/releases/download/2048-v0.2.0/2048.zip"
+    },
+    {
+      "id": "addonstore",
+      "version": "0.4.0",
+      "title": "Store",
+      "titles": {
+        "Russian": "Магазин"
+      },
+      "section": "more",
+      "tag": "addonstore-v0.4.0",
+      "asset": "addonstore.zip",
+      "size": 67102,
+      "sha256": "aa5c101c00feaedb450baf01eab8847fa426342395a2d87f954737bc965e5d2b",
+      "so_size": 113964,
+      "so_sha256": "578c6f21a599bc5ea222d20f18498ddf1d9ae43f42605061e060272bd5201834",
+      "url": "https://github.com/Givemegitpls/sonix-player-addons/releases/download/addonstore-v0.4.0/addonstore.zip"
+    },
+    {
+      "id": "cassette",
+      "version": "0.4.0",
+      "title": "Cassette",
+      "titles": {
+        "Russian": "Кассета",
+        "Italiano": "Cassetta"
+      },
+      "section": "music",
+      "tag": "cassette-v0.4.0",
+      "asset": "cassette.zip",
+      "size": 177874,
+      "sha256": "0d02d4e4e1bcc29e896a7f128671e4c9f28bd07e688150ba4d0e81f9c5e8fccd",
+      "so_size": 52696,
+      "so_sha256": "239d08d1edb0ad88ac45e1605a857b4ca471dfe36a5a3a701ed6a635b5b25867",
+      "url": "https://github.com/Givemegitpls/sonix-player-addons/releases/download/cassette-v0.4.0/cassette.zip"
+    },
+    {
+      "id": "daily",
+      "version": "0.2.0",
+      "title": "Daily",
+      "titles": {
+        "Russian": "Трек дня",
+        "English": "Daily",
+        "Italiano": "Brano del giorno"
+      },
+      "section": "music",
+      "tag": "daily-v0.2.0",
+      "asset": "daily.zip",
+      "size": 36843,
+      "sha256": "595598b9a6899c2a1476d10e8d201ec0dda3afba3a1b2f4c2660dfd5d4d2919e",
+      "so_size": 56904,
+      "so_sha256": "1c885aebf91c9946ce5a4e5a331e83e09f353122bbe7a3537f31befa150e9ddd",
+      "url": "https://github.com/Givemegitpls/sonix-player-addons/releases/download/daily-v0.2.0/daily.zip"
+    },
+    {
+      "id": "dino",
+      "version": "0.2.0",
+      "title": "Dino",
+      "titles": {
+        "Russian": "Динозаврик",
+        "Italiano": "Dino"
+      },
+      "section": "more",
+      "tag": "dino-v0.2.0",
+      "asset": "dino.zip",
+      "size": 44920,
+      "sha256": "0f6013627d31cfd6e76f2dc186f03351ed80954c5c7a134589acf08e12e1ee51",
+      "so_size": 75064,
+      "so_sha256": "82af22635b4a84757c0f663bf7ce997062364d1a6ad2435c393b614b82122d4d",
+      "url": "https://github.com/Givemegitpls/sonix-player-addons/releases/download/dino-v0.2.0/dino.zip"
+    },
+    {
+      "id": "flappybird",
+      "version": "0.2.0",
+      "title": "Flappy Bird",
+      "titles": {
+        "Russian": "Flappy Bird",
+        "Italiano": "Flappy Bird"
+      },
+      "section": "more",
+      "tag": "flappybird-v0.2.0",
+      "asset": "flappybird.zip",
+      "size": 182941,
+      "sha256": "7a590082720f63fcfe4f5c8976910dd2db0f9cc8e2eef0276329f9c98319f56e",
+      "so_size": 78440,
+      "so_sha256": "9b2cdd3766c720fb4751105ca004f6f77751df445f013502bd09fd2c08c12f56",
+      "url": "https://github.com/Givemegitpls/sonix-player-addons/releases/download/flappybird-v0.2.0/flappybird.zip"
+    },
+    {
+      "id": "gearboy",
+      "version": "0.2.0",
+      "title": "Gearboy",
+      "titles": {
+        "Russian": "Gearboy",
+        "Italiano": "Gearboy"
+      },
+      "section": "more",
+      "tag": "gearboy-v0.2.0",
+      "asset": "gearboy.zip",
+      "size": 773156,
+      "sha256": "0fae2ec74c53b8c84f26c59f9c1f3b7b32f957aa3f2b402122fc2cc98c61f26f",
+      "so_size": 2616612,
+      "so_sha256": "663ad984d23e4d00a1f379bf9f3fc95d1ab0ba5d76aaa4cc8b57b347647c2e55",
+      "url": "https://github.com/Givemegitpls/sonix-player-addons/releases/download/gearboy-v0.2.0/gearboy.zip"
+    },
+    {
+      "id": "gravity",
+      "version": "0.2.0",
+      "title": "Gravity Defied",
+      "titles": {
+        "Russian": "Gravity Defied",
+        "Italiano": "Gravity Defied"
+      },
+      "section": "more",
+      "tag": "gravity-v0.2.0",
+      "asset": "gravity.zip",
+      "size": 879134,
+      "sha256": "a72119716c6df5680e68534cfa481d6faa9442b266551c01bfce003e10818e6a",
+      "so_size": 2515092,
+      "so_sha256": "4288addf4ad8383f8d3a1000a77bef76a95b331cbc5bd5e7c805744543a2a6de",
+      "url": "https://github.com/Givemegitpls/sonix-player-addons/releases/download/gravity-v0.2.0/gravity.zip"
+    },
+    {
+      "id": "qobuz",
+      "version": "0.1",
+      "title": "Qobuz",
+      "titles": {
+        "Russian": "Qobuz",
+        "Italiano": "Qobuz"
+      },
+      "section": "streaming",
+      "tag": "0.0.6",
+      "asset": "qobuz.zip",
+      "size": 99694,
+      "sha256": "3b79aedb4b0ff0ee464ca9fbfc2bb1639dc90522c78c184275681381c490e49e",
+      "so_size": 156752,
+      "so_sha256": "5611f3d3e125fbb25f328f64ebe51c621ee6378253c225f0c82cd30838b1683b",
+      "url": "https://github.com/Givemegitpls/sonix-player-addons/releases/download/0.0.6/qobuz.zip"
+    },
+    {
+      "id": "quiz",
+      "version": "0.12.0",
+      "title": "Quiz",
+      "titles": {
+        "Russian": "Викторина",
+        "Italiano": "Quiz"
+      },
+      "section": "more",
+      "tag": "quiz-v0.12.0",
+      "asset": "quiz.zip",
+      "size": 71647,
+      "sha256": "7478cac34452ca26361dabe68b08ba525826209093e3016811a66942d831215d",
+      "so_size": 124008,
+      "so_sha256": "bba5407b6e3a92adef4cc155320561c23d425d335194724b5c92fdb5f2fa1a70",
+      "url": "https://github.com/Givemegitpls/sonix-player-addons/releases/download/quiz-v0.12.0/quiz.zip"
+    },
+    {
+      "id": "subsonic",
+      "version": "0.2",
+      "title": "Subsonic",
+      "titles": {
+        "Russian": "Subsonic"
+      },
+      "section": "streaming",
+      "tag": "0.0.6",
+      "asset": "subsonic.zip",
+      "size": 66955,
+      "sha256": "22d340e3bae7eb09863c3d2b46c3852bad89d01af093dbcea0a462561e6ef9ca",
+      "so_size": 130868,
+      "so_sha256": "276501a56b3b8996b98abac9b3bd1b40a6131edc7846eb63110c9ba171ec707a",
+      "url": "https://github.com/Givemegitpls/sonix-player-addons/releases/download/0.0.6/subsonic.zip"
+    },
+    {
+      "id": "tictactoe",
+      "version": "0.2.0",
+      "title": "Tic Tac Toe",
+      "titles": {
+        "Russian": "Крестики-нолики",
+        "Italiano": "Tris"
+      },
+      "section": "more",
+      "tag": "tictactoe-v0.2.0",
+      "asset": "tictactoe.zip",
+      "size": 42655,
+      "sha256": "1b4c00236e12b1a343c614974e89e689c6c7de27aafdefbe740452eb33be9f92",
+      "so_size": 70752,
+      "so_sha256": "f0f72df06d32284b7ea88bc9c142d63b91b19f8f631f6dac700c495bbe3323a5",
+      "url": "https://github.com/Givemegitpls/sonix-player-addons/releases/download/tictactoe-v0.2.0/tictactoe.zip"
+    },
+    {
+      "id": "yandex",
+      "version": "0.1",
+      "title": "Yandex Music",
+      "titles": {
+        "Russian": "Яндекс Музыка",
+        "Italiano": "Yandex Music"
+      },
+      "section": "streaming",
+      "tag": "0.0.6",
+      "asset": "yandex.zip",
+      "size": 147669,
+      "sha256": "7a2ff92f39de2bcd6b18f4c2f44622ae7d5de34bf18dddd45c5fee6ed6e77428",
+      "so_size": 300424,
+      "so_sha256": "4e1fe7feaf8e72bb253d69eab08b67c37a29e1d0301c15e3403a33115a0c0bf9",
+      "url": "https://github.com/Givemegitpls/sonix-player-addons/releases/download/0.0.6/yandex.zip"
+    }
+  ]
+}
