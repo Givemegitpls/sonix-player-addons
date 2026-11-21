@@ -4,5 +4,6 @@
   "titles": { "Russian": "Трек дня", "English": "Daily", "Italiano": "Brano del giorno" },
   "section": "music",
   "version": "0.1.0",
-  "icon": "icon.png"
+  "icon": "icon.png",
+  "unload": "leave"
 }

@@ -69,14 +69,18 @@ byte copies, so no client is offered an update for an addon that did not change.
 
 ## Rules that keep biting
 
-- An addon is **unloaded** when the card leaves or its files change on the card,
-  so every one exports `sonix_addon_stop_entry` (`sonix_addon_stop_t.stop`,
+- An addon is **unloaded** when the card leaves, its files change on the card, or
+  — for an app addon whose manifest says `"unload": "leave"` — when the user
+  leaves its page (docs/ADDONS.md, "Leaving a page"). So every one exports
+  `sonix_addon_stop_entry` (`sonix_addon_stop_t.stop`,
   `bool`): true means the library may be `dlclose()`d, false means a worker is
   still inside it and the mapping is kept instead. A library without the symbol
   is refused at load. `stop()` joins threads, deletes its `lv_timer`s (with
   `power_forget_timer()`), withdraws `theme`/`device_state`/`streamturn`
   registrations, and registers every screen it creates with
-  `sonix_addon_own_screen()`.
+  `sonix_addon_own_screen()`. A `stop()` that can block in a socket has no
+  business with the `leave` key until it can interrupt itself
+  (`http_stream_wake()`; `as_cancel()` in `addonstore/asnet.c`).
 - The interface is written at 480x720 and compiled at 320x480: every pixel size
   or position goes through `SC()` (`sonix-player/sonix-player/src/gui/shell/scale.h`).
   `tools/scale_gui.py` in the player's repository finds bare literals in layout

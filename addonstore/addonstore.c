@@ -1409,6 +1409,12 @@ static lv_obj_t *store_init(const sonix_addon_host_t *h) {
 static bool store_stop(void) {
 	stopping = true;
 	progress.stop = true;
+	// The download, if one is running, is parked in a recv() with a 30 s
+	// timeout: wake it, or this wait spends STOP_WAIT_MS and then says the
+	// library is not quiet -- which on the leave path would keep it loaded for
+	// the rest of the run. The refresh/scan jobs use http_get_ex() and cannot be
+	// woken; those are the ones the bounded wait is still for.
+	as_cancel();
 
 	pthread_mutex_lock(&job_lock);
 	struct timespec deadline;

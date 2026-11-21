@@ -4,5 +4,6 @@
   "titles": { "Russian": "2048" },
   "section": "more",
   "version": "0.1",
-  "icon": "icon.png"
+  "icon": "icon.png",
+  "unload": "leave"
 }

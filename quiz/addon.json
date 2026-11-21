@@ -4,5 +4,6 @@
   "titles": { "Russian": "Викторина", "Italiano": "Quiz" },
   "section": "more",
   "version": "0.11.0",
-  "icon": "icon.png"
+  "icon": "icon.png",
+  "unload": "leave"
 }

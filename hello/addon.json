@@ -6,5 +6,6 @@
 		"Italiano": "Ciao"
 	},
 	"section": "streaming",
-	"version": "0.1"
+	"version": "0.1",
+	"unload": "leave"
 }

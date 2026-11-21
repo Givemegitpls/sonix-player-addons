@@ -4,5 +4,6 @@
 	"titles": { "Russian": "Кассета", "Italiano": "Cassetta" },
 	"section": "music",
 	"version": "0.3.0",
-	"icon": "icon.png"
+	"icon": "icon.png",
+	"unload": "leave"
 }

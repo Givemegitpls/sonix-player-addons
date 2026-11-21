@@ -1,5 +1,6 @@
 #include "asnet.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,30 @@
 #define LIST_TIMEOUT_SECS 20
 #define DOWNLOAD_TIMEOUT_SECS 30
 #define CHUNK 32768
+
+// The stream the download worker is reading right now, if any, so that a stop
+// can end it without waiting out the receive timeout: http_stream_wake() shuts
+// the socket down, the pending recv() returns at once and the loop in
+// as_download() notices progress.stop on its next chunk. One at a time is
+// enough: the store runs one job per worker and one download per job.
+static pthread_mutex_t live_lock = PTHREAD_MUTEX_INITIALIZER;
+static http_stream_t *live_stream;
+
+static void live_set(http_stream_t *st) {
+	pthread_mutex_lock(&live_lock);
+	live_stream = st;
+	pthread_mutex_unlock(&live_lock);
+}
+
+void as_cancel(void) {
+	pthread_mutex_lock(&live_lock);
+	if (live_stream) {
+		// The stream stays valid -- its owner still closes it -- and every read
+		// from here on fails, which is what ends the worker.
+		http_stream_wake(live_stream);
+	}
+	pthread_mutex_unlock(&live_lock);
+}
 
 static void set_error(char *error, size_t size, const char *text) {
 	if (error && size) {
@@ -264,12 +289,14 @@ bool as_download(const char *url, const char *path, long expect_size, const char
 	}
 
 	long total = stream.content_length > 0 ? stream.content_length : expect_size;
+	live_set(&stream);
 	if (pg) {
 		pg->done = 0;
 		pg->total = total;
 	}
 	if (expect_size > 0 && stream.content_length > 0 && stream.content_length != expect_size) {
 		set_error(error, errsz, "the server sends a different size than the release lists");
+		live_set(NULL);
 		http_stream_close(&stream);
 		fclose(f);
 		unlink(path);
@@ -316,6 +343,7 @@ bool as_download(const char *url, const char *path, long expect_size, const char
 			pg->done = done;
 		}
 	}
+	live_set(NULL);
 	http_stream_close(&stream);
 
 	if (ok && expect_size > 0 && done != expect_size) {

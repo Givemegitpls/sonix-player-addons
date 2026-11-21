@@ -4,5 +4,6 @@
   "titles": { "Russian": "Динозаврик", "Italiano": "Dino" },
   "section": "more",
   "version": "0.1",
-  "icon": "icon.png"
+  "icon": "icon.png",
+  "unload": "leave"
 }

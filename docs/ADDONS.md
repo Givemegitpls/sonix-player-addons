@@ -92,6 +92,7 @@ can stay about the interface.
 | `service` | no | `true` when the addon is a streaming service: it also exports `sonix_addon_service_entry()`, and the player asks it about the account (src/addon/addon_service.h) |
 | `owns_paths` | no | the card paths that are the addon's, relative to the card, answered from the manifest alone — before the library is opened (USB export, the sleep timer, a factory reset) |
 | `cache_path` | no | the directory a factory reset empties, relative to the card |
+| `unload` | no | `"leave"` asks the player to stop and unmap the addon as soon as none of its screens is on the display; any other value, or none, keeps it loaded until the card leaves (see "Leaving a page") |
 
 `order` is what makes an addon a replacement rather than an addition: a page
 moved out of the binary asks for the place its tile used to have, and the page
@@ -219,6 +220,47 @@ library whose files changed on the card — an addon copied over adb, downloaded
 over the network or carried in on a card is reloaded the next time its tile is
 tapped, because `addon_open()` compares the file identity it recorded with what
 is on the card now.
+
+### Leaving a page: `"unload": "leave"`
+
+A third place, and the one this key asks for: an **app** addon is stopped and
+unmapped as soon as none of its screens is on the display. The player calls
+`addon_unload_offstage()` after every page change, one LVGL cycle later
+(`lv_async_call`), so the addon's widgets are not deleted inside the event that
+left them and `dlclose()` never runs with the library's code on the stack.
+The test is the active `lv_obj_t`, so a sub-page the addon opened itself keeps it
+loaded, and the player sheet sliding over it does not count as leaving.
+
+What it costs and what it asks:
+
+- the next tap calls `init()` again: the screen is built from scratch, so
+  everything that ends when the user walks away (session, sound, timers,
+  workers) must end in `SCREEN_UNLOADED` or in `stop()`, and the screen must be
+  reset in `SCREEN_LOADED`, not in `init()`;
+- leaving puts the addon out of the back-stack: "back" from the page it was left
+  for goes to the page before, not to the addon. That is already what the card's
+  unload does;
+- it is opt-in, because a `stop()` that says "not yet" has a much cheaper answer
+  on this path than on the card's: the player keeps everything as it is, logs
+  `addon: <id> cannot unload on leave; keeping it loaded`, and does not ask
+  again this run. So only addons whose `stop()` finishes in milliseconds should
+  opt in — and a worker parked in `http_stream_read()` is exactly what does not
+  (`as_cancel()` in the store's `asnet.c` is the pattern: publish the live
+  `http_stream_t`, then `http_stream_wake()` from `stop()`, so the read returns
+  at once instead of sitting out the 30 s receive timeout);
+- an old player ignores the key, so the addon keeps working unchanged there. A
+  missing symbol, by contrast, is `undefined symbol` at `dlopen`: never call a
+  player function added for this feature.
+
+A **service** (`"service": true`) is never unloaded this way even if its manifest
+carries the key: its workers, its account table and its `owns_paths` are the
+player's own dependencies, not a page's.
+
+App addons in this tree opted in (`2048`, `addonstore`, `cassette`, `daily`,
+`dino`, `flappybird`, `gearboy`, `gravity`, `hello`, `quiz`, `tictactoe`); the
+services stayed out. `gravity` and `gearboy` are the two that matter most — a
+307 KB frame plus game statics, and a whole cartridge in RAM plus an emulator
+thread and its stack.
 
 `gui_post()` calls an addon makes are safe: the shell drops queued callbacks
 whose function lies inside the library's mapping before it unmaps it.

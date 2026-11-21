@@ -59,4 +59,12 @@ bool as_fetch_releases(const char *repo, as_release_t *out, int max, int *count,
 bool as_download(const char *url, const char *path, long expect_size, const char *expect_sha, as_progress_t *pg,
 				 char *error, size_t errsz);
 
+// Ends whatever download is in flight, from any thread: shuts the socket down
+// so a worker parked in http_stream_read() returns now instead of sitting out
+// the receive timeout. Called by the addon's stop(); the worker itself sees
+// `pg->stop`/the failed read and leaves. Waiting after this is milliseconds,
+// not the timeout, which is what lets the player unload this addon when the
+// page is left.
+void as_cancel(void);
+
 #endif /* ADDONSTORE_ASNET_H */

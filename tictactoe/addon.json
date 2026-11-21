@@ -4,5 +4,6 @@
   "titles": { "Russian": "Крестики-нолики", "Italiano": "Tris" },
   "section": "more",
   "version": "0.1",
-  "icon": "icon.png"
+  "icon": "icon.png",
+  "unload": "leave"
 }

@@ -7,5 +7,6 @@
   "version": "0.1",
   "icon": "icon.png",
   "owns_paths": ["Addons/gearboy/cache/"],
-  "cache_path": "Addons/gearboy/cache/"
+  "cache_path": "Addons/gearboy/cache/",
+  "unload": "leave"
 }
