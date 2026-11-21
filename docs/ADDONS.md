@@ -910,6 +910,17 @@ never bumped by accident:
 git tag dino-v0.2.0 && git push origin dino-v0.2.0
 ```
 
+**One tag per push, or at most three.** GitHub creates no `push` event when a
+single push carries more than three tags ("Events will not be created for tags
+when more than three tags are pushed at once", `docs.github.com`, "Events that
+trigger workflows"). Ten tags in one `git push --tags` therefore release
+nothing: the tags land on the remote, no workflow run exists, and the catalogue
+is not rebuilt either — the `latest` job only runs when a tag or `index` asked
+for it. Push them one at a time. A batch that already reached the remote has to
+be deleted and pushed again in threes (`git push origin --delete <tag> …`, then
+`git push origin <tag> <tag> <tag>`); re-pushing a tag that already exists is a
+no-op and still creates nothing.
+
 `workflow_dispatch` takes `addons` (space separated; empty means every addon)
 and `index` (republish the catalogue and the bundle without releasing an addon,
 for a repair).

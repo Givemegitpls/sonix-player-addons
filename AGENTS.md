@@ -106,5 +106,10 @@ byte copies, so no client is offered an update for an addon that did not change.
   and `addons/spotify/addon.mk` copies the built binary into `spotify/assets/`.
   The addon without that binary says "engine not built" — never commit a stale
   one.
+- **A push carrying more than three tags creates no `push` events at all**, so
+  ten tags pushed together release nothing and the store catalogue is not
+  rebuilt (`latest` needs a tag or an explicit `index`). Push tags one at a
+  time; a batch already on the remote must be deleted and pushed again in
+  threes — `docs/ADDONS.md`, "Releasing an addon".
 - `git commit` is denied to agents by the global opencode config: stage, write
   the message, hand the command to the owner.
