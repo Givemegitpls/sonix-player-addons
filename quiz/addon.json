@@ -3,7 +3,7 @@
   "title": "Quiz",
   "titles": { "Russian": "Викторина", "Italiano": "Quiz" },
   "section": "more",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "icon": "icon.png",
   "unload": "leave"
 }

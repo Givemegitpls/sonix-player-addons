@@ -3,7 +3,7 @@
   "title": "2048",
   "titles": { "Russian": "2048" },
   "section": "more",
-  "version": "0.1",
+  "version": "0.2.0",
   "icon": "icon.png",
   "unload": "leave"
 }

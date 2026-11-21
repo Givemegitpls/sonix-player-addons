@@ -3,7 +3,7 @@
   "title": "Daily",
   "titles": { "Russian": "Трек дня", "English": "Daily", "Italiano": "Brano del giorno" },
   "section": "music",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "icon": "icon.png",
   "unload": "leave"
 }
